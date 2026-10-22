@@ -110,8 +110,9 @@ an error, deadline or cancellation.
 | `memory` | `resources.limits.memory`; docker units `b/k/m/g/t` are converted |
 
 When `cpus` or `memory` is not set, limits are computed per card:
-`ZW-M890P` uses 31 cores and 256Gi, `OAM-810E` uses 11 cores and 112Gi.
+`ZW-M890P` uses 31 cores and 256Gi, while `OAM-810E` (including `ZW-810E`) uses 11 cores and 112Gi.
 Without a `board-type` selector, `OAM-810E` values are used.
+Board equivalence affects resource defaults only; node selection retains the supplied label value.
 
 ## Environment contract
 

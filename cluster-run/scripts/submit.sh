@@ -363,7 +363,7 @@ if [ -z "$CPUS" ]; then
       CPU_PER_PPU=31
       CPU_MAX=248
       ;;
-    OAM-810E|"")
+    OAM-810E|ZW-810E|"")
       CPU_PER_PPU=11
       CPU_MAX=176
       ;;
@@ -383,7 +383,7 @@ if [ -z "$MEMORY" ]; then
       MEMORY_PER_PPU_GI=256
       MEMORY_MAX_GI=2048
       ;;
-    OAM-810E|"")
+    OAM-810E|ZW-810E|"")
       MEMORY_PER_PPU_GI=112
       MEMORY_MAX_GI=1792
       ;;

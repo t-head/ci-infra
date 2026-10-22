@@ -492,6 +492,14 @@ class StagingTests(unittest.TestCase):
         index = next(index for index, step in enumerate(sequence) if step.get("run") == lifecycle)
         self.assertEqual(sequence[index + 1].get("run"), staging)
 
+    def test_scheduling_step_recognizes_810e_board_alias(self):
+        step = next(step for step in self.action["runs"]["steps"] if step.get("id") == "submit")
+        self.assertIn(
+            "(contains(format(',{0},', inputs.node_selector), ',board-type=OAM-810E,') || "
+            "contains(format(',{0},', inputs.node_selector), ',board-type=ZW-810E,')) && '810E'",
+            step["name"])
+        self.assertIn("',board-type=ZW-M890P,') && '890P' || 'PPU'", step["name"])
+
     def test_yaml_inline_bash_syntax(self):
         scripts = [step["run"] for step in self.action["runs"]["steps"] if "run" in step]
         scripts += [step["run"] for job in self.workflow["jobs"].values()

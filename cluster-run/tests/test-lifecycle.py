@@ -486,6 +486,39 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual((self.root / "source 'quoted" / "required.txt").read_text(), "source transferred")
 
+    def test_810e_board_alias_defaults_and_selector(self):
+        for cards in (1, 8, 16, 32):
+            for board in ("OAM-810E", "ZW-810E"):
+                with self.subTest(cards=cards, board=board):
+                    self.configure([pod(0, scheduled=EPOCH)])
+                    rc, outputs, text = self.run_script(
+                        "submit.sh", INPUT_NPROC_PER_NODE=str(cards),
+                        INPUT_NODE_SELECTOR="board-type=" + board + ",pool=fixture")
+                    self.assertEqual(rc, 0, text)
+                    self.assertEqual(outputs["job_status"], "scheduled")
+                    spec = self.worker_manifest()["spec"]
+                    self.assertEqual(spec["nodeSelector"], {"board-type": board, "pool": "fixture"})
+                    resources = spec["containers"][0]["resources"]
+                    self.assertEqual(resources["limits"]["cpu"], str(min(cards * 11, 176)))
+                    self.assertEqual(resources["limits"]["memory"], str(min(cards * 112, 1792)) + "Gi")
+                    for key in ("limits", "requests"):
+                        self.assertEqual(resources[key]["alibabacloud.com/ppu"], str(cards))
+
+    def test_810e_board_alias_preserves_explicit_limits(self):
+        for options, cpu, memory in (("cpus: 500m", "500m", "896Gi"),
+                                     ("memory: 64Gi", "88", "64Gi"),
+                                     ("cpus: 1.5\nmemory: 64Gi", "1.5", "64Gi")):
+            with self.subTest(options=options):
+                self.configure([pod(0, scheduled=EPOCH)])
+                rc, _, text = self.run_script(
+                    "submit.sh", INPUT_NODE_SELECTOR="board-type=ZW-810E", CONTAINER_OPTIONS=options)
+                self.assertEqual(rc, 0, text)
+                spec = self.worker_manifest()["spec"]
+                self.assertEqual(spec["nodeSelector"]["board-type"], "ZW-810E")
+                resources = spec["containers"][0]["resources"]
+                self.assertEqual(resources["limits"]["cpu"], cpu)
+                self.assertEqual(resources["limits"]["memory"], memory)
+
     def test_master_address_for_single_pod_and_gang(self):
         for nodes, cards in ((0, 1), (0, 8), (2, 8)):
             with self.subTest(nodes=nodes, cards=cards):
