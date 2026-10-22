@@ -120,7 +120,7 @@ jobs:
 
       - name: Launch ${{ matrix.label }} workload
         id: smoke
-        uses: ./cluster-run
+        uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
@@ -182,7 +182,7 @@ jobs:
       - name: Run scheduling and log phases
         id: lifecycle
         continue-on-error: true
-        uses: ./cluster-run
+        uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
@@ -231,7 +231,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Read enforced cgroup limits
-        uses: ./cluster-run
+        uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
@@ -279,7 +279,7 @@ jobs:
       - name: Submit oversized 810E gang
         id: blocked_allocation
         continue-on-error: true
-        uses: ./cluster-run
+        uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
@@ -348,7 +348,7 @@ jobs:
           path: ${{ runner.temp }}/restored-fixture
 
       - name: Inspect staged repository and marker
-        uses: ./cluster-run
+        uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
