@@ -20,7 +20,7 @@ METRICS_END_EPOCH=$(date +%s)
 METRICS_END_TIME=$(date +%Y-%m-%dT%H:%M:%S%z)
 DURATION=$(( METRICS_END_EPOCH - START_TIME ))
 set_output "duration_seconds" "$DURATION"
-POD_SNAPSHOT=$(kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
+POD_SNAPSHOT=$(timeout --signal=KILL 10s kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json --request-timeout=10s)
 
 QUEUE_START_EPOCH=0
 QUEUE_END_EPOCH=0
@@ -95,7 +95,7 @@ fi
 
 QUEUE_REASON=""
 if [ "$LONG_QUEUE_PODS" -gt 0 ] || [ "$UNSCHEDULED_PODS" -gt 0 ]; then
-  QUEUE_REASON=$(kubectl get events -n "$NAMESPACE" --field-selector "reason=FailedScheduling" -o json 2>/dev/null \
+  QUEUE_REASON=$(timeout --signal=KILL 10s kubectl get events -n "$NAMESPACE" --field-selector "reason=FailedScheduling" -o json --request-timeout=10s 2>/dev/null \
     | jq -r --arg job "$JOB_NAME" '
         [.items[] | select(.involvedObject.name | startswith($job))]
         | sort_by(.lastTimestamp // .eventTime // "") | last | .message // empty' 2>/dev/null \

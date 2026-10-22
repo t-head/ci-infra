@@ -18,7 +18,7 @@ set_output() {
   fi
 }
 
-# --- 预设默认输出（防止脚本异常退出时 cleanup 拿不到 job_status）---
+# --- Initialize default outputs so cleanup can read job_status even if the script exits unexpectedly ---
 set_output "job_status" "failed"
 set_output "duration_seconds" "0"
 set_output "queue_duration_seconds" "0"
@@ -32,6 +32,10 @@ FINAL_STATUS="failed"
 _on_exit() {
   local rc=$?
   trap - EXIT TERM INT
+  if [ "$FINAL_STATUS" = "failed" ] && [ -n "${DEADLINE:-}" ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    FINAL_STATUS="timeout"
+    set_output "job_status" "$FINAL_STATUS"
+  fi
   if [ -n "${WAIT_PID:-}" ]; then
     kill "$WAIT_PID" 2>/dev/null || true
     wait "$WAIT_PID" 2>/dev/null || true
@@ -51,12 +55,12 @@ _on_signal() {
 trap '_on_exit' EXIT
 trap '_on_signal' TERM INT
 
-# YAML 双引号字符串转义：将值中的特殊字符转义后可安全嵌入 value: "..." 中
+# Escape special characters for safe embedding in a YAML double-quoted value: "...".
 yaml_escape_value() {
   local val="$1"
   val="${val//\\/\\\\}"       # \ → \\
   val="${val//\"/\\\"}"       # " → \\"
-  val="${val//$'\n'/\\n}"     # 换行 → \n
+  val="${val//$'\n'/\\n}"     # newline → \n
   val="${val//$'\t'/\\t}"     # tab → \t
   printf '%s' "$val"
 }
@@ -64,7 +68,7 @@ yaml_escape_value() {
 NNODES="${INPUT_NNODES:-0}"
 NPROC="${INPUT_NPROC_PER_NODE:-1}"
 
-# nnodes=0 表示单机模式：仅 1 pod，无 gang/service
+# nnodes=0 selects single-node mode: one pod, no gang scheduling or service.
 SINGLE_MODE=false
 if [ "$NNODES" -eq 0 ]; then
   SINGLE_MODE=true
@@ -87,13 +91,13 @@ DMESG_POLICY="${INPUT_DMESG_POLICY:-never}"
 case "$DMESG_POLICY" in
   never|on_failure|always) ;;
   *)
-    log_error "dmesg_policy 取值必须为 never/on_failure/always，实际为 '${DMESG_POLICY}'"
+    log_error "dmesg_policy must be never/on_failure/always; got '${DMESG_POLICY}'"
     exit 1
     ;;
 esac
 
-# 默认 NAS 挂载定义（pod spec 与 host_volumes 去重共用同一份定义）
-# 每项格式: "volumeName|containerMountPath|hostPath"
+# Default NAS mounts, shared by the pod spec and host_volumes deduplication.
+# Entry format: "volumeName|containerMountPath|hostPath"
 DEFAULT_NAS_VOLUMES=(
   "nas-aisw|/nas_aisw|/nas_aisw"
   "wl-nas|/mnt/wl_nas|/wl_nas"
@@ -103,11 +107,11 @@ DEFAULT_NAS_VOLUMES=(
 TIMEOUT=$(( TIMEOUT_MINUTES * 60 ))
 
 if [ -z "$IMAGE" ]; then
-  log_error "input 'image' 必填，但为空。"
+  log_error "Input 'image' is required but empty."
   exit 1
 fi
 if [ -z "$COMMAND" ]; then
-  log_error "input 'command' 必填，但为空。"
+  log_error "Input 'command' is required but empty."
   exit 1
 fi
 
@@ -115,27 +119,38 @@ RUN_ID="${GITHUB_RUN_ID:-0}"
 RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
 JOB_NAME="${JOB_NAME:-}"
 if [ -z "$JOB_NAME" ]; then
-  log_error "JOB_NAME 为空（应由 Resolve job name 步骤计算）"
+  log_error "JOB_NAME is empty (expected from the Resolve job name step)"
   exit 1
 fi
 set_output "job_name" "$JOB_NAME"
+START_TIME=$(date +%s)
+DEADLINE=$(( START_TIME + TIMEOUT ))
+set_output "start_time" "$START_TIME"
+set_output "deadline" "$DEADLINE"
 
-log_info "Job 名称:   $JOB_NAME"
-log_info "命名空间:   $NAMESPACE"
+kube_request() {
+  local remaining=$(( DEADLINE - $(date +%s) ))
+  [ "$remaining" -gt 0 ] || return 124
+  [ "$remaining" -gt 10 ] && remaining=10
+  timeout --signal=KILL "${remaining}s" kubectl "$@" --request-timeout="${remaining}s"
+}
+
+log_info "Job name:   $JOB_NAME"
+log_info "Namespace:  $NAMESPACE"
 if [ "$SINGLE_MODE" = true ]; then
   if [ "$NPROC" -gt 1 ]; then
-    log_info "模式:       多卡 (${NPROC} PPU)"
+    log_info "Mode:       Multi-card (${NPROC} PPU)"
   else
-    log_info "模式:       单卡 (${NPROC} PPU)"
+    log_info "Mode:       Single-card (${NPROC} PPU)"
   fi
 else
-  log_info "规模:       ${NNODES} node(s) × ${NPROC} PPU/node"
+  log_info "Scale:      ${NNODES} node(s) × ${NPROC} PPU/node"
 fi
-log_info "超时:       ${TIMEOUT_MINUTES}min (${TIMEOUT}s)"
+log_info "Timeout:    ${TIMEOUT_MINUTES}min (${TIMEOUT}s)"
 
 if [ "$SINGLE_MODE" = false ]; then
-  if ! kubectl get crd podgroups.scheduling.x-k8s.io >/dev/null 2>&1; then
-    log_error "未检测到 PodGroup CRD (podgroups.scheduling.x-k8s.io)。无法进行 gang 调度。"
+  if ! kube_request get crd podgroups.scheduling.x-k8s.io >/dev/null 2>&1; then
+    log_error "PodGroup CRD (podgroups.scheduling.x-k8s.io) not found. Gang scheduling is unavailable."
     exit 1
   fi
 fi
@@ -156,10 +171,10 @@ if [ -n "$EXTRA_ENV" ]; then
   EXTRA_ENV_YAML="${EXTRA_ENV_YAML%$'\n'}"
 fi
 
-# --- 从当前环境继承代理变量，注入 worker pod ---
-# ARC Runner 通过 hook-extension-cpu ConfigMap 注入了代理变量，
-# 这里将非空的代理变量透传给 worker pod，避免直连外网被 WAF 403。
-# 放在 EXTRA_ENV_YAML 之前，用户可通过 extra_env 覆盖代理设置。
+# --- Inherit proxy variables from the current environment and inject them into worker pods ---
+# ARC Runner receives proxy variables through the hook-extension-cpu ConfigMap.
+# Forward nonempty proxy variables to worker pods to avoid WAF 403 responses from direct external connections.
+# Place them before EXTRA_ENV_YAML so users can override proxy settings through extra_env.
 PROXY_ENV_YAML=""
 for _proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY; do
   _proxy_val="${!_proxy_var:-}"
@@ -171,17 +186,17 @@ for _proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROX
 done
 PROXY_ENV_YAML="${PROXY_ENV_YAML%$'\n'}"
 if [ -n "$PROXY_ENV_YAML" ]; then
-  log_info "代理环境变量将注入 worker pod"
+  log_info "Proxy environment variables will be injected into worker pods"
 fi
 
-# === 用户 workflow/job env 自动转发 ===
+# === Automatically forward user workflow/job env variables ===
 USER_ENV_YAML=""
 if [[ -n "${USER_ENV_JSON:-}" && "${USER_ENV_JSON}" != "{}" && "${USER_ENV_JSON}" != "null" ]]; then
   while IFS= read -r line; do
     _key="${line%%=*}"
     _b64val="${line#*=}"
     [[ -z "${_key}" ]] && continue
-    # 跳过 action 内部变量，避免二次注入
+    # Skip action-internal variables to avoid duplicate injection.
     case "$_key" in
       INPUT_*|CONTAINER_OPTIONS|SOURCE_STAGE_DIR|USER_ENV_JSON|GITHUB_*) continue ;;
     esac
@@ -192,7 +207,7 @@ if [[ -n "${USER_ENV_JSON:-}" && "${USER_ENV_JSON}" != "{}" && "${USER_ENV_JSON}
   done < <(echo "${USER_ENV_JSON}" | jq -r 'to_entries[] | "\(.key)=\(.value | @base64)"')
   USER_ENV_YAML="${USER_ENV_YAML%$'\n'}"
   if [[ -n "${USER_ENV_YAML}" ]]; then
-    log_info "用户 env 变量将注入 worker pod: $(echo "${USER_ENV_JSON}" | jq -r 'keys | join(", ")')"
+    log_info "User env variables will be injected into worker pods: $(echo "${USER_ENV_JSON}" | jq -r 'keys | join(", ")')"
   fi
 fi
 
@@ -214,20 +229,20 @@ if [ -n "$NODE_SELECTOR" ]; then
       _key_name="${_key##*/}"
       if [ ${#_key_prefix} -gt 253 ] || [ -z "$_key_prefix" ] \
          || ! [[ "$_key_prefix" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$ ]]; then
-        log_error "node_selector: key 前缀不合法: '${_key_prefix}'"
+        log_error "node_selector: invalid key prefix: '${_key_prefix}'"
         exit 1
       fi
     fi
     if [ -z "$_key_name" ] || [ ${#_key_name} -gt 63 ] \
        || ! [[ "$_key_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?$ ]]; then
-      log_error "node_selector: key 名称不合法: '${_key_name}'"
+      log_error "node_selector: invalid key name: '${_key_name}'"
       exit 1
     fi
 
     if [ -n "$_val" ]; then
       if [ ${#_val} -gt 63 ] \
          || ! [[ "$_val" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?$ ]]; then
-        log_error "node_selector: value 不合法: '${_val}'"
+        log_error "node_selector: invalid value: '${_val}'"
         exit 1
       fi
     fi
@@ -241,17 +256,17 @@ if [ -n "$NODE_SELECTOR" ]; then
   fi
 fi
 
-# --- Container runtime options 解析 ---
-# CONTAINER_OPTIONS 为用户传入的 YAML 片段（可多行），支持的键：
-#   privileged:   true/false             → 容器 securityContext.privileged
+# --- Parse container runtime options ---
+# CONTAINER_OPTIONS is a user-supplied YAML fragment (optionally multiline). Supported keys:
+#   privileged:   true/false             → container securityContext.privileged
 #   host_ipc:     true/false             → pod spec.hostIPC
 #   host_network: true/false             → pod spec.hostNetwork
 #   dns_policy:   "ClusterFirstWithHostNet" → pod spec.dnsPolicy
-#   shm_size:     "8Gi"                  → /dev/shm emptyDir sizeLimit（默认 64Gi）
-#   cap_add:      "SYS_PTRACE,IPC_LOCK"  → securityContext.capabilities.add（逗号分隔）
-#   cpus:         "8" / "1.5" / "500m"   → resources.limits.cpu（别名 cpu）
-#   memory:       "64Gi" / "64g"         → resources.limits.memory（docker 小写单位按 1024 进制转换）
-# cpus/memory 留空时按卡型和 NPROC 自动计算，其他选项保持各自默认值。
+#   shm_size:     "8Gi"                  → /dev/shm emptyDir sizeLimit (default 64Gi)
+#   cap_add:      "SYS_PTRACE,IPC_LOCK"  → securityContext.capabilities.add (comma-separated)
+#   cpus:         "8" / "1.5" / "500m"   → resources.limits.cpu (alias cpu)
+#   memory:       "64Gi" / "64g"         → resources.limits.memory (Docker lowercase units converted using base 1024)
+# When cpus/memory are empty, calculate from the card type and NPROC; other options retain their defaults.
 PRIVILEGED="false"
 HOST_IPC="false"
 HOST_NETWORK="false"
@@ -261,8 +276,8 @@ CAP_ADD=""
 CPUS=""
 MEMORY=""
 
-# 提取指定键的取值：键名大小写不敏感；值去引号与空白。
-# 注：pipefail 下 grep 无匹配会使管道非零，尾部 || true 兜底，空值由调用方回退默认。
+# Extract the value for a case-insensitive key; strip quotes and whitespace from the value.
+# With pipefail, grep without matches makes the pipeline nonzero; || true handles this, and callers apply defaults to empty values.
 _co_opt_value() {
   printf '%s\n' "$CONTAINER_OPTIONS" | grep -i "^[[:space:]]*${1}:" | head -1 | awk '{print $2}' | tr -d "\"' " || true
 }
@@ -277,53 +292,53 @@ if [ -n "$CONTAINER_OPTIONS" ]; then
   CPUS=$(_co_opt_value 'cpus'); [ -z "$CPUS" ] && CPUS=$(_co_opt_value 'cpu')
   MEMORY=$(_co_opt_value 'memory')
 
-  # 布尔值规范化（True/TRUE → true）并校验
+  # Normalize booleans (True/TRUE → true) and validate.
   PRIVILEGED=$(printf '%s' "$PRIVILEGED" | tr '[:upper:]' '[:lower:]')
   HOST_IPC=$(printf '%s' "$HOST_IPC" | tr '[:upper:]' '[:lower:]')
   HOST_NETWORK=$(printf '%s' "$HOST_NETWORK" | tr '[:upper:]' '[:lower:]')
   if [ "$PRIVILEGED" != "true" ] && [ "$PRIVILEGED" != "false" ]; then
-    log_error "container_options: privileged 取值必须为 true/false，实际为 '${PRIVILEGED}'"
+    log_error "container_options: privileged must be true/false; got '${PRIVILEGED}'"
     exit 1
   fi
   if [ "$HOST_IPC" != "true" ] && [ "$HOST_IPC" != "false" ]; then
-    log_error "container_options: host_ipc 取值必须为 true/false，实际为 '${HOST_IPC}'"
+    log_error "container_options: host_ipc must be true/false; got '${HOST_IPC}'"
     exit 1
   fi
   if [ "$HOST_NETWORK" != "true" ] && [ "$HOST_NETWORK" != "false" ]; then
-    log_error "container_options: host_network 取值必须为 true/false，实际为 '${HOST_NETWORK}'"
+    log_error "container_options: host_network must be true/false; got '${HOST_NETWORK}'"
     exit 1
   fi
 
-  # dns_policy 校验并规范化为 K8s 的驼峰取值。None 需同时提供 dnsConfig，
-  # 本 action 不生成 dnsConfig，故明确拒绝，而不是产出一份会被 apiserver 打回的 pod spec。
+  # Validate dns_policy and normalize to K8s camel-case values. None also requires dnsConfig,
+  # which this action does not generate, so reject it explicitly instead of producing a pod spec the apiserver would reject.
   if [ -n "$DNS_POLICY" ]; then
     case "$(printf '%s' "$DNS_POLICY" | tr '[:upper:]' '[:lower:]')" in
       clusterfirst)            DNS_POLICY="ClusterFirst" ;;
       clusterfirstwithhostnet) DNS_POLICY="ClusterFirstWithHostNet" ;;
       default)                 DNS_POLICY="Default" ;;
       *)
-        log_error "container_options: dns_policy 取值必须为 ClusterFirst/ClusterFirstWithHostNet/Default，实际为 '${DNS_POLICY}'"
+        log_error "container_options: dns_policy must be ClusterFirst/ClusterFirstWithHostNet/Default; got '${DNS_POLICY}'"
         exit 1
         ;;
     esac
   fi
 
-  # shm_size 校验（K8s quantity，如 8Gi / 512Mi / 1024），同时防非法字符注入 YAML
+  # Validate shm_size as a K8s quantity (e.g. 8Gi / 512Mi / 1024) and prevent invalid characters from entering YAML.
   if [ -n "$SHM_SIZE" ]; then
     if ! [[ "$SHM_SIZE" =~ ^[0-9]+(\.[0-9]+)?([kMGTPE]i?)?$ ]]; then
-      log_error "container_options: shm_size 不是合法的 K8s size（示例: 8Gi、512Mi），实际为 '${SHM_SIZE}'"
+      log_error "container_options: shm_size is not a valid K8s size (e.g. 8Gi, 512Mi); got '${SHM_SIZE}'"
       exit 1
     fi
   fi
 
   if [ -n "$CPUS" ]; then
     if ! [[ "$CPUS" =~ ^([0-9]+(\.[0-9]+)?|[0-9]+m)$ ]]; then
-      log_error "container_options: cpus 不是合法的 CPU 数量（示例: 8、1.5、500m），实际为 '${CPUS}'"
+      log_error "container_options: cpus is not a valid CPU quantity (e.g. 8, 1.5, 500m); got '${CPUS}'"
       exit 1
     fi
   fi
 
-  # docker 的 b/k/m/g/t 为 1024 进制，而 K8s 中小写 m 表示 milli，须转换为 Ki/Mi/Gi/Ti
+  # Docker b/k/m/g/t units use base 1024, whereas lowercase m in K8s means milli; convert to bytes/Ki/Mi/Gi/Ti.
   if [ -n "$MEMORY" ]; then
     if [[ "$MEMORY" =~ ^([0-9]+)([bkmgt])$ ]]; then
       case "${BASH_REMATCH[2]}" in
@@ -334,7 +349,7 @@ if [ -n "$CONTAINER_OPTIONS" ]; then
         t) MEMORY="${BASH_REMATCH[1]}Ti" ;;
       esac
     elif ! [[ "$MEMORY" =~ ^[0-9]+(\.[0-9]+)?([KMGTPE]i?|k)?$ ]]; then
-      log_error "container_options: memory 不是合法的内存大小（示例: 64Gi、512Mi、64g），实际为 '${MEMORY}'"
+      log_error "container_options: memory is not a valid memory size (e.g. 64Gi, 512Mi, 64g); got '${MEMORY}'"
       exit 1
     fi
   fi
@@ -351,13 +366,13 @@ if [ -z "$CPUS" ]; then
       CPU_MAX=176
       ;;
     *)
-      log_error "node_selector: 未知 board-type '${BOARD_TYPE}'，无法确定默认 CPU；请显式设置 container_options.cpus"
+      log_error "node_selector: unknown board-type '${BOARD_TYPE}'; cannot determine default CPU; set container_options.cpus explicitly"
       exit 1
       ;;
   esac
   CPUS=$((NPROC * CPU_PER_PPU))
   [ "$CPUS" -gt "$CPU_MAX" ] && CPUS="$CPU_MAX"
-  log_info "container_options.cpus 未设置，按 board-type=${BOARD_TYPE:-<未指定，按OAM-810E>}、${NPROC} PPU 自动设置为 ${CPUS}"
+  log_info "container_options.cpus is unset; using board-type=${BOARD_TYPE:-<unspecified, assuming OAM-810E>}, ${NPROC} PPU to automatically set ${CPUS}"
 fi
 
 if [ -z "$MEMORY" ]; then
@@ -371,41 +386,41 @@ if [ -z "$MEMORY" ]; then
       MEMORY_MAX_GI=1792
       ;;
     *)
-      log_error "node_selector: 未知 board-type '${BOARD_TYPE}'，无法确定默认内存；请显式设置 container_options.memory"
+      log_error "node_selector: unknown board-type '${BOARD_TYPE}'; cannot determine default memory; set container_options.memory explicitly"
       exit 1
       ;;
   esac
   MEMORY_GI=$((NPROC * MEMORY_PER_PPU_GI))
   [ "$MEMORY_GI" -gt "$MEMORY_MAX_GI" ] && MEMORY_GI="$MEMORY_MAX_GI"
   MEMORY="${MEMORY_GI}Gi"
-  log_info "container_options.memory 未设置，按 board-type=${BOARD_TYPE:-<未指定，按OAM-810E>}、${NPROC} PPU 自动设置为 ${MEMORY}"
+  log_info "container_options.memory is unset; using board-type=${BOARD_TYPE:-<unspecified, assuming OAM-810E>}, ${NPROC} PPU to automatically set ${MEMORY}"
 fi
 
-log_info "container_options: privileged=${PRIVILEGED} host_ipc=${HOST_IPC} host_network=${HOST_NETWORK} dns_policy=${DNS_POLICY:-<集群默认>} shm_size=${SHM_SIZE:-64Gi(默认)} cap_add=${CAP_ADD:-<none>} cpus=${CPUS:-<不限>} memory=${MEMORY}"
+log_info "container_options: privileged=${PRIVILEGED} host_ipc=${HOST_IPC} host_network=${HOST_NETWORK} dns_policy=${DNS_POLICY:-<cluster default>} shm_size=${SHM_SIZE:-64Gi(default)} cap_add=${CAP_ADD:-<none>} cpus=${CPUS:-<unlimited>} memory=${MEMORY}"
 
-# hostNetwork 与默认的 ClusterFirst 组合，会让 pod 拿到宿主 resolver，于是本 action
-# 自己注入的 MASTER_ADDR（headless Service 的 *.svc.cluster.local）无法解析，
-# 多机 rendezvous 必然失败。K8s 对这一组合的官方解法就是
-# ClusterFirstWithHostNet：集群内名字走 CoreDNS，其余仍由 CoreDNS 按上游转发。
-# 未显式指定 dns_policy 时按此补齐；显式指定则一律尊重用户取值。
+# Combining hostNetwork with the default ClusterFirst makes pods use the host resolver, so this action's
+# injected MASTER_ADDR (the headless Service's *.svc.cluster.local address) cannot resolve,
+# causing multi-node rendezvous to fail. The official K8s solution for this combination is
+# ClusterFirstWithHostNet: CoreDNS resolves cluster names and forwards other queries upstream.
+# Apply this default when dns_policy is unset; always honor explicitly supplied values.
 if [ "$HOST_NETWORK" = "true" ] && [ -z "$DNS_POLICY" ]; then
   DNS_POLICY="ClusterFirstWithHostNet"
-  log_info "host_network=true，dnsPolicy 自动置为 ClusterFirstWithHostNet（可用 container_options.dns_policy 覆盖）"
+  log_info "host_network=true; dnsPolicy automatically set to ClusterFirstWithHostNet (override with container_options.dns_policy)"
 fi
 
-# /dev/shm 大小（默认 64Gi，与历史行为一致）
+# /dev/shm size (default 64Gi, preserving historical behavior).
 SHM_SIZE_LIMIT="${SHM_SIZE:-64Gi}"
 
-# cap_add → securityContext.capabilities.add 列表项（12 空格缩进，对齐 add: 下的列表）
+# cap_add → securityContext.capabilities.add list entries (12-space indentation, aligned under add:).
 CAP_ADD_ITEMS=""
 if [ -n "$CAP_ADD" ]; then
   IFS=',' read -ra _caps <<< "$CAP_ADD"
   for _cap in "${_caps[@]}"; do
     _cap=$(printf '%s' "$_cap" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
     [ -z "$_cap" ] && continue
-    # K8s capability 名称：大写字母开头，仅大写字母/数字/下划线
+    # K8s capability names start with an uppercase letter and contain only uppercase letters, digits, and underscores.
     if ! [[ "$_cap" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
-      log_error "container_options: cap_add 含不合法的 capability 名称 '${_cap}'（示例: SYS_PTRACE,IPC_LOCK）"
+      log_error "container_options: cap_add contains an invalid capability name '${_cap}' (e.g. SYS_PTRACE,IPC_LOCK)"
       exit 1
     fi
     CAP_ADD_ITEMS+="            - ${_cap}"$'\n'
@@ -413,13 +428,13 @@ if [ -n "$CAP_ADD" ]; then
   CAP_ADD_ITEMS="${CAP_ADD_ITEMS%$'\n'}"
 fi
 
-# 仅设 limits：K8s 会把未声明的 requests 默认为同值，与 docker --cpus/--memory 的硬上限语义一致
+# Set only limits: K8s defaults unspecified requests to the same values, matching Docker --cpus/--memory hard limits.
 RESOURCE_LIMITS_YAML=""
 [ -n "$CPUS" ] && RESOURCE_LIMITS_YAML+="          cpu: \"${CPUS}\""$'\n'
 [ -n "$MEMORY" ] && RESOURCE_LIMITS_YAML+="          memory: \"${MEMORY}\""$'\n'
 RESOURCE_LIMITS_YAML="${RESOURCE_LIMITS_YAML%$'\n'}"
 
-# 容器级 securityContext 片段（6 空格缩进，与 image/env/resources 同级）
+# Container-level securityContext fragment (6-space indentation, at the same level as image/env/resources).
 SECURITY_CONTEXT_YAML=""
 if [ "$PRIVILEGED" = "true" ] || [ -n "$CAP_ADD_ITEMS" ]; then
   _sc="      securityContext:"
@@ -434,7 +449,7 @@ if [ "$PRIVILEGED" = "true" ] || [ -n "$CAP_ADD_ITEMS" ]; then
   SECURITY_CONTEXT_YAML="$_sc"
 fi
 
-# pod 级选项片段（2 空格缩进，与 nodeSelector/containers 同级）
+# Pod-level options fragment (2-space indentation, at the same level as nodeSelector/containers).
 POD_LEVEL_OPTIONS_YAML=""
 _append_pod_option() {
   if [ -n "$POD_LEVEL_OPTIONS_YAML" ]; then
@@ -463,10 +478,10 @@ if [ -n "$HOST_VOLUMES" ]; then
     _host_path="${_pair%%:*}"
     _container_path="${_pair#*:}"
     if [ -z "$_host_path" ] || [ -z "$_container_path" ]; then
-      log_error "host_volumes 格式错误: '${_pair}'，应为 /host/path:/container/path"
+      log_error "Invalid host_volumes format: '${_pair}'; expected /host/path:/container/path"
       exit 1
     fi
-    # 过滤与默认 NAS 挂载重复的路径
+    # Filter paths that duplicate default NAS mounts.
     _is_default=false
     for _def_entry in "${DEFAULT_NAS_VOLUMES[@]}"; do
       _def_path="${_def_entry#*|}"; _def_path="${_def_path%%|*}"
@@ -476,7 +491,7 @@ if [ -n "$HOST_VOLUMES" ]; then
       fi
     done
     if [ "$_is_default" = true ]; then
-      log_warn "host_volumes 条目 '${_pair}' 的挂载路径 ${_container_path} 已是默认挂载，已跳过以避免重复。"
+      log_warn "host_volumes entry '${_pair}' uses default mount path ${_container_path}; skipped to avoid duplication."
       continue
     fi
     _vol_name="host-vol-${_vol_idx}"
@@ -490,25 +505,27 @@ if [ -n "$HOST_VOLUMES" ]; then
   done
   HOST_VOLUME_MOUNTS="${HOST_VOLUME_MOUNTS%$'\n'}"
   HOST_VOLUME_DEFS="${HOST_VOLUME_DEFS%$'\n'}"
-  log_info "host_volumes 解析结果:"
+  log_info "Parsed host_volumes:"
   echo "${HOST_VOLUME_MOUNTS}" >&2
   echo "${HOST_VOLUME_DEFS}" >&2
 fi
 
-# --- NAS 源码 tarball 解压注入 ---
-# SOURCE_STAGE_DIR 为 CPU runner 视角的 tarball 路径（/wl_nas/devops/xxx/source.tar.gz），
-# PPU pod 通过默认 NAS 挂载（/mnt/wl_nas）访问同一份文件，路径前缀需做映射。
+# --- Inject extraction of the source tarball from NAS ---
+# SOURCE_STAGE_DIR is the tarball path as seen by the CPU runner (/wl_nas/devops/xxx/source.tar.gz).
+# PPU pods access the same file through the default NAS mount (/mnt/wl_nas), so remap the path prefix.
 if [ -n "$SOURCE_STAGE_DIR" ]; then
-  # CPU runner 容器内 NAS 路径 /wl_nas → PPU pod 容器内 NAS 路径 /mnt/wl_nas
-  # 注：不用 patsub（${var/\/wl_nas\//...}）——bash 的替换串中 \/ 会字面保留反斜杠
+  # NAS path inside the CPU runner container /wl_nas → NAS path inside the PPU pod container /mnt/wl_nas.
+  # Avoid patsub (${var/\/wl_nas\//...}): bash preserves the backslash in \/ within the replacement string.
   if [[ "$SOURCE_STAGE_DIR" == /wl_nas/* ]]; then
     TARBALL_PATH_IN_POD="/mnt/wl_nas/${SOURCE_STAGE_DIR#/wl_nas/}"
   else
     TARBALL_PATH_IN_POD="$SOURCE_STAGE_DIR"
   fi
-  EXTRACT_CMD="mkdir -p ${SOURCE_MOUNT_PATH} && tar xzf ${TARBALL_PATH_IN_POD} -C ${SOURCE_MOUNT_PATH} && cd ${SOURCE_MOUNT_PATH} && echo '✓ 源码已解压到 ${SOURCE_MOUNT_PATH}'"
-  COMMAND="${EXTRACT_CMD} && ${COMMAND}"
-  log_info "源码 tarball 解压注入: ${TARBALL_PATH_IN_POD} → ${SOURCE_MOUNT_PATH}"
+  printf -v EXTRACT_CMD 'mkdir -p %q && tar xzf %q -C %q && cd %q' \
+    "$SOURCE_MOUNT_PATH" "$TARBALL_PATH_IN_POD" "$SOURCE_MOUNT_PATH" "$SOURCE_MOUNT_PATH"
+  COMMAND="${EXTRACT_CMD} || exit \$?
+${COMMAND}"
+  log_info "Source tarball extraction injected: ${TARBALL_PATH_IN_POD} → ${SOURCE_MOUNT_PATH}"
 fi
 
 if [ "$DMESG_POLICY" != "never" ]; then
@@ -537,24 +554,35 @@ _ppu_command_rc=\$?
 trap - TERM INT
 _ppu_dmesg_end \"\$_ppu_command_rc\"
 exit \"\$_ppu_command_rc\""
-  log_info "dmesg 采集策略: ${DMESG_POLICY}，NAS 路径: /wl_nas/devops/dmesg/${RUN_ID}-${RUN_ATTEMPT}/${JOB_NAME}"
+  log_info "dmesg collection policy: ${DMESG_POLICY}; NAS path: /wl_nas/devops/dmesg/${RUN_ID}-${RUN_ATTEMPT}/${JOB_NAME}"
 fi
 
 SCRIPT_INDENTED=$(printf '%s\n' "$COMMAND" | sed 's/^/          /')
 
-# --- 清理同名旧资源 ---
-log_info "清理同名旧资源（若存在）: $JOB_NAME"
-kubectl delete pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" --ignore-not-found=true 2>/dev/null || true
-kubectl delete svc "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-kubectl delete podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-sleep 3
+# --- Remove existing resources with the same name ---
+log_info "Removing old resources with the same name, if any: $JOB_NAME"
+kube_request delete pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" --ignore-not-found=true --wait=false
+if [ "$SINGLE_MODE" = false ]; then
+  kube_request delete svc "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true --wait=false
+  kube_request delete podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true --wait=false
+fi
+WAIT_SECONDS=$(( DEADLINE - $(date +%s) ))
+[ "$WAIT_SECONDS" -gt 3 ] && WAIT_SECONDS=3
+[ "$WAIT_SECONDS" -gt 0 ] && sleep "$WAIT_SECONDS"
+while true; do
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    log_error "Job timeout reached while waiting for previous resources to disappear"
+    FINAL_STATUS="timeout"
+    exit 0
+  fi
+  OLD_PODS=$(kube_request get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" --no-headers -o custom-columns=NAME:.metadata.name)
+  [ -z "$OLD_PODS" ] && break
+  WAIT_SECONDS=$(( DEADLINE - $(date +%s) ))
+  [ "$WAIT_SECONDS" -gt 3 ] && WAIT_SECONDS=3
+  [ "$WAIT_SECONDS" -gt 0 ] && sleep "$WAIT_SECONDS"
+done
 
-START_TIME=$(date +%s)
-DEADLINE=$(( START_TIME + TIMEOUT ))
-set_output "start_time" "$START_TIME"
-set_output "deadline" "$DEADLINE"
-
-# --- 创建 Headless Service ---
+# --- Create Headless Service ---
 if [ "$SINGLE_MODE" = false ]; then
   SVC_MANIFEST="$MANIFEST_DIR/service.yaml"
   cat > "$SVC_MANIFEST" <<SVC_EOF
@@ -573,10 +601,10 @@ spec:
       targetPort: ${MASTER_PORT}
 SVC_EOF
 
-  log_info "创建 Headless Service: $JOB_NAME"
-  kubectl create -f "$SVC_MANIFEST"
+  log_info "Creating Headless Service: $JOB_NAME"
+  kube_request create -f "$SVC_MANIFEST"
 
-  # --- 创建 PodGroup ---
+  # --- Create PodGroup ---
   PG_MANIFEST="$MANIFEST_DIR/podgroup.yaml"
   cat > "$PG_MANIFEST" <<PG_EOF
 apiVersion: scheduling.x-k8s.io/v1alpha1
@@ -588,13 +616,13 @@ spec:
   minMember: ${NNODES}
 PG_EOF
 
-  log_info "创建 PodGroup: $JOB_NAME (minMember=$NNODES)"
-  kubectl create -f "$PG_MANIFEST"
+  log_info "Creating PodGroup: $JOB_NAME (minMember=$NNODES)"
+  kube_request create -f "$PG_MANIFEST"
 else
-  log_info "单卡/多卡模式：跳过 Service/PodGroup 创建"
+  log_info "Single-card/multi-card mode: skipping Service/PodGroup creation"
 fi
 
-# --- 构建 Pod labels（gang 模式才包含 pod-group label）---
+# --- Build Pod labels (include the pod-group label only in gang mode) ---
 POD_LABELS="    ppu-job: ${JOB_NAME}"
 if [ "$SINGLE_MODE" = false ]; then
   POD_LABELS="${POD_LABELS}"$'\n'"    scheduling.x-k8s.io/pod-group: ${JOB_NAME}"
@@ -615,7 +643,7 @@ AFFINITY_EOF
 )
 fi
 
-# 从 DEFAULT_NAS_VOLUMES 动态生成 pod spec 中的 NAS volumeMounts 和 volumes
+# Generate NAS volumeMounts and volumes in the pod spec dynamically from DEFAULT_NAS_VOLUMES.
 DEFAULT_NAS_VOLUME_MOUNTS=""
 DEFAULT_NAS_VOLUME_DEFS=""
 for _def_entry in "${DEFAULT_NAS_VOLUMES[@]}"; do
@@ -630,7 +658,10 @@ done
 DEFAULT_NAS_VOLUME_MOUNTS="${DEFAULT_NAS_VOLUME_MOUNTS%$'\n'}"
 DEFAULT_NAS_VOLUME_DEFS="${DEFAULT_NAS_VOLUME_DEFS%$'\n'}"
 
-# --- 循环创建 N 个 Pod ---
+MASTER_ADDR="${JOB_NAME}-worker-0.${JOB_NAME}.${NAMESPACE}.svc.cluster.local"
+[ "$SINGLE_MODE" = true ] && MASTER_ADDR="127.0.0.1"
+
+# --- Create N Pods in a loop ---
 for i in $(seq 0 $(( NNODES - 1 ))); do
   POD_MANIFEST="$MANIFEST_DIR/pod-worker-${i}.yaml"
   cat > "$POD_MANIFEST" <<POD_EOF
@@ -683,7 +714,7 @@ ${SCRIPT_INDENTED}
         - name: RANK
           value: "${i}"
         - name: MASTER_ADDR
-          value: "${JOB_NAME}-worker-0.${JOB_NAME}.${NAMESPACE}.svc.cluster.local"
+          value: "${MASTER_ADDR}"
         - name: NODE_NAME
           valueFrom:
             fieldRef:
@@ -712,13 +743,13 @@ ${DEFAULT_NAS_VOLUME_DEFS}
 ${HOST_VOLUME_DEFS}
 POD_EOF
 
-  log_info "创建 Pod: ${JOB_NAME}-worker-${i}"
-  kubectl create -f "$POD_MANIFEST"
+  log_info "Creating Pod: ${JOB_NAME}-worker-${i}"
+  kube_request create -f "$POD_MANIFEST"
 done
 
-log_info "所有 ${NNODES} 个 worker Pod 已提交"
+log_info "All ${NNODES} worker Pods submitted"
 
-# --- 写入任务记录到 NAS ---
+# --- Write the task record to NAS ---
 {
   TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"
   mkdir -p "$TASK_DIR" 2>/dev/null || true
@@ -739,7 +770,7 @@ log_info "所有 ${NNODES} 个 worker Pod 已提交"
   "status": "pending"
 }
 TASK_EOF
-  log_info "任务记录已写入: ${TASK_FILE}"
+  log_info "Task record written: ${TASK_FILE}"
 } 2>/dev/null || true
 
 log_info "Waiting for PPU scheduling (shared job timeout: ${TIMEOUT}s)..."
@@ -753,7 +784,7 @@ while true; do
     exit 0
   fi
 
-  POD_SNAPSHOT=$(kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
+  POD_SNAPSHOT=$(kube_request get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
   if [ -f "${TASK_FILE:-}" ] && printf '%s' "$POD_SNAPSHOT" | jq -e 'any(.items[]; .status.phase == "Running" or .status.phase == "Succeeded")' >/dev/null; then
     TASK_RECORDED_STATUS=$(jq -r '.status // empty' "$TASK_FILE")
     if [ "$TASK_RECORDED_STATUS" != "running" ]; then

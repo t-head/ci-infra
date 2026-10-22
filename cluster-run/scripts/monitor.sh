@@ -75,13 +75,20 @@ LOG_PID=$!
 while true; do
   NOW=$(date +%s)
   ELAPSED=$(( NOW - START_TIME ))
-  if [ "$NOW" -ge "$DEADLINE" ]; then
-    echo "::error::Job timed out after $(( DEADLINE - START_TIME ))s across scheduling and execution"
+  REQUEST_SECONDS=$(( DEADLINE - NOW ))
+  if [ "$REQUEST_SECONDS" -le 0 ]; then
     FINAL_STATUS="timeout"
-    exit 0
+    REQUEST_SECONDS=10
   fi
-
-  POD_SNAPSHOT=$(kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
+  [ "$REQUEST_SECONDS" -gt 10 ] && REQUEST_SECONDS=10
+  if POD_SNAPSHOT=$(timeout --signal=KILL "${REQUEST_SECONDS}s" \
+    kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json --request-timeout="${REQUEST_SECONDS}s"); then
+    NOW=$(date +%s)
+  else
+    rc=$?
+    [ "$(date +%s)" -lt "$DEADLINE" ] || FINAL_STATUS="timeout"
+    exit "$rc"
+  fi
   SUCCEEDED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Succeeded")] | length')
   FAILED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Failed")] | length')
   RUNNING=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Running")] | length')
@@ -94,15 +101,36 @@ while true; do
     fi
   fi
 
+  if [ "$NOW" -ge "$DEADLINE" ]; then
+    FINAL_STATUS="timeout"
+    SUCCEEDED=0
+    FAILED=0
+    while IFS='|' read -r phase finished_at; do
+      [ -n "$finished_at" ] || continue
+      finished_epoch=$(date -d "$finished_at" +%s)
+      [ "$finished_epoch" -le "$DEADLINE" ] || continue
+      case "$phase" in
+        Succeeded) SUCCEEDED=$(( SUCCEEDED + 1 )) ;;
+        Failed) FAILED=$(( FAILED + 1 )) ;;
+      esac
+    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // "")] | join("|")')
+  fi
+
   if [ "$SUCCEEDED" -eq "$NNODES" ] || [ "$FAILED" -gt 0 ]; then
     W0_PHASE=$(printf '%s' "$POD_SNAPSHOT" | jq -r --arg pod "$POD_W0" '.items[] | select(.metadata.name == $pod) | .status.phase')
     case "$W0_PHASE" in Succeeded|Failed) DRAIN_LOGS=true ;; esac
     if [ "$FAILED" -gt 0 ]; then
       echo "::error::Worker execution failed (failed=$FAILED)"
+      FINAL_STATUS="failed"
       exit 0
     fi
     FINAL_STATUS="succeeded"
     echo "All worker pods succeeded"
+    exit 0
+  fi
+
+  if [ "$NOW" -ge "$DEADLINE" ]; then
+    echo "::error::Workload exceeded the $(( DEADLINE - START_TIME ))s scheduling and execution budget"
     exit 0
   fi
 

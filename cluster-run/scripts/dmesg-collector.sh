@@ -1,4 +1,4 @@
-# 锚点法避免 --since 的时钟换算和重复时间戳造成漏记。
+# Anchors avoid missing entries due to --since clock conversion and duplicate timestamps.
 _ppu_dmesg_awk='
 function fmt(e,   d, s, z, era, doe, yoe, y, doy, mp, dd, m) {
   e = int(e) + 28800
@@ -33,7 +33,7 @@ END {
   if (INIT == 1) start = NR + 1
   else if (pos) start = pos + 1 + skip
   else {
-    print "[ppu-action] 内核日志缓冲区已回绕或锚点丢失，此处之前可能有日志丢失" >> OUT
+    print "[ppu-action] Kernel log buffer wrapped or anchor lost; earlier entries may be missing" >> OUT
     start = 1
   }
   for (i = start; i <= NR; i++) emit(line[i])
@@ -49,7 +49,7 @@ _ppu_dmesg_poll() {
 
 _ppu_dmesg_begin() {
   if ! command -v dmesg >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
-    echo "[ppu-action] 镜像内缺少 dmesg 或 awk，跳过 dmesg 采集" >&2
+    echo "[ppu-action] Image lacks dmesg or awk; skipping dmesg collection" >&2
     return 0
   fi
   _ppu_dmesg_file="${PPU_DMESG_DIR}/worker-${NODE_RANK:-0}-${NODE_NAME:-unknown}.log"
@@ -59,12 +59,12 @@ _ppu_dmesg_begin() {
   read -r _up _ < /proc/uptime
   _ppu_dmesg_boot=$(awk -v now="$(date +%s)" -v up="$_up" 'BEGIN { printf "%.6f", now - up }')
   mkdir -p "$PPU_DMESG_DIR" 2>/dev/null
-  if ! echo "# ppu-action dmesg pod=${HOSTNAME:-} node=${NODE_NAME:-} rank=${NODE_RANK:-0} start_uptime=${_up} 时间按 UTC+8 换算" > "$_ppu_dmesg_file" 2>/dev/null; then
-    echo "[ppu-action] 无法写入 ${_ppu_dmesg_file}，跳过 dmesg 采集" >&2
+  if ! echo "# ppu-action dmesg pod=${HOSTNAME:-} node=${NODE_NAME:-} rank=${NODE_RANK:-0} start_uptime=${_up} timestamps converted to UTC+8" > "$_ppu_dmesg_file" 2>/dev/null; then
+    echo "[ppu-action] Cannot write to ${_ppu_dmesg_file}; skipping dmesg collection" >&2
     return 0
   fi
   if ! _ppu_dmesg_poll 1; then
-    echo "[ppu-action] 当前容器无权读取 dmesg，跳过 dmesg 采集" >&2
+    echo "[ppu-action] Container cannot read dmesg; skipping dmesg collection" >&2
     rm -f "$_ppu_dmesg_file" "$_ppu_dmesg_snap" "$_ppu_dmesg_state"
     return 0
   fi
@@ -78,13 +78,13 @@ _ppu_dmesg_begin() {
     done
   ) &
   _ppu_dmesg_pid=$!
-  echo "[ppu-action] dmesg 采集已启动 → ${_ppu_dmesg_file}"
+  echo "[ppu-action] dmesg collection started → ${_ppu_dmesg_file}"
 }
 
 _ppu_dmesg_end() {
   [ -n "${_ppu_dmesg_pid:-}" ] || return 0
   kill -TERM "$_ppu_dmesg_pid" 2>/dev/null
   wait "$_ppu_dmesg_pid" 2>/dev/null
-  echo "# ppu-action dmesg 采集结束 exit_code=$1" >> "$_ppu_dmesg_file" 2>/dev/null
+  echo "# ppu-action dmesg collection ended exit_code=$1" >> "$_ppu_dmesg_file" 2>/dev/null
   rm -f "$_ppu_dmesg_snap" "$_ppu_dmesg_state"
 }

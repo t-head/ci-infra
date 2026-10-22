@@ -28,6 +28,8 @@ jobs:
     runs-on: <cpu-orchestration-runner-label>
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: t-head/ci-infra/cluster-run@main
         with:
@@ -51,26 +53,43 @@ jobs:
 | `0` (default) | Single pod | One pod, no `PodGroup` or headless `Service` |
 | `1..N` | Gang | `N` worker pods, a `PodGroup` (`minMember=N`) and a headless `Service` for rendezvous |
 
+### What reaches the worker
+
+Staging omits Git config files from repositories, submodules and worktrees so checkout
+authentication is not carried into the archive. Objects, refs and `HEAD` are preserved
+for commands such as `git describe --always`; the runner's workspace config is left
+intact. Configure Git on the worker if the workload needs custom settings. The checkout
+example disables credential persistence with `persist-credentials: false`.
+
+Each extra artifact uses its basename as the workspace destination. Copies are skipped
+only when source and destination identify the same object. Other existing destinations,
+even broken symlinks, cause staging to fail rather than overwrite or combine content.
+
 ## Inputs
 
 | Name | Required | Default | Description |
 |------|----------|---------|-------------|
 | `image` | yes | | Container image with job code and dependencies |
 | `command` | yes | | Shell command executed in each worker pod (`/bin/bash -c`) |
-| `nnodes` | no | `0` | Number of worker pods |
+| `nnodes` | no | `0` | Single-pod mode at `0`; otherwise the number of gang-scheduled pods |
 | `nproc_per_node` | no | `1` | PPU cards requested per pod (`alibabacloud.com/ppu`) |
 | `namespace` | no | `default` | Kubernetes namespace |
-| `timeout_minutes` | no | `60` | Job timeout; the job is cleaned up and marked failed on expiry |
+| `timeout_minutes` | no | `60` | Combined scheduling and execution limit; expiry records `timeout` and removes job resources |
 | `host_volumes` | no | | `/host/a:/ctr/a,/host/b:/ctr/b`; NAS mounts are added by default |
 | `extra_env` | no | | `KEY1=VAL1,KEY2=VAL2` |
 | `master_port` | no | `29500` | Rendezvous port |
-| `cleanup_policy` | no | `always` | `always`, `on_success` or `never` |
+| `cleanup_policy` | no | `always` | Accepted but not applied; resource removal is unconditional |
 | `source_dir` | no | `/workspace/source` | Path where staged source is extracted in the pod |
 | `node_selector` | no | | `KEY1=VAL1,...`, merged into `spec.nodeSelector` |
 | `container_options` | no | | YAML snippet, see below |
 | `artifact_paths` | no | | Extra paths (one per line) staged with the source |
 | `job_suffix` | no | | Readable segment of resource names; a unique hash is always appended |
-| `dmesg_policy` | no | `never` | `never`, `on_failure` or `always` |
+| `dmesg_policy` | no | `never` | No logs with `never`; either `on_failure` or `always` enables collection, printing and NAS storage |
+
+Changing `cleanup_policy` cannot keep pods or other job resources, which are removed
+for all terminal states. The current implementation treats `on_failure` exactly like
+`always`: kernel logs also remain on NAS after successful execution, not just after
+an error, deadline or cancellation.
 
 ### `container_options`
 
@@ -99,7 +118,7 @@ Each worker pod receives:
 | `NPROC_PER_NODE` | Cards per pod |
 | `NODE_RANK` / `RANK` | Pod index |
 | `LOCAL_RANK` | `0` |
-| `MASTER_ADDR` | DNS name of worker 0 via the headless `Service` |
+| `MASTER_ADDR` | Standalone pod: `127.0.0.1`; gang workers: worker-0 headless `Service` DNS name |
 | `MASTER_PORT` | `master_port` input |
 | `NODE_NAME` | Kubernetes node name |
 
@@ -126,5 +145,5 @@ pod independently, so multi-node jobs are accounted for correctly.
 ```
 action.yml          Composite action definition
 scripts/            Naming, submission, cleanup and dmesg scripts
-tests/              Lifecycle regression tests
+tests/              Workload lifecycle and source-transfer checks
 ```

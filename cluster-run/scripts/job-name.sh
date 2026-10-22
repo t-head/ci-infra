@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 输出本 job 的资源名：可读前缀 + 6 位 hash，hash 永远保留在末尾不被截断。
-# runner.name 在同一时刻只对应一个 job，用于区分 job id 与 matrix 都相同的不同 reusable workflow。
+# Print this job's resource name: a readable prefix + a 6-character hash, always preserved at the end without truncation.
+# runner.name identifies one job at a time, distinguishing reusable workflows with the same job id and matrix.
 set -uo pipefail
 
 sanitize_name() {
@@ -36,6 +36,6 @@ fi
 _hash=$(printf '%s\n%s\n%s\n%s' "${PPU_RUNNER_NAME:-}" "${GITHUB_JOB_NAME:-}" "${INPUT_JOB_SUFFIX:-}" "$_matrix" \
   | md5sum | cut -c1-6)
 
-# 52 = 63(hostname 上限) - "-worker-NN" 预留；前缀截到 45，再拼 "-" + 6 位 hash
+# 52 = 63 (hostname limit) minus space reserved for "-worker-NN"; truncate the prefix to 45, then append "-" + a 6-character hash.
 _prefix=$(echo "ppu-${_owner}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}-${_readable}" | cut -c1-45 | sed 's/-*$//')
 echo "${_prefix}-${_hash}"

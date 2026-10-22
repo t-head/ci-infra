@@ -1,9 +1,10 @@
 name: 'Cluster Run'
 description: >-
-  以声明式 inputs 在 PPU 集群上提交并管理框架无关的分布式作业（单卡到多机多卡），
-  通过 PodGroup + default-scheduler 的 gang 调度与拓扑感知分配。
-  应在 CPU-only 编排 runner 上执行（由用户 workflow 的 runs-on 指定编排 runner 标签），
-  编排壳零占卡，算力仅在 worker pod 中消耗。
+  Submit and manage framework-agnostic distributed jobs on a PPU cluster using declarative inputs,
+  from a single card to multiple nodes and cards, with gang scheduling and topology-aware allocation
+  through PodGroup + default-scheduler. Run on a CPU-only orchestration runner
+  (selected by the runner labels in the workflow's runs-on).
+  Orchestration uses no PPU cards; compute resources are consumed only by worker pods.
 author: 't-head'
 
 branding:
@@ -12,76 +13,77 @@ branding:
 
 inputs:
   nnodes:
-    description: '节点数（= worker Pod 数量），单机为 1，多机为 N'
+    description: 'Use 0 for one standalone worker pod; positive values specify the pod count in gang mode.'
     required: false
     default: '0'
   nproc_per_node:
-    description: '每节点 PPU 卡数（每 Pod 请求的 alibabacloud.com/ppu 数量，任意正整数）'
+    description: 'PPU cards per node (the alibabacloud.com/ppu quantity requested by each pod; any positive integer).'
     required: false
     default: '1'
   command:
     description: >-
-      用户自定义启动命令（必填）。Action 原样注入 worker pod 的 shell 执行，
-      可引用注入的分布式环境变量契约：$RANK $NODE_RANK $LOCAL_RANK $WORLD_SIZE
-      $NNODES $NPROC_PER_NODE $MASTER_ADDR $MASTER_PORT。
+      Custom launch command (required), passed unchanged to the worker pod's shell.
+      The command can reference the injected distributed environment variables: $RANK $NODE_RANK $LOCAL_RANK $WORLD_SIZE
+      $NNODES $NPROC_PER_NODE $MASTER_ADDR $MASTER_PORT.
     required: true
   image:
-    description: '训练/推理容器镜像（必填，须包含作业代码与依赖）'
+    description: 'Training/inference container image (required; must include the job code and dependencies).'
     required: true
   namespace:
-    description: 'K8s 命名空间'
+    description: 'K8s namespace.'
     required: false
     default: 'default'
   timeout_minutes:
-    description: '作业超时时间（分钟），超时后强制清理并标记失败'
+    description: 'Minutes allowed for scheduling and execution together; exceeding the limit records timeout and cleans up resources.'
     required: false
     default: '60'
   host_volumes:
-    description: '宿主机目录挂载，格式 /host/path1:/container/path1,/host/path2:/container/path2（逗号分隔，留空不挂载）。默认挂载 /nas_aisw 和 /mnt/wl_nas，无需重复指定；若传入相同容器路径的条目会被自动跳过。'
+    description: 'Host directory mounts in /host/path1:/container/path1,/host/path2:/container/path2 format (comma-separated; leave empty for no additional mounts). /nas_aisw and /mnt/wl_nas are mounted by default and need not be repeated; entries with the same container paths are skipped automatically.'
     required: false
     default: ''
   extra_env:
-    description: '额外环境变量，格式 KEY1=VAL1,KEY2=VAL2（逗号分隔）'
+    description: 'Additional environment variables in KEY1=VAL1,KEY2=VAL2 format (comma-separated).'
     required: false
     default: ''
   master_port:
-    description: 'rendezvous / 分布式通信端口'
+    description: 'Rendezvous / distributed communication port.'
     required: false
     default: '29500'
   cleanup_policy:
     description: >-
-      清理策略：always（默认）总是清理 / on_success 仅作业成功时清理，失败时保留 Pod 供调试 / never 从不清理。
+      Retained for compatibility but ignored at runtime. Every job resource is removed
+      regardless of success, failure, timeout or cancellation.
     required: false
     default: 'always'
   source_dir:
     description: >-
-      PPU pod 内源码解压路径（默认 /workspace/source）。若 workflow 中已使用 actions/checkout，
-      本 action 会自动将 $GITHUB_WORKSPACE 打包暂存到 NAS，并在 command 前自动解压到此路径，
-      供 PPU worker pod 访问。
+      Source extraction path inside the PPU pod (default /workspace/source). If the workflow uses actions/checkout,
+      this action automatically archives $GITHUB_WORKSPACE and stages it on NAS, then extracts it to this path
+      before running command so PPU worker pods can access it.
     required: false
     default: '/workspace/source'
   node_selector:
     description: >-
-      节点选择器，格式 KEY1=VAL1,KEY2=VAL2（逗号分隔），合并进 pod 的 spec.nodeSelector，
-      把作业定向到带对应标签的节点（与基础标签 ack.node.ppu.schedule 叠加，AND 硬约束）。
+      Node selector in KEY1=VAL1,KEY2=VAL2 format (comma-separated), merged into the pod's spec.nodeSelector
+      to target nodes with matching labels (combined with the base ack.node.ppu.schedule label as a hard AND constraint).
     required: false
     default: ''
   container_options:
     description: >-
-      容器运行时选项（YAML 片段，可多行）。支持的键：privileged: true/false
-      （映射容器 securityContext.privileged）；host_ipc: true/false（映射 pod spec.hostIPC）；
-      host_network: true/false（映射 pod spec.hostNetwork，置 true 时 dnsPolicy 自动补为
-      ClusterFirstWithHostNet，否则注入的 MASTER_ADDR 无法解析）；dns_policy:
-      "ClusterFirst" / "ClusterFirstWithHostNet" / "Default"（映射 pod spec.dnsPolicy，
-      显式指定时覆盖上述自动补齐）；shm_size: "8Gi"
-      （映射 /dev/shm emptyDir 的 sizeLimit，默认 64Gi）；cap_add: "SYS_PTRACE,IPC_LOCK"
-      （映射 securityContext.capabilities.add，逗号分隔）；cpus: "8" / "1.5" / "500m"
-      （别名 cpu，映射容器 resources.limits.cpu）；memory: "64Gi" / "64g"（映射容器
-      resources.limits.memory，docker 小写单位 b/k/m/g/t 按 1024 进制转换为 Ki/Mi/Gi/Ti）。
-      cpus/memory 未设置时按卡数自动计算：ZW-M890P 为 31 核和 256Gi/卡，OAM-810E
-      为 11 核和 112Gi/卡；node_selector 未指定 board-type 时按 OAM-810E 计算。
-      显式设置的值覆盖对应默认值。未列出的键会被忽略（K8s 无容器级 swap 限制，
-      不支持 memory_swap）。
+      Container runtime options (a YAML fragment, optionally multiline). Supported keys: privileged: true/false
+      (maps to container securityContext.privileged); host_ipc: true/false (maps to pod spec.hostIPC);
+      host_network: true/false (maps to pod spec.hostNetwork; when true, dnsPolicy defaults to
+      ClusterFirstWithHostNet so the injected MASTER_ADDR can resolve); dns_policy:
+      "ClusterFirst" / "ClusterFirstWithHostNet" / "Default" (maps to pod spec.dnsPolicy;
+      an explicit value overrides the automatic default above); shm_size: "8Gi"
+      (maps to the /dev/shm emptyDir sizeLimit, default 64Gi); cap_add: "SYS_PTRACE,IPC_LOCK"
+      (maps to securityContext.capabilities.add, comma-separated); cpus: "8" / "1.5" / "500m"
+      (alias cpu, maps to container resources.limits.cpu); memory: "64Gi" / "64g" (maps to container
+      resources.limits.memory; Docker lowercase units b/k/m/g/t are converted using base 1024 to bytes/Ki/Mi/Gi/Ti).
+      When cpus/memory are unset, values are calculated from the card count: ZW-M890P uses 31 cores and 256Gi per card,
+      OAM-810E uses 11 cores and 112Gi per card; OAM-810E is assumed when node_selector omits board-type.
+      Explicit values override the corresponding defaults. Unlisted keys are ignored (K8s has no container-level swap limit;
+      memory_swap is unsupported).
     required: false
     default: ''
   artifact_paths:
@@ -94,23 +96,23 @@ inputs:
     default: ''
   job_suffix:
     description: >-
-      自定义资源名的可读段（替换默认的 github.job + 首个 matrix 值），仅影响可读性。
-      资源名末尾始终附带由 runner 名与 matrix 计算的短 hash，无需靠此参数避免命名冲突。
+      Custom readable segment of resource names (replaces the default github.job + first matrix value), for readability only.
+      Resource names always end with a short hash derived from the runner name and matrix, so this input is not needed to prevent naming collisions.
     required: false
     default: ''
   dmesg_policy:
     description: >-
-      worker 所在节点内核日志保存策略：never（默认）不采集、on_failure 仅失败/超时/取消时保留、
-      always 无论结果均保留。日志按作业执行时间窗口保存到 NAS。
+      Set never (default) to turn off kernel log collection. Currently, on_failure behaves like always:
+      execution-window logs are collected, printed and kept on NAS for every result.
     required: false
     default: 'never'
 
 outputs:
   job_name:
-    description: '作业标识名'
+    description: 'Workload identifier.'
     value: ${{ steps.naming.outputs.job_name }}
   job_status:
-    description: '最终作业状态：Completed / Failed / Timeout'
+    description: 'Terminal result: succeeded, failed, timeout or cancelled.'
     value: ${{ steps.cleanup.outputs.job_status || steps.monitor.outputs.job_status || (steps.submit.outputs.job_status != 'scheduled' && steps.submit.outputs.job_status) || 'failed' }}
   duration_seconds:
     description: 'Job duration in seconds, including scheduling and execution.'
@@ -128,7 +130,7 @@ outputs:
     description: 'Comma-separated worker pod names.'
     value: ${{ steps.monitor.outputs.task_pods || steps.submit.outputs.task_pods }}
   log_artifact_name:
-    description: '上传的日志 artifact 名称'
+    description: 'Name of the uploaded log artifact.'
     value: ${{ steps.submit.outputs.log_artifact_name }}
 
 runs:
@@ -137,55 +139,56 @@ runs:
     - name: Setup kubectl
       shell: bash
       run: |
-        echo "::group::检测并按需安装 kubectl"
-        # 优先检查 hostPath 挂载的 /opt/bin/kubectl（由集群预置）
+        echo "::group::Check kubectl and install if needed"
+        # Prefer /opt/bin/kubectl, preinstalled by the cluster and mounted via hostPath.
         if [ -x /opt/bin/kubectl ]; then
           export PATH="/opt/bin:$PATH"
-          echo "✓ kubectl 已通过 hostPath 挂载就绪：/opt/bin/kubectl"
+          echo "/opt/bin" >> "$GITHUB_PATH"
+          echo "✓ kubectl is available via hostPath: /opt/bin/kubectl"
           kubectl version --client 2>/dev/null || true
         elif command -v kubectl >/dev/null 2>&1; then
-          echo "✓ kubectl 已存在，跳过安装：$(command -v kubectl)"
+          echo "✓ kubectl is already installed; skipping installation: $(command -v kubectl)"
         else
-          echo "未检测到 kubectl，开始动态下载安装"
+          echo "kubectl not found; downloading and installing"
           stable_version="$(curl -L -s --connect-timeout 5 --max-time 15 https://dl.k8s.io/release/stable.txt 2>/dev/null || echo 'v1.31.0')"
           official_url="https://dl.k8s.io/release/${stable_version}/bin/linux/amd64/kubectl"
-          echo "下载版本 ${stable_version} 从 ${official_url}"
+          echo "Downloading version ${stable_version} from ${official_url}"
           download_ok=false
           for attempt in 1 2 3; do
-            echo "尝试 #${attempt}..."
+            echo "Attempt #${attempt}..."
             if curl --fail -L --connect-timeout 10 --max-time 120 --retry 2 -o /tmp/kubectl "${official_url}"; then
               download_ok=true
               break
             fi
-            echo "下载失败，等待 5s 后重试..."
+            echo "Download failed; retrying in 5s..."
             sleep 5
           done
           if [ "$download_ok" != "true" ]; then
-            echo "::error::kubectl 下载失败（已重试 3 次）"
+            echo "::error::kubectl download failed after 3 retries"
             exit 1
           fi
-          # 验证下载的是 ELF 二进制而非 HTML 错误页
+          # Verify that the download is an ELF binary, not an HTML error page.
           if ! file /tmp/kubectl | grep -q ELF; then
-            echo "::error::下载的文件不是有效的 ELF 二进制"
+            echo "::error::Downloaded file is not a valid ELF binary"
             file /tmp/kubectl
             head -c 200 /tmp/kubectl
             exit 1
           fi
           chmod +x /tmp/kubectl
           if install -m 0755 /tmp/kubectl /usr/local/bin/kubectl 2>/dev/null; then
-            echo "✓ 已安装到 /usr/local/bin/kubectl"
+            echo "✓ Installed to /usr/local/bin/kubectl"
           else
             mkdir -p "$HOME/.local/bin"
             mv /tmp/kubectl "$HOME/.local/bin/kubectl"
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.local/bin:$PATH"
-            echo "✓ 无 /usr/local/bin 写权限，已安装到 $HOME/.local/bin/kubectl 并加入 GITHUB_PATH"
+            echo "✓ /usr/local/bin is not writable; installed to $HOME/.local/bin/kubectl and added to GITHUB_PATH"
           fi
         fi
         echo "--- kubectl version (client) ---"
         kubectl version --client 2>&1 || true
         echo "--- kubectl version (server) ---"
-        kubectl version --short 2>&1 || kubectl version 2>&1 | head -5 || echo "(server version 不可用)"
+        kubectl version --short 2>&1 || kubectl version 2>&1 | head -5 || echo "(server version unavailable)"
         echo "::endgroup::"
 
     - name: Validate inputs and check PodGroup CRD
@@ -195,27 +198,27 @@ runs:
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_NNODES: ${{ inputs.nnodes }}
       run: |
-        echo "::group::校验 inputs 与 PodGroup 可用性"
+        echo "::group::Check action inputs and PodGroup availability"
         if [ -z "$INPUT_IMAGE" ]; then
-          echo "::error::输入 'image' 为必填项"
+          echo "::error::Input 'image' is required"
           exit 1
         fi
         if [ -z "$INPUT_COMMAND" ]; then
-          echo "::error::输入 'command' 为必填项"
+          echo "::error::Input 'command' is required"
           exit 1
         fi
-        # 仅在 gang 模式下校验 PodGroup CRD（兼容 x-k8s.io 和 volcano 两种实现）
+        # Validate PodGroup CRD only in gang mode (supports both x-k8s.io and volcano implementations).
         if [ "$INPUT_NNODES" != "0" ] && command -v kubectl &> /dev/null; then
           if kubectl get crd podgroups.scheduling.x-k8s.io &> /dev/null; then
-            echo "✓ PodGroup CRD 校验通过（scheduling.x-k8s.io）"
+            echo "✓ PodGroup CRD check passed (scheduling.x-k8s.io)"
           elif kubectl get crd podgroups.scheduling.volcano.sh &> /dev/null; then
-            echo "✓ PodGroup CRD 校验通过（scheduling.volcano.sh，向后兼容）"
+            echo "✓ PodGroup CRD check passed (scheduling.volcano.sh, backward compatible)"
           else
-            echo "::error::PodGroup CRD 未安装（缺少 podgroups.scheduling.x-k8s.io 或 podgroups.scheduling.volcano.sh），无法进行 gang 调度"
+            echo "::error::PodGroup CRD not installed (missing podgroups.scheduling.x-k8s.io or podgroups.scheduling.volcano.sh); gang scheduling is unavailable"
             exit 1
           fi
         fi
-        echo "✓ inputs 校验通过"
+        echo "✓ Input validation passed"
         echo "::endgroup::"
 
     - name: Resolve job name
@@ -229,7 +232,7 @@ runs:
       run: |
         _job_name="$(bash "$GITHUB_ACTION_PATH/scripts/job-name.sh")"
         echo "job_name=${_job_name}" >> "$GITHUB_OUTPUT"
-        echo "Job 名称: ${_job_name}"
+        echo "Job name: ${_job_name}"
 
     - name: Stage source to NAS
       shell: bash
@@ -237,54 +240,62 @@ runs:
         ARTIFACT_PATHS: ${{ inputs.artifact_paths }}
         JOB_NAME: ${{ steps.naming.outputs.job_name }}
       run: |
-        echo "::group::暂存源码到 NAS（tar 打包）"
+        echo "::group::Prepare source archive on NAS (tar)"
         STAGE_TARBALL="/wl_nas/devops/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${JOB_NAME}/source.tar.gz"
-        echo "NAS 暂存 tarball: $STAGE_TARBALL"
-        echo "源码目录:         $GITHUB_WORKSPACE"
-        # 确保 NAS 目标目录存在且可写
+        echo "NAS staging tarball: $STAGE_TARBALL"
+        echo "Source directory:    $GITHUB_WORKSPACE"
+        # Ensure the NAS target directory exists and is writable.
         if [ ! -d "/wl_nas/devops" ]; then
-          echo "[warn] NAS devops 目录不存在，尝试创建..."
+          echo "[warn] NAS devops directory does not exist; attempting to create it..."
           mkdir -p /wl_nas/devops && chmod 777 /wl_nas/devops
         fi
         mkdir -p "$(dirname "$STAGE_TARBALL")"
-        # 处理 artifact_paths：将额外 artifact 拷贝到 workspace 内，一起打包
+        # Process artifact_paths: copy extra artifacts into the workspace to include in the archive.
         if [ -n "${ARTIFACT_PATHS:-}" ]; then
-          echo "处理额外的 artifact 路径..."
+          echo "Processing additional artifact paths..."
           while IFS= read -r _apath; do
-            # 跳过空行和纯空白行
+            # Skip empty and whitespace-only lines.
             [ -z "$(printf '%s' "$_apath" | tr -d '[:space:]')" ] && continue
-            # 去除首尾空白
+            # Trim leading and trailing whitespace.
             _apath="$(printf '%s' "$_apath" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-            # 解析相对路径为相对于 GITHUB_WORKSPACE
+            # Resolve relative paths against GITHUB_WORKSPACE.
             if [[ "$_apath" != /* ]]; then
               _apath="$GITHUB_WORKSPACE/$_apath"
             fi
             if [ ! -e "$_apath" ]; then
-              echo "[warn] artifact 路径不存在，已跳过: $_apath"
+              echo "[warn] Artifact path does not exist; skipping: $_apath"
               continue
             fi
             _basename="$(basename "$_apath")"
-            # 仅当 artifact 不在 workspace 内时才拷贝
-            if [ ! -e "$GITHUB_WORKSPACE/$_basename" ]; then
-              cp -a "$_apath" "$GITHUB_WORKSPACE/$_basename"
-              echo "✓ artifact 已拷贝到 workspace: $_apath → $_basename"
-            else
-              echo "✓ artifact 已在 workspace 中: $_basename"
+            _target="$GITHUB_WORKSPACE/$_basename"
+            if [ "$_apath" -ef "$_target" ]; then
+              echo "Skipping artifact already present at its destination: $_basename"
+              continue
             fi
+            if [ -e "$_target" ] || [ -L "$_target" ]; then
+              echo "::error::Cannot stage artifact over an unrelated destination: $_apath -> $_target"
+              exit 1
+            fi
+            cp -a "$_apath" "$_target"
+            echo "Staged additional artifact: $_apath -> $_basename"
           done <<< "$ARTIFACT_PATHS"
         fi
-        # 在本地 workspace 直接打包，然后 copy 到 NAS（避免 NFS 上大量文件操作和 silly rename）
+        # Archive the local workspace first, then copy to NAS to avoid excessive NFS file operations and silly renames.
         echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-        echo "workspace 顶层内容:"
-        ls -la "$GITHUB_WORKSPACE/" | head -30
-        echo "workspace .github 目录:"
-        ls -la "$GITHUB_WORKSPACE/.github/" 2>/dev/null | head -10 || echo "(.github 目录不存在)"
+        echo "Top-level workspace contents:"
+        ls -la "$GITHUB_WORKSPACE/" | head -30 || true
+        echo "Workspace .github directory:"
+        ls -la "$GITHUB_WORKSPACE/.github/" 2>/dev/null | head -10 || echo "(.github directory does not exist)"
         _local_tarball="/tmp/source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
-        tar czf "$_local_tarball" -C "$GITHUB_WORKSPACE" .
+        tar czf "$_local_tarball" \
+          --exclude='*/.git/config' --exclude='*/.git/config.worktree' \
+          --exclude='*/.git/modules/*/config' --exclude='*/.git/modules/*/config.worktree' \
+          --exclude='*/.git/worktrees/*/config' --exclude='*/.git/worktrees/*/config.worktree' \
+          -C "$GITHUB_WORKSPACE" .
         cp "$_local_tarball" "$STAGE_TARBALL"
         rm -f "$_local_tarball"
         echo "SOURCE_STAGE_DIR=$STAGE_TARBALL" >> "$GITHUB_ENV"
-        echo "✓ 源码已打包暂存到 NAS: $STAGE_TARBALL ($(du -h "$STAGE_TARBALL" | cut -f1))"
+        echo "✓ Source archived and staged on NAS: $STAGE_TARBALL ($(du -h "$STAGE_TARBALL" | cut -f1))"
         echo "::endgroup::"
 
     - name: Wait for ${{ contains(format(',{0},', inputs.node_selector), ',board-type=OAM-810E,') && '810E' || contains(format(',{0},', inputs.node_selector), ',board-type=ZW-M890P,') && '890P' || 'PPU' }} pods to be scheduled

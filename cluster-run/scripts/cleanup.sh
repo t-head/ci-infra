@@ -7,19 +7,19 @@ log_error() { echo "::error::[cleanup] $*"; }
 
 NAMESPACE="${INPUT_NAMESPACE:-default}"
 JOB_NAME="${JOB_NAME:-}"
-# cleanup_policy 已移除：无条件执行全量清理
+# cleanup_policy has been removed: always perform full cleanup.
 NNODES="${INPUT_NNODES:-0}"
 SOURCE_STAGE_DIR="${SOURCE_STAGE_DIR:-}"
 
-# job_name 在任何资源创建前已由 Resolve job name 步骤输出，为空说明尚未创建任何资源
+# Resolve job name outputs job_name before any resources are created; an empty value means none exist yet.
 if [ -z "$JOB_NAME" ]; then
-  log_warn "未获取到 job_name，跳过清理"
+  log_warn "job_name is unavailable; skipping cleanup"
   exit 0
 fi
 
-# NAS 源码暂存 tarball 始终清理（无论 cleanup_policy，因为只是临时中转存储）
+# Always remove the source tarball staged on NAS, regardless of cleanup_policy, since it is temporary transfer storage.
 if [ -n "${SOURCE_STAGE_DIR:-}" ] && [ -f "$SOURCE_STAGE_DIR" ]; then
-  log_info "清理 NAS 源码暂存 tarball: $SOURCE_STAGE_DIR"
+  log_info "Removing source tarball staged on NAS: $SOURCE_STAGE_DIR"
   rm -f "$SOURCE_STAGE_DIR"
   _parent_dir="$(dirname "$SOURCE_STAGE_DIR")"
   if [ -d "$_parent_dir" ] && [ -z "$(ls -A "$_parent_dir" 2>/dev/null)" ]; then
@@ -27,9 +27,9 @@ if [ -n "${SOURCE_STAGE_DIR:-}" ] && [ -f "$SOURCE_STAGE_DIR" ]; then
   fi
 fi
 
-log_info "执行全量清理: $JOB_NAME (namespace=$NAMESPACE)"
+log_info "Performing full cleanup: $JOB_NAME (namespace=$NAMESPACE)"
 
-# --- 更新任务记录 ---
+# --- Update the task record ---
 TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"
 TASK_FILE="${TASK_DIR}/${JOB_NAME}.json"
 TASK_STATUS="${INPUT_JOB_STATUS:-}"
@@ -54,67 +54,114 @@ if [ -f "$TASK_FILE" ] && command -v jq >/dev/null 2>&1; then
   jq --arg end_time "$TASK_END_TIME" --arg status "$TASK_STATUS" \
     '.end_time = $end_time | .status = $status' \
     "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-  log_info "任务记录已更新: ${TASK_FILE} (status=${TASK_STATUS})"
+  log_info "Task record updated: ${TASK_FILE} (status=${TASK_STATUS})"
 fi
 
 POD_SELECTOR="ppu-job=$JOB_NAME"
 
-# 带重试的 delete（应对 etcd NOSPACE 等暂时性故障）
-kube_delete_retry() {
-  local max_retries=3 delay=5
-  for attempt in $(seq 1 $max_retries); do
-    if "$@" 2>/dev/null; then return 0; fi
-    if [ $attempt -lt $max_retries ]; then
-      log_warn "删除失败（第${attempt}次），${delay}s 后重试..."
-      sleep $delay
-    fi
-  done
-  log_warn "删除在 ${max_retries} 次重试后仍失败，跳过。"
-  return 0
+# Apply a single time limit to cluster cleanup and keep a final force-delete allowance.
+CLEANUP_TIMEOUT=60
+FORCE_RESERVE=10
+CLEANUP_START=$(date +%s)
+CLEANUP_DEADLINE=$((CLEANUP_START + CLEANUP_TIMEOUT))
+CLEANUP_CONFIRMED=true
+PODS_CONFIRMED=false
+
+kube_request() {
+  local reserve=$1 remaining request_seconds
+  shift
+  remaining=$((CLEANUP_DEADLINE - $(date +%s) - reserve))
+  [ "$remaining" -gt 0 ] || return 1
+  request_seconds=$remaining
+  [ "$request_seconds" -le 10 ] || request_seconds=10
+  timeout --signal=KILL "${request_seconds}s" \
+    kubectl "$@" --request-timeout="${request_seconds}s"
 }
 
-log_info "删除 pods: $JOB_NAME (namespace=$NAMESPACE)"
-kube_delete_retry kubectl delete pods -n "$NAMESPACE" -l "$POD_SELECTOR" --ignore-not-found=true
+cleanup_sleep() {
+  local seconds=$1 reserve=$2 remaining
+  remaining=$((CLEANUP_DEADLINE - $(date +%s) - reserve))
+  [ "$remaining" -gt 0 ] || return 1
+  [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  sleep "$seconds"
+}
 
-# Service 与 PodGroup 仅在 gang 模式（nnodes>=2）创建，单机模式跳过删除以避免多余告警
+# Retry deletion to handle transient failures such as etcd NOSPACE.
+kube_delete_retry() {
+  local max_retries=3 delay=5 attempt
+  for ((attempt=1; attempt<=max_retries; attempt++)); do
+    if kube_request "$FORCE_RESERVE" "$@" 2>/dev/null; then return 0; fi
+    if [ "$attempt" -lt "$max_retries" ]; then
+      log_warn "Deletion failed (attempt ${attempt}); retrying in at most ${delay}s..."
+      cleanup_sleep "$delay" "$FORCE_RESERVE" || break
+    fi
+  done
+  log_warn "Deletion remains unconfirmed after the available attempts or time budget."
+  return 1
+}
+
+log_info "Deleting pods: $JOB_NAME (namespace=$NAMESPACE)"
+kube_delete_retry delete pods -n "$NAMESPACE" -l "$POD_SELECTOR" \
+  --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
+
+# No Service or PodGroup exists for standalone workloads.
 if [ "$NNODES" != "0" ]; then
-  log_info "删除 service: $JOB_NAME"
-  kube_delete_retry kubectl delete svc "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true
+  log_info "Deleting service: $JOB_NAME"
+  kube_delete_retry delete svc "$JOB_NAME" -n "$NAMESPACE" \
+    --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
 
-  log_info "删除 podgroup: $JOB_NAME"
-  kube_delete_retry kubectl delete podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true
+  log_info "Deleting podgroup: $JOB_NAME"
+  kube_delete_retry delete podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" \
+    --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
 else
-  log_info "单卡/多卡模式（nnodes=0），无 service/podgroup 需清理，跳过。"
+  log_info "Single-card/multi-card mode (nnodes=0): no service/podgroup to clean up; skipping."
 fi
 
-WAIT_TIMEOUT=60
-WAIT_START=$(date +%s)
-
-log_info "等待关联 pod 终止..."
+log_info "Waiting for associated pods to terminate..."
+FORCE_ATTEMPTED=false
 while true; do
-  ELAPSED=$(( $(date +%s) - WAIT_START ))
-  POD_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "$POD_SELECTOR" \
-                --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  REMAINING=$((CLEANUP_DEADLINE - $(date +%s)))
+  [ "$REMAINING" -gt 0 ] || break
 
-  if [ "${POD_COUNT:-0}" -eq 0 ]; then
-    log_info "所有关联 pod 已终止。"
-    break
+  if [ "$REMAINING" -le "$FORCE_RESERVE" ] && [ "$FORCE_ATTEMPTED" = false ]; then
+    FORCE_ATTEMPTED=true
+    log_warn "Pod removal is not confirmed; issuing a bounded force-delete request."
+    if ! kube_request 0 delete pods -n "$NAMESPACE" -l "$POD_SELECTOR" \
+      --force --grace-period=0 --wait=false --ignore-not-found=true 2>/dev/null; then
+      CLEANUP_CONFIRMED=false
+      log_warn "The force-delete request failed or reached the cleanup deadline."
+    fi
+    continue
   fi
 
-  if [ "$ELAPSED" -ge "$WAIT_TIMEOUT" ]; then
-    log_warn "等待 pod 终止超时 (${WAIT_TIMEOUT}s)，强制删除残留 pod。"
-    kubectl delete pods -n "$NAMESPACE" -l "$POD_SELECTOR" \
-      --force --grace-period=0 2>/dev/null || true
-    break
+  REQUEST_RESERVE=$FORCE_RESERVE
+  [ "$FORCE_ATTEMPTED" = false ] || REQUEST_RESERVE=0
+  if POD_LIST=$(kube_request "$REQUEST_RESERVE" get pods -n "$NAMESPACE" \
+    -l "$POD_SELECTOR" --no-headers 2>/dev/null); then
+    POD_COUNT=0
+    while IFS= read -r pod_line; do
+      if [ -n "$pod_line" ]; then POD_COUNT=$((POD_COUNT + 1)); fi
+    done <<< "$POD_LIST"
+    if [ "$POD_COUNT" -eq 0 ]; then
+      PODS_CONFIRMED=true
+      break
+    fi
+    ELAPSED=$(( $(date +%s) - CLEANUP_START ))
+    echo "  Waiting for ${POD_COUNT} pods to terminate... (${ELAPSED}s/${CLEANUP_TIMEOUT}s)"
+  else
+    log_warn "Could not query pods; cleanup is unverified and will be checked again within the time limit."
   fi
-
-  echo "  等待 ${POD_COUNT} 个 pod 终止... (${ELAPSED}s/${WAIT_TIMEOUT}s)"
-  sleep 5
+  cleanup_sleep 5 "$REQUEST_RESERVE" || continue
 done
 
 if [ -d "/tmp/training-manifests" ]; then
-  log_info "清理临时 manifest 文件"
+  log_info "Removing temporary manifest files"
   rm -rf /tmp/training-manifests
 fi
 
-log_info "清理完成: $JOB_NAME"
+if [ "$CLEANUP_CONFIRMED" = true ] && [ "$PODS_CONFIRMED" = true ]; then
+  log_info "All associated pods have terminated."
+  log_info "Cleanup complete: $JOB_NAME"
+else
+  log_warn "Cleanup ended without confirmed cluster resource removal: $JOB_NAME. Finalizers may still retain pods; they were left untouched."
+fi

@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -94,15 +95,33 @@ def fake_command(tool, args):
         signal.signal(signal.SIGTERM, forward)
         signal.signal(signal.SIGINT, forward)
         try:
-            returncode = child.wait(timeout=10)
+            limit = 0.15 if fixture.get("block_delete") and args[command + 1] == "delete" else 10
+            returncode = child.wait(timeout=limit)
             return returncode if returncode >= 0 else 128 - returncode
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait()
+            clock(int(args[command - 1].removesuffix("s")))
             return 124
 
     if tool == "kubectl":
-        if args[0] in ("create", "delete") or args[:2] == ["get", "crd"]:
+        if args[0] != "logs" and not any(arg.startswith("--request-timeout=") for arg in args):
+            raise ValueError("API requests must be bounded")
+        if args[0] == "delete":
+            if "--wait=false" not in args:
+                raise ValueError("Deletion must not wait for finalizers")
+            if fixture.get("block_delete"):
+                while True:
+                    time.sleep(0.01)
+            if "--force" in args:
+                (root / "forced").touch()
+            return fixture.get("delete_error", 0)
+        if args[0] == "create":
+            path = Path(args[args.index("-f") + 1])
+            (root / "manifests").mkdir(exist_ok=True)
+            (root / "manifests" / path.name).write_text(path.read_text())
+            return 0
+        if args[:2] == ["get", "crd"]:
             return 0
         if args[0] == "logs":
             if args[1] != os.environ["JOB_NAME"] + "-worker-0":
@@ -123,7 +142,16 @@ def fake_command(tool, args):
             return 0
         if args[:2] in (["get", "pods"], ["get", "pod"]):
             if "--no-headers" in args:
+                if fixture.get("query_error"):
+                    return fixture["query_error"]
+                if clock() < fixture.get("stale_pods_until", 0) or fixture.get("remaining_pods"):
+                    print("old-worker")
                 return 0
+            if fixture.get("pod_query_error") and not (root / "query-failed").exists():
+                if fixture.get("pod_query_error_once"):
+                    (root / "query-failed").touch()
+                clock(fixture.get("pod_query_error_advance", 0))
+                return fixture["pod_query_error"]
             frames = fixture["frames"]
             items = frames[0]["pods"]
             for frame in frames:
@@ -145,6 +173,12 @@ class LifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="ppu-lifecycle-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.scripts = self.root / "scripts"
+        shutil.copytree(SCRIPTS, self.scripts)
+        for path in self.scripts.glob("*.sh"):
+            path.write_text(path.read_text()
+                            .replace("/tmp/training-manifests", str(self.root / "manifests"))
+                            .replace("/wl_nas/devops/ppu-dashboard/tasks", str(self.root / "tasks")))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for tool in ("kubectl", "date", "sleep", "timeout"):
@@ -206,7 +240,7 @@ class LifecycleTests(unittest.TestCase):
     def start(self, script, **env):
         output = self.root / (script + ".outputs")
         process = subprocess.Popen(
-            ["/bin/bash", str(SCRIPTS / script)], env={**self.env, **env, "GITHUB_OUTPUT": str(output)},
+            ["/bin/bash", str(self.scripts / script)], env={**self.env, **env, "GITHUB_OUTPUT": str(output)},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         self.processes.append(process)
         return process, output
@@ -248,7 +282,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertEqual(outputs["job_status"], "scheduled")
         self.assertEqual(int(outputs["deadline"]) - int(outputs["start_time"]), 60)
-        self.assertEqual(int((self.root / "clock").read_text()), int(outputs["start_time"]))
+        self.assertEqual(int((self.root / "clock").read_text()), int(outputs["start_time"]) + 3)
         self.assertEqual([call["args"] for call in self.calls("sleep")], [["3"]])
         creates = [call for call in self.calls("kubectl") if call["args"][0] == "create"]
         self.assertEqual(len(creates), 10)
@@ -307,9 +341,9 @@ class LifecycleTests(unittest.TestCase):
         self.assert_reported(outputs, "timeout", 1)
         self.assertEqual(outputs["duration_seconds"], "60")
         monitor_sleeps = [call["args"] for call in self.calls()[before:] if call["tool"] == "sleep"]
-        self.assertEqual(monitor_sleeps, [["30"]])
-        budgets = [call["args"][2] for call in self.calls("timeout")]
-        self.assertEqual(budgets, ["30s"])
+        self.assertEqual(monitor_sleeps, [["27"]])
+        budgets = [call["args"][2] for call in self.calls("timeout") if "logs" in call["args"]]
+        self.assertEqual(budgets, ["27s"])
 
     def test_sigterm_finalizes_both_steps_and_reaps_log_children(self):
         for script in ("submit.sh", "monitor.sh"):
@@ -343,7 +377,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assert_reported(outputs, "failed", 8)
         self.assertEqual(outputs["unscheduled_pods"], "7")
-        self.assertEqual(outputs["duration_seconds"], "0")
+        self.assertEqual(outputs["duration_seconds"], "3")
         self.assertEqual([call["args"] for call in self.calls("sleep")], [["3"]])
 
     def test_monitor_exits_on_failed_member_while_worker_zero_is_running(self):
@@ -374,7 +408,8 @@ class LifecycleTests(unittest.TestCase):
         self.configure([pod(0)])
         script = (SCRIPTS / "cleanup.sh").read_text().replace(
             'TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"',
-            "TASK_DIR=" + shlex.quote(str(self.root)))
+            "TASK_DIR=" + shlex.quote(str(self.root))).replace(
+                "/tmp/training-manifests", str(self.root / "manifests"))
         task = self.root / (self.env["JOB_NAME"] + ".json")
         output = self.root / "cleanup-record.outputs"
         for status, recorded, expected in (
@@ -397,6 +432,177 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(rc, 0, text)
                 self.assertEqual(outputs["job_status"], expected)
                 self.assertEqual(json.loads(task.read_text())["status"], expected)
+
+    def worker_manifest(self):
+        path = self.root / "manifests" / "pod-worker-0.yaml"
+        return json.loads(subprocess.check_output(
+            ["ruby", "-ryaml", "-rjson", "-e",
+             "puts JSON.generate(YAML.safe_load(STDIN.read, aliases: true))"],
+            input=path.read_text(), text=True, stderr=subprocess.DEVNULL))
+
+    def test_source_extraction_failure_stops_multiline_workload(self):
+        archive = self.root / "broken source.tar.gz"
+        archive.write_bytes(b"not a tar archive")
+        marker = self.root / "should-not-exist"
+        self.configure([pod(0, scheduled=EPOCH)])
+        rc, outputs, text = self.run_script(
+            "submit.sh", SOURCE_STAGE_DIR=str(archive),
+            INPUT_SOURCE_DIR=str(self.root / "source 'quoted"),
+            INPUT_COMMAND="set -euo pipefail\ntouch " + shlex.quote(str(marker)) + "\nexit 0")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        command = self.worker_manifest()["spec"]["containers"][0]["args"][0]
+        result = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_source_extraction_preserves_paths_and_workload_exit_code(self):
+        archive = self.root / "valid source.tar.gz"
+        source = self.root / "required.txt"
+        source.write_text("source transferred")
+        with tarfile.open(archive, "w:gz") as handle:
+            handle.add(source, arcname="required.txt")
+        self.configure([pod(0, scheduled=EPOCH)])
+        rc, outputs, text = self.run_script(
+            "submit.sh", SOURCE_STAGE_DIR=str(archive),
+            INPUT_SOURCE_DIR=str(self.root / "source 'quoted"),
+            INPUT_COMMAND="set -euo pipefail\ntest -f required.txt\nexit 7")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        command = self.worker_manifest()["spec"]["containers"][0]["args"][0]
+        result = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual((self.root / "source 'quoted" / "required.txt").read_text(), "source transferred")
+
+    def test_master_address_for_single_pod_and_gang(self):
+        for nodes, cards in ((0, 1), (0, 8), (2, 8)):
+            with self.subTest(nodes=nodes, cards=cards):
+                self.configure([pod(i, scheduled=EPOCH) for i in range(nodes or 1)])
+                rc, _, text = self.run_script(
+                    "submit.sh", INPUT_NNODES=str(nodes), INPUT_NPROC_PER_NODE=str(cards))
+                self.assertEqual(rc, 0, text)
+                env = {item["name"]: item.get("value") for item in
+                       self.worker_manifest()["spec"]["containers"][0]["env"]}
+                expected = (self.env["JOB_NAME"] + "-worker-0." + self.env["JOB_NAME"]
+                            + ".fixture.svc.cluster.local") if nodes else "127.0.0.1"
+                self.assertEqual(env["MASTER_ADDR"], expected)
+
+    def test_submission_waits_for_old_pods_within_original_budget(self):
+        self.configure([pod(0)], stale_pods_until=EPOCH + 120)
+        rc, outputs, text = self.run_script("submit.sh")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "timeout")
+        self.assertEqual(outputs["start_time"], str(EPOCH))
+        self.assertEqual(outputs["duration_seconds"], "60")
+        self.assertFalse(any(call["args"][0] == "create" for call in self.calls("kubectl")))
+
+    def test_submission_aborts_on_delete_or_query_failure(self):
+        for options in ({"delete_error": 42}, {"query_error": 42}):
+            with self.subTest(options=options):
+                self.configure([pod(0)], **options)
+                rc, outputs, _ = self.run_script("submit.sh")
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(outputs["job_status"], "failed")
+                self.assertFalse(any(call["args"][0] == "create" for call in self.calls("kubectl")))
+
+    def test_submission_bounds_blocked_delete(self):
+        self.configure([pod(0)], block_delete=True)
+        rc, outputs, _ = self.run_script("submit.sh")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(outputs["job_status"], "failed")
+        self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertTrue(any("delete" in call["args"] for call in self.calls("timeout")))
+        self.assertFalse(any(call["args"][0] == "create" for call in self.calls("kubectl")))
+
+    def test_monitor_refreshes_terminal_state_at_last_poll(self):
+        running = [pod(0, "Running", EPOCH, started=EPOCH)]
+        complete = [pod(0, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 55)]
+        self.configure(running, later=[(EPOCH + 55, complete)])
+        rc, outputs, text = self.run_script("monitor.sh")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "succeeded", 1)
+
+    def test_monitor_distinguishes_on_time_and_late_terminal_states(self):
+        for phase, finish, expected in (("Succeeded", 55, "succeeded"),
+                                        ("Succeeded", 60, "succeeded"),
+                                        ("Succeeded", 61, "timeout"),
+                                        ("Failed", 55, "failed"),
+                                        ("Failed", 61, "timeout")):
+            with self.subTest(phase=phase, finish=finish):
+                self.configure([pod(0, phase, EPOCH, started=EPOCH, finished=EPOCH + finish)],
+                               now=EPOCH + 65)
+                rc, outputs, text = self.run_script("monitor.sh")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, expected, 1)
+        self.configure([pod(0, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 55),
+                        pod(1, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 61)],
+                       now=EPOCH + 65)
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "timeout", 2)
+
+    def test_monitor_query_failure_classification_at_deadline(self):
+        for now, advance, expected in ((EPOCH + 59, 0, "failed"),
+                                       (EPOCH + 59, 1, "timeout"),
+                                       (EPOCH + 65, 0, "timeout")):
+            with self.subTest(now=now, advance=advance):
+                (self.root / "query-failed").unlink(missing_ok=True)
+                self.configure([pod(0, "Running", EPOCH, started=EPOCH)],
+                               now=now, pod_query_error=42, pod_query_error_once=True,
+                               pod_query_error_advance=advance)
+                rc, outputs, text = self.run_script("monitor.sh")
+                self.assertEqual(rc, 42, text)
+                self.assert_reported(outputs, expected, 1)
+
+    def test_cleanup_is_unconditional_for_all_policy_values(self):
+        self.configure([pod(0)])
+        for policy in ("always", "on_success", "never"):
+            with self.subTest(policy=policy):
+                before = len(self.calls())
+                rc, outputs, text = self.run_script(
+                    "cleanup.sh", INPUT_NNODES="2", INPUT_CLEANUP_POLICY=policy,
+                    INPUT_JOB_STATUS="failed")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "failed")
+                deletes = [call for call in self.calls()[before:]
+                           if call["tool"] == "kubectl" and call["args"][0] == "delete"]
+                self.assertEqual({call["args"][1] for call in deletes},
+                                 {"pods", "svc", "podgroups.scheduling.x-k8s.io"})
+                self.assertTrue(all("--wait=false" in call["args"] for call in deletes))
+
+    def test_cleanup_force_deletes_finalized_pods_within_budget(self):
+        self.configure([pod(0)], remaining_pods=True)
+        rc, _, text = self.run_script("cleanup.sh")
+        self.assertEqual(rc, 0, text)
+        self.assertTrue((self.root / "forced").exists())
+        self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertNotIn("All associated pods have terminated", text)
+
+    def test_cleanup_does_not_treat_query_failure_as_empty(self):
+        self.configure([pod(0)], query_error=42)
+        rc, _, text = self.run_script("cleanup.sh")
+        self.assertEqual(rc, 0, text)
+        self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertNotIn("All associated pods have terminated", text)
+        self.assertTrue((self.root / "forced").exists())
+
+    def test_cleanup_bounds_blocked_api_requests(self):
+        self.configure([pod(0)], block_delete=True, query_error=42)
+        rc, _, text = self.run_script("cleanup.sh")
+        self.assertEqual(rc, 0, text)
+        self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertNotIn("All associated pods have terminated", text)
+
+    def test_dmesg_enabled_policies_keep_the_same_collection_contract(self):
+        commands = {}
+        for policy in ("never", "on_failure", "always"):
+            self.configure([pod(0, scheduled=EPOCH)])
+            rc, _, text = self.run_script("submit.sh", INPUT_DMESG_POLICY=policy)
+            self.assertEqual(rc, 0, text)
+            commands[policy] = self.worker_manifest()["spec"]["containers"][0]["args"][0]
+        self.assertNotIn("_ppu_dmesg_begin", commands["never"])
+        self.assertIn("_ppu_dmesg_begin", commands["always"])
+        self.assertEqual(commands["on_failure"], commands["always"])
 
     def test_report_card_hours_use_pod_timestamps(self):
         self.configure([

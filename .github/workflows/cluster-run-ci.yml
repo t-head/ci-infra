@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Fetch source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Inspect action definition
         shell: bash
@@ -68,6 +70,10 @@ jobs:
       - name: Exercise scheduling and monitoring transitions
         shell: bash
         run: python3 cluster-run/tests/test-lifecycle.py
+
+      - name: Cover source transfer and workflow assertions
+        shell: bash
+        run: python3 cluster-run/tests/test-staging.py
 
       - name: Verify generated names
         shell: bash
@@ -117,6 +123,8 @@ jobs:
     steps:
       - name: Fetch this revision
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Launch ${{ matrix.label }} workload
         id: smoke
@@ -178,6 +186,8 @@ jobs:
     steps:
       - name: Fetch this revision
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Run scheduling and log phases
         id: lifecycle
@@ -204,7 +214,8 @@ jobs:
         run: |
           [ "$ALLOCATION_STATUS" = "$REQUIRED_STATUS" ]
           [ "$ALLOCATION_OUTCOME" = "$REQUIRED_OUTCOME" ]
-          [ -z "$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$ALLOCATION_NAME" -o name)" ]
+          pods="$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$ALLOCATION_NAME" -o name)"
+          test -z "$pods"
           if [ "$REQUIRED_STATUS" = timeout ]; then
             awk -v value="$EXECUTION_CARD_HOURS" 'BEGIN { exit !(value > 0) }'
           fi
@@ -229,6 +240,8 @@ jobs:
     steps:
       - name: Fetch this revision
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read enforced cgroup limits
         uses: $/cluster-run
@@ -275,6 +288,8 @@ jobs:
     steps:
       - name: Fetch this revision
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Submit oversized 810E gang
         id: blocked_allocation
@@ -307,6 +322,8 @@ jobs:
     steps:
       - name: Fetch source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Create marker
         shell: bash
@@ -340,6 +357,8 @@ jobs:
     steps:
       - name: Fetch this revision
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Restore marker outside the checkout
         uses: actions/download-artifact@v4
