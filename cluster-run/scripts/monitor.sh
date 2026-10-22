@@ -63,8 +63,15 @@ echo "Streaming worker-0 logs; waiting for all ${NNODES} worker pods to finish"
       kubectl logs "$POD_W0" -c worker -n "$NAMESPACE" -f --pod-running-timeout=5s 2>/dev/null &
     _log_child=$!
     wait "$_log_child" && break
-    _phase=$(kubectl get pod "$POD_W0" -n "$NAMESPACE" --request-timeout=10s -o jsonpath='{.status.phase}' 2>/dev/null || true)
-    case "$_phase" in Succeeded|Failed) break ;; esac
+    _phase=$(timeout --signal=KILL 10s kubectl get pod "$POD_W0" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    case "$_phase" in
+      Succeeded|Failed)
+        timeout --signal=TERM --kill-after=5s 10s kubectl logs "$POD_W0" -c worker -n "$NAMESPACE" 2>/dev/null &
+        _log_child=$!
+        wait "$_log_child" || true
+        break
+        ;;
+    esac
     sleep 3 &
     _log_child=$!
     wait "$_log_child" || true
@@ -82,7 +89,7 @@ while true; do
   fi
   [ "$REQUEST_SECONDS" -gt 10 ] && REQUEST_SECONDS=10
   if POD_SNAPSHOT=$(timeout --signal=KILL "${REQUEST_SECONDS}s" \
-    kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json --request-timeout="${REQUEST_SECONDS}s"); then
+    kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json); then
     NOW=$(date +%s)
   else
     rc=$?

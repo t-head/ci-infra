@@ -86,7 +86,8 @@ def fake_command(tool, args):
 
     if tool == "timeout":
         command = next(i for i, arg in enumerate(args) if arg == "kubectl")
-        child = subprocess.Popen(args[command:])
+        child = subprocess.Popen(args[command:], env={**os.environ,
+                                 "LIFECYCLE_API_TIMEOUT": args[command - 1]})
 
         def forward(signum, frame):
             if child.poll() is None:
@@ -95,7 +96,7 @@ def fake_command(tool, args):
         signal.signal(signal.SIGTERM, forward)
         signal.signal(signal.SIGINT, forward)
         try:
-            limit = 0.15 if fixture.get("block_delete") and args[command + 1] == "delete" else 10
+            limit = 1 if fixture.get("block_delete") and args[command + 1] == "delete" else 10
             returncode = child.wait(timeout=limit)
             return returncode if returncode >= 0 else 128 - returncode
         except subprocess.TimeoutExpired:
@@ -105,8 +106,10 @@ def fake_command(tool, args):
             return 124
 
     if tool == "kubectl":
-        if args[0] != "logs" and not any(arg.startswith("--request-timeout=") for arg in args):
-            raise ValueError("API requests must be bounded")
+        if not os.environ.get("LIFECYCLE_API_TIMEOUT"):
+            raise ValueError("API requests must have an outer deadline")
+        if any(arg.startswith("--request-timeout=") for arg in args):
+            raise ValueError("Request timeout overrides break in-cluster configuration")
         if args[0] == "delete":
             if "--wait=false" not in args:
                 raise ValueError("Deletion must not wait for finalizers")
@@ -123,11 +126,20 @@ def fake_command(tool, args):
             return 0
         if args[:2] == ["get", "crd"]:
             return 0
+        if args[0] == "get" and args[1] in ("svc", "podgroups.scheduling.x-k8s.io"):
+            if fixture.get("gang_query_error") == args[1]:
+                return 42
+            if clock() < fixture.get("stale_" + args[1] + "_until", 0):
+                print(args[1] + "/old-resource")
+            return 0
         if args[0] == "logs":
             if args[1] != os.environ["JOB_NAME"] + "-worker-0":
                 raise ValueError("Only worker-0 logs may be streamed")
             if any(arg.startswith(("--tail", "--since")) for arg in args):
                 raise ValueError("Early logs must not be filtered")
+            if fixture.get("first_log_error") and not (root / "log-failed").exists():
+                (root / "log-failed").touch()
+                return 42
             lines = fixture.get("logs", ["early training log", "final training log"])
             print("\n".join(lines[:-1]), flush=True)
             (root / "logs-started").touch()
@@ -247,7 +259,7 @@ class LifecycleTests(unittest.TestCase):
 
     def finish(self, process, output):
         try:
-            text, _ = process.communicate(timeout=15)
+            text, _ = process.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             text, _ = process.communicate()
@@ -487,6 +499,46 @@ class LifecycleTests(unittest.TestCase):
                             + ".fixture.svc.cluster.local") if nodes else "127.0.0.1"
                 self.assertEqual(env["MASTER_ADDR"], expected)
 
+    def test_user_environment_preserves_trailing_newlines(self):
+        values = {"EMPTY": "", "MULTILINE": "line one\nline two\n\n",
+                  "QUOTED": '"quoted"\\value\n', "SENTINEL": "ends with.\n"}
+        self.configure([pod(0, scheduled=EPOCH)])
+        rc, _, text = self.run_script("submit.sh", USER_ENV_JSON=json.dumps(values))
+        self.assertEqual(rc, 0, text)
+        env = {item["name"]: item.get("value") for item in
+               self.worker_manifest()["spec"]["containers"][0]["env"]}
+        for key, value in values.items():
+            self.assertEqual(env[key], value)
+
+    def test_shared_memory_quantity_suffixes(self):
+        for size in ("512Ki", "512Mi", "8Gi", "1.5Gi", "512k", "8M", "1024", "512ki"):
+            with self.subTest(size=size):
+                self.configure([pod(0, scheduled=EPOCH)])
+                rc, _, text = self.run_script("submit.sh", CONTAINER_OPTIONS="shm_size: " + size)
+                if size == "512ki":
+                    self.assertNotEqual(rc, 0, text)
+                else:
+                    self.assertEqual(rc, 0, text)
+                    shm = next(volume for volume in self.worker_manifest()["spec"]["volumes"]
+                               if volume["name"] == "dshm")
+                    self.assertEqual(str(shm["emptyDir"]["sizeLimit"]), size)
+
+    def test_monitor_fetches_terminal_logs_after_initial_failure(self):
+        self.configure([pod(0, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 1)],
+                       first_log_error=True, logs=["early output", "final output"])
+        rc, outputs, text = self.run_script("monitor.sh")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "succeeded")
+        self.assertIn("[worker-0] early output\n", text)
+        self.assertIn("[worker-0] final output\n", text)
+        logs = [call["args"] for call in self.calls("kubectl") if call["args"][0] == "logs"]
+        self.assertEqual(len(logs), 2)
+        self.assertIn("-f", logs[0])
+        self.assertNotIn("-f", logs[1])
+        final_timeout = [call["args"] for call in self.calls("timeout")
+                         if "logs" in call["args"] and "-f" not in call["args"]]
+        self.assertEqual(final_timeout[0][2], "10s")
+
     def test_submission_waits_for_old_pods_within_original_budget(self):
         self.configure([pod(0)], stale_pods_until=EPOCH + 120)
         rc, outputs, text = self.run_script("submit.sh")
@@ -495,6 +547,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(outputs["start_time"], str(EPOCH))
         self.assertEqual(outputs["duration_seconds"], "60")
         self.assertFalse(any(call["args"][0] == "create" for call in self.calls("kubectl")))
+
+    def test_submission_waits_for_all_gang_resources(self):
+        for resource in ("svc", "podgroups.scheduling.x-k8s.io"):
+            for removed_at, expected in ((EPOCH + 9, "scheduled"), (EPOCH + 120, "timeout")):
+                with self.subTest(resource=resource, removed_at=removed_at):
+                    before = len(self.calls())
+                    self.configure([pod(i, scheduled=EPOCH) for i in range(2)],
+                                   **{"stale_" + resource + "_until": removed_at})
+                    rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="2")
+                    self.assertEqual(rc, 0, text)
+                    self.assertEqual(outputs["job_status"], expected)
+                    now = int((self.root / "clock").read_text())
+                    self.assertEqual(now, EPOCH + (9 if expected == "scheduled" else 60))
+                    creates = [call for call in self.calls()[before:]
+                               if call["tool"] == "kubectl" and call["args"][0] == "create"]
+                    self.assertEqual(len(creates), 4 if expected == "scheduled" else 0)
+
+    def test_submission_aborts_on_gang_resource_query_failure(self):
+        for resource in ("svc", "podgroups.scheduling.x-k8s.io"):
+            with self.subTest(resource=resource):
+                self.configure([pod(i, scheduled=EPOCH) for i in range(2)],
+                               gang_query_error=resource)
+                rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="2")
+                self.assertEqual(rc, 42, text)
+                self.assertEqual(outputs["job_status"], "failed")
+                self.assertFalse(any(call["args"][0] == "create" for call in self.calls("kubectl")))
 
     def test_submission_aborts_on_delete_or_query_failure(self):
         for options in ({"delete_error": 42}, {"query_error": 42}):
@@ -591,6 +669,17 @@ class LifecycleTests(unittest.TestCase):
         rc, _, text = self.run_script("cleanup.sh")
         self.assertEqual(rc, 0, text)
         self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertNotIn("All associated pods have terminated", text)
+
+    def test_cleanup_attempts_every_gang_resource_before_retries(self):
+        self.configure([pod(0)], block_delete=True, query_error=42)
+        rc, _, text = self.run_script("cleanup.sh", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        deletes = [call["args"] for call in self.calls("kubectl") if call["args"][0] == "delete"]
+        self.assertEqual([args[1] for args in deletes[:3]],
+                         ["pods", "svc", "podgroups.scheduling.x-k8s.io"])
+        self.assertLessEqual(int((self.root / "clock").read_text()) - EPOCH, 60)
+        self.assertTrue(any("--force" in args for args in deletes))
         self.assertNotIn("All associated pods have terminated", text)
 
     def test_dmesg_enabled_policies_keep_the_same_collection_contract(self):

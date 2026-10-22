@@ -75,7 +75,7 @@ kube_request() {
   request_seconds=$remaining
   [ "$request_seconds" -le 10 ] || request_seconds=10
   timeout --signal=KILL "${request_seconds}s" \
-    kubectl "$@" --request-timeout="${request_seconds}s"
+    kubectl "$@"
 }
 
 cleanup_sleep() {
@@ -88,34 +88,41 @@ cleanup_sleep() {
 
 # Retry deletion to handle transient failures such as etcd NOSPACE.
 kube_delete_retry() {
-  local max_retries=3 delay=5 attempt
+  local max_retries=3 delay=5 attempt resource
+  local -a pending=("$@") failed=() delete_args=()
   for ((attempt=1; attempt<=max_retries; attempt++)); do
-    if kube_request "$FORCE_RESERVE" "$@" 2>/dev/null; then return 0; fi
+    failed=()
+    for resource in "${pending[@]}"; do
+      delete_args=("$JOB_NAME")
+      [ "$resource" != pods ] || delete_args=(-l "$POD_SELECTOR")
+      if ! kube_request "$FORCE_RESERVE" delete "$resource" "${delete_args[@]}" \
+        -n "$NAMESPACE" --wait=false --ignore-not-found=true 2>/dev/null; then
+        failed+=("$resource")
+      fi
+    done
+    [ "${#failed[@]}" -ne 0 ] || return 0
+    pending=("${failed[@]}")
     if [ "$attempt" -lt "$max_retries" ]; then
-      log_warn "Deletion failed (attempt ${attempt}); retrying in at most ${delay}s..."
+      log_warn "Deletion is unverified for ${pending[*]} (round ${attempt}); retrying in at most ${delay}s..."
       cleanup_sleep "$delay" "$FORCE_RESERVE" || break
     fi
   done
-  log_warn "Deletion remains unconfirmed after the available attempts or time budget."
+  log_warn "Deletion remains unconfirmed for ${pending[*]} after the available attempts or time budget."
   return 1
 }
 
 log_info "Deleting pods: $JOB_NAME (namespace=$NAMESPACE)"
-kube_delete_retry delete pods -n "$NAMESPACE" -l "$POD_SELECTOR" \
-  --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
+PENDING_RESOURCES=(pods)
 
 # No Service or PodGroup exists for standalone workloads.
 if [ "$NNODES" != "0" ]; then
   log_info "Deleting service: $JOB_NAME"
-  kube_delete_retry delete svc "$JOB_NAME" -n "$NAMESPACE" \
-    --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
-
   log_info "Deleting podgroup: $JOB_NAME"
-  kube_delete_retry delete podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" \
-    --wait=false --ignore-not-found=true || CLEANUP_CONFIRMED=false
+  PENDING_RESOURCES+=(svc podgroups.scheduling.x-k8s.io)
 else
   log_info "Single-card/multi-card mode (nnodes=0): no service/podgroup to clean up; skipping."
 fi
+kube_delete_retry "${PENDING_RESOURCES[@]}" || CLEANUP_CONFIRMED=false
 
 log_info "Waiting for associated pods to terminate..."
 FORCE_ATTEMPTED=false

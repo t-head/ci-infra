@@ -132,7 +132,8 @@ kube_request() {
   local remaining=$(( DEADLINE - $(date +%s) ))
   [ "$remaining" -gt 0 ] || return 124
   [ "$remaining" -gt 10 ] && remaining=10
-  timeout --signal=KILL "${remaining}s" kubectl "$@" --request-timeout="${remaining}s"
+  # This kubectl's in-cluster credentials stop resolving when a nonzero request timeout is set.
+  timeout --signal=KILL "${remaining}s" kubectl "$@"
 }
 
 log_info "Job name:   $JOB_NAME"
@@ -200,7 +201,8 @@ if [[ -n "${USER_ENV_JSON:-}" && "${USER_ENV_JSON}" != "{}" && "${USER_ENV_JSON}
     case "$_key" in
       INPUT_*|CONTAINER_OPTIONS|SOURCE_STAGE_DIR|USER_ENV_JSON|GITHUB_*) continue ;;
     esac
-    _val=$(echo "${_b64val}" | base64 -d)
+    _val=$(printf '%s' "${_b64val}" | base64 -d && printf '.')
+    _val="${_val%.}"
     _val=$(yaml_escape_value "$_val")
     USER_ENV_YAML+="        - name: \"${_key}\""$'\n'
     USER_ENV_YAML+="          value: \"${_val}\""$'\n'
@@ -325,7 +327,7 @@ if [ -n "$CONTAINER_OPTIONS" ]; then
 
   # Validate shm_size as a K8s quantity (e.g. 8Gi / 512Mi / 1024) and prevent invalid characters from entering YAML.
   if [ -n "$SHM_SIZE" ]; then
-    if ! [[ "$SHM_SIZE" =~ ^[0-9]+(\.[0-9]+)?([kMGTPE]i?)?$ ]]; then
+    if ! [[ "$SHM_SIZE" =~ ^[0-9]+(\.[0-9]+)?([KMGTPE]i|[kMGTPE])?$ ]]; then
       log_error "container_options: shm_size is not a valid K8s size (e.g. 8Gi, 512Mi); got '${SHM_SIZE}'"
       exit 1
     fi
@@ -576,7 +578,13 @@ while true; do
     exit 0
   fi
   OLD_PODS=$(kube_request get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" --no-headers -o custom-columns=NAME:.metadata.name)
-  [ -z "$OLD_PODS" ] && break
+  OLD_SERVICE=""
+  OLD_PODGROUP=""
+  if [ "$SINGLE_MODE" = false ]; then
+    OLD_SERVICE=$(kube_request get svc "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true -o name)
+    OLD_PODGROUP=$(kube_request get podgroups.scheduling.x-k8s.io "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true -o name)
+  fi
+  [ -z "$OLD_PODS$OLD_SERVICE$OLD_PODGROUP" ] && break
   WAIT_SECONDS=$(( DEADLINE - $(date +%s) ))
   [ "$WAIT_SECONDS" -gt 3 ] && WAIT_SECONDS=3
   [ "$WAIT_SECONDS" -gt 0 ] && sleep "$WAIT_SECONDS"

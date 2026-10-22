@@ -38,9 +38,28 @@ def fake_command(tool, args):
         if fixture.get("tar_status"):
             return fixture["tar_status"]
         return subprocess.run([os.environ["STAGING_REAL_TAR"], *args]).returncode
+    if tool == "cp":
+        if fixture.get("cp_status") and args[-1] == fixture["partial_destination"]:
+            Path(args[-1]).write_bytes(Path(args[-2]).read_bytes()[:16])
+            return fixture["cp_status"]
+        return subprocess.run([os.environ["STAGING_REAL_CP"], *args]).returncode
+    if tool == "timeout":
+        return subprocess.run(args[2:], env={**os.environ, "STAGING_API_TIMEOUT": args[1]}).returncode
     if tool == "kubectl":
+        if any(arg.startswith("--request-timeout=") for arg in args):
+            raise ValueError("Request timeout overrides break in-cluster configuration")
         if args[0] == "version":
+            if "--client" not in args and not os.environ.get("STAGING_API_TIMEOUT"):
+                raise ValueError("Server version requests must have an outer deadline")
             print("fixture kubectl")
+            return 0 if "--client" in args else fixture.get("server_status", 0)
+        if args[:2] == ["get", "crd"]:
+            if not os.environ.get("STAGING_API_TIMEOUT"):
+                raise ValueError("CRD requests must have an outer deadline")
+            if args[2] != "podgroups.scheduling.x-k8s.io":
+                raise ValueError("Only x-k8s.io PodGroups are supported")
+            return fixture.get("crd_status", 0)
+        if args[0] == "delete":
             return 0
         if args[:2] == ["get", "pods"]:
             print(fixture.get("pods", ""), end="")
@@ -123,6 +142,13 @@ class StagingTests(unittest.TestCase):
         self.assertTrue(self.staged().is_file())
         self.assertEqual((self.root / "env").read_text(), "SOURCE_STAGE_DIR=" + str(self.staged()) + "\n")
 
+    def assert_symlink_rejected(self, result):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("::error::", result.stdout)
+        self.assertIn("symlink", result.stdout)
+        self.assertFalse(self.staged().exists())
+        self.assertFalse((self.root / "env").exists())
+
     def git(self, *args, directory=None):
         result = subprocess.run(
             ["git", "-C", str(directory or self.workspace),
@@ -180,25 +206,75 @@ class StagingTests(unittest.TestCase):
         self.assert_staged(self.stage("artifact\n" + str(artifact) + "\n" + str(artifact)))
         self.assertFalse((artifact / "artifact").exists())
         self.assertEqual((artifact / "marker").read_text(), "original")
+        with tarfile.open(self.staged()) as archive:
+            self.assertEqual(archive.extractfile("./artifact/marker").read(), b"original")
 
-    def test_symlink_to_same_source_is_skipped(self):
+    def test_symlink_to_same_source_is_rejected(self):
         artifact = self.workspace / "artifact"
         artifact.mkdir()
         (artifact / "marker").write_text("original")
         external = self.root / "artifact"
         external.symlink_to(artifact, target_is_directory=True)
-        self.assert_staged(self.stage(str(external)))
+        self.assert_symlink_rejected(self.stage(str(external)))
+        self.assertTrue(external.is_symlink())
+        self.assertEqual(os.readlink(external), str(artifact))
+        self.assertEqual((artifact / "marker").read_text(), "original")
         self.assertFalse((artifact / "artifact").exists())
 
-    def test_destination_symlink_to_same_source_is_skipped(self):
+    def test_destination_symlink_to_same_source_is_rejected(self):
         artifact = self.root / "artifact"
         artifact.mkdir()
         (artifact / "marker").write_text("external")
         target = self.workspace / "artifact"
         target.symlink_to(artifact, target_is_directory=True)
-        self.assert_staged(self.stage(str(artifact)))
+        self.assert_symlink_rejected(self.stage(str(artifact)))
         self.assertTrue(target.is_symlink())
+        self.assertEqual(os.readlink(target), str(artifact))
+        self.assertEqual((artifact / "marker").read_text(), "external")
         self.assertFalse((artifact / "artifact").exists())
+
+    def test_selected_workspace_symlink_is_rejected(self):
+        artifact = self.root / "payload"
+        artifact.mkdir()
+        (artifact / "marker").write_text("runner-only")
+        target = self.workspace / "artifact"
+        target.symlink_to(artifact, target_is_directory=True)
+        for path in ("artifact", str(target), "artifact/", str(target) + "///"):
+            with self.subTest(path=path):
+                self.assert_symlink_rejected(self.stage(path))
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(os.readlink(target), str(artifact))
+                self.assertEqual((artifact / "marker").read_text(), "runner-only")
+
+    def test_source_symlink_without_destination_is_rejected(self):
+        for kind in ("file", "directory", "dangling"):
+            with self.subTest(kind=kind):
+                payload = self.root / ("payload-" + kind)
+                if kind == "file":
+                    payload.write_text("external")
+                elif kind == "directory":
+                    payload.mkdir()
+                    (payload / "marker").write_text("external")
+                source = self.root / ("artifact-" + kind)
+                source.symlink_to(payload, target_is_directory=kind == "directory")
+                self.assert_symlink_rejected(self.stage(str(source)))
+                self.assertTrue(source.is_symlink())
+                self.assertEqual(os.readlink(source), str(payload))
+                self.assertFalse((self.workspace / source.name).exists())
+                self.assertFalse((self.workspace / source.name).is_symlink())
+                if kind == "file":
+                    self.assertEqual(payload.read_text(), "external")
+                elif kind == "directory":
+                    self.assertEqual((payload / "marker").read_text(), "external")
+                else:
+                    self.assertFalse(payload.exists())
+
+    def test_missing_artifact_path_is_warned_and_skipped(self):
+        result = self.stage("missing-artifact")
+        self.assert_staged(result)
+        self.assertIn("[warn]", result.stdout)
+        self.assertIn(str(self.workspace / "missing-artifact"), result.stdout)
+        self.assertNotIn("::error::", result.stdout)
 
     def test_hardlink_to_same_file_is_skipped(self):
         artifact = self.root / "artifact"
@@ -206,6 +282,8 @@ class StagingTests(unittest.TestCase):
         os.link(artifact, self.workspace / "artifact")
         self.assert_staged(self.stage(str(artifact)))
         self.assertTrue(os.path.samefile(artifact, self.workspace / "artifact"))
+        with tarfile.open(self.staged()) as archive:
+            self.assertEqual(archive.extractfile("./artifact").read(), b"same inode")
 
     def test_different_sources_with_same_basename_fail(self):
         for kind in ("file", "directory", "symlink", "dangling"):
@@ -269,9 +347,42 @@ class StagingTests(unittest.TestCase):
         self.assertFalse(self.staged().exists())
         self.assertFalse((self.root / "env").exists())
 
+    def test_partial_nas_copy_failure_is_handed_to_cleanup(self):
+        self.env["STAGING_REAL_CP"] = shutil.which("cp")
+        self.fake("cp")
+        self.fixture(cp_status=29, partial_destination=str(self.staged()))
+        artifact = self.root / "extra.txt"
+        artifact.write_text("file fixture")
+        result = self.stage(str(artifact))
+        self.assertEqual(result.returncode, 29, result.stdout + result.stderr)
+        self.assertEqual((self.workspace / "extra.txt").read_text(), "file fixture")
+        local_tarball = self.root / "source-1234-1.tar.gz"
+        with tarfile.open(local_tarball) as archive:
+            self.assertEqual(archive.extractfile("./extra.txt").read(), b"file fixture")
+        self.assertEqual(self.staged().read_bytes(), local_tarball.read_bytes()[:16])
+        handoff = (self.root / "env").read_text()
+        self.assertEqual(handoff, "SOURCE_STAGE_DIR=" + str(self.staged()) + "\n")
+        cleanup_step = next(step for step in self.action["runs"]["steps"] if step.get("id") == "cleanup")
+        self.assertEqual(cleanup_step["env"]["SOURCE_STAGE_DIR"], "${{ env.SOURCE_STAGE_DIR }}")
+        self.fake("kubectl")
+        self.fake("timeout")
+        env = dict(self.env, INPUT_NAMESPACE="fixture", INPUT_NNODES="0",
+                   INPUT_JOB_STATUS="", INPUT_WORKFLOW_STATUS="failure",
+                   GITHUB_OUTPUT=str(self.root / "output"))
+        env.update(line.split("=", 1) for line in handoff.splitlines())
+        cleanup = (ACTION / "scripts" / "cleanup.sh").read_text()
+        cleanup = cleanup.replace("/wl_nas/devops", str(self.nas))
+        cleanup = cleanup.replace("/tmp/training-manifests", str(self.root / "training-manifests"))
+        result = self.shell(cleanup, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(self.staged()), result.stdout)
+        self.assertFalse(self.staged().exists())
+        self.assertFalse(self.staged().parent.exists())
+
     def setup_script(self):
         for tool in ("mkdir", "mv", "chmod", "head", "grep"):
             (self.bin / tool).symlink_to(shutil.which(tool))
+        self.fake("timeout")
         self.env["PATH"] = str(self.bin)
         script = self.step("Setup kubectl").replace("/opt/bin", str(self.root / "opt" / "bin"))
         script = script.replace("/tmp/kubectl", str(self.root / "downloaded-kubectl"))
@@ -293,6 +404,37 @@ class StagingTests(unittest.TestCase):
         result = self.shell(script)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.next_step_kubectl(host)
+
+    def test_preflight_server_failure_is_bounded_and_nonfatal(self):
+        script = self.setup_script()
+        host = self.root / "opt" / "bin"
+        host.mkdir(parents=True)
+        self.fake("kubectl", host)
+        self.fixture(server_status=42)
+        result = self.shell(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("server version unavailable", result.stdout)
+        calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+        requests = [call for call in calls if call["tool"] == "timeout"]
+        self.assertEqual(requests[0]["args"][:2], ["--signal=KILL", "10s"])
+        self.assertNotIn("log_artifact_name", self.action["outputs"])
+
+    def test_preflight_requires_supported_crd_only_in_gang_mode(self):
+        self.fake("kubectl")
+        self.fake("timeout")
+        script = self.step("Validate inputs and check PodGroup CRD")
+        env = dict(self.env, INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0")
+        for nodes, status, expected in (("0", 42, 0), ("2", 0, 0), ("2", 42, 1)):
+            with self.subTest(nodes=nodes, status=status):
+                self.fixture(crd_status=status)
+                result = self.shell(script, dict(env, INPUT_NNODES=nodes))
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+        crds = [call for call in calls if call["tool"] == "kubectl"]
+        self.assertEqual(len(crds), 2)
+        self.assertTrue(all(call["args"][2] == "podgroups.scheduling.x-k8s.io" for call in crds))
+        requests = [call for call in calls if call["tool"] == "timeout"]
+        self.assertTrue(all(call["args"][:2] == ["--signal=KILL", "10s"] for call in requests))
 
     def test_download_fallback_survives_next_step(self):
         script = self.setup_script()
