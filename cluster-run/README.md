@@ -61,14 +61,8 @@ for commands such as `git describe --always`; the runner's workspace config is l
 intact. Configure Git on the worker if the workload needs custom settings. The checkout
 example disables credential persistence with `persist-credentials: false`.
 
-Each extra artifact uses its basename as the workspace destination. Staging refuses
-symlinks at the declared source or that top-level destination, including broken links
-and links to the same object. Supply actual files or directories, since tar retains
-symlinks and their runner-local targets may be unavailable to workers. An identical
-real directory or a hardlink to the same file needs no copy. Any unrelated existing
-destination is an error; content is neither combined nor replaced. Absent paths remain
-warning-only skips. Once tar completes, cleanup receives the destination before the
-NAS transfer starts, including when a failed copy leaves an incomplete archive.
+Extra artifacts are copied by basename only when the workspace does not already contain
+that name. Existing destinations are kept as-is, while missing paths are warning-only skips.
 
 ## Inputs
 

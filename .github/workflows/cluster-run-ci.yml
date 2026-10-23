@@ -71,6 +71,13 @@ jobs:
         shell: bash
         run: python3 cluster-run/tests/test-lifecycle.py
 
+      - name: Verify ZW-810E equivalence
+        shell: bash
+        run: |
+          python3 cluster-run/tests/test-lifecycle.py \
+            LifecycleTests.test_810e_board_alias_defaults_and_selector \
+            LifecycleTests.test_810e_board_alias_preserves_explicit_limits
+
       - name: Cover source transfer and workflow assertions
         shell: bash
         run: python3 cluster-run/tests/test-staging.py

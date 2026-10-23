@@ -256,34 +256,18 @@ runs:
             if [[ "$_apath" != /* ]]; then
               _apath="$GITHUB_WORKSPACE/$_apath"
             fi
-            # A trailing slash must not conceal a symbolic-link artifact.
-            while [[ "$_apath" == */ && "$_apath" != / ]]; do
-              _apath="${_apath%/}"
-            done
-            if [ -L "$_apath" ]; then
-              echo "::error::Cannot archive a symlink artifact source; provide its actual file or directory: $_apath"
-              exit 1
-            fi
             if [ ! -e "$_apath" ]; then
               echo "[warn] Artifact path does not exist; skipping: $_apath"
               continue
             fi
             _basename="$(basename "$_apath")"
-            _target="$GITHUB_WORKSPACE/$_basename"
-            if [ -L "$_target" ]; then
-              echo "::error::Refusing a symlink at the artifact destination: $_apath -> $_target"
-              exit 1
+            # Copy only if the basename is absent from the workspace.
+            if [ ! -e "$GITHUB_WORKSPACE/$_basename" ]; then
+              cp -a "$_apath" "$GITHUB_WORKSPACE/$_basename"
+              echo "Staged additional artifact: $_apath -> $_basename"
+            else
+              echo "Artifact is already present in the workspace: $_basename"
             fi
-            if [ "$_apath" -ef "$_target" ]; then
-              echo "Skipping artifact already present at its destination: $_basename"
-              continue
-            fi
-            if [ -e "$_target" ] || [ -L "$_target" ]; then
-              echo "::error::Cannot stage artifact over an unrelated destination: $_apath -> $_target"
-              exit 1
-            fi
-            cp -a "$_apath" "$_target"
-            echo "Staged additional artifact: $_apath -> $_basename"
           done <<< "$ARTIFACT_PATHS"
         fi
         # Archive the local workspace first, then copy to NAS to avoid excessive NFS file operations and silly renames.
@@ -298,10 +282,9 @@ runs:
           --exclude='*/.git/modules/*/config' --exclude='*/.git/modules/*/config.worktree' \
           --exclude='*/.git/worktrees/*/config' --exclude='*/.git/worktrees/*/config.worktree' \
           -C "$GITHUB_WORKSPACE" .
-        # Register the archive destination first, allowing cleanup after an interrupted NAS copy.
-        echo "SOURCE_STAGE_DIR=$STAGE_TARBALL" >> "$GITHUB_ENV"
         cp "$_local_tarball" "$STAGE_TARBALL"
         rm -f "$_local_tarball"
+        echo "SOURCE_STAGE_DIR=$STAGE_TARBALL" >> "$GITHUB_ENV"
         echo "✓ Source archived and staged on NAS: $STAGE_TARBALL ($(du -h "$STAGE_TARBALL" | cut -f1))"
         echo "::endgroup::"
 
