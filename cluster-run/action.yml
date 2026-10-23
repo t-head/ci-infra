@@ -1,0 +1,375 @@
+name: 'Cluster Run'
+description: >-
+  Submit and manage framework-agnostic distributed jobs on a PPU cluster using declarative inputs,
+  from a single card to multiple nodes and cards, with gang scheduling and topology-aware allocation
+  through PodGroup + default-scheduler. Run on a CPU-only orchestration runner
+  (selected by the runner labels in the workflow's runs-on).
+  Orchestration uses no PPU cards; compute resources are consumed only by worker pods.
+author: 't-head'
+
+branding:
+  icon: 'cpu'
+  color: 'blue'
+
+inputs:
+  nnodes:
+    description: 'Use 0 for one standalone worker pod; positive values specify the pod count in gang mode.'
+    required: false
+    default: '0'
+  nproc_per_node:
+    description: 'PPU cards per node (the alibabacloud.com/ppu quantity requested by each pod; any positive integer).'
+    required: false
+    default: '1'
+  command:
+    description: >-
+      Custom launch command (required), passed unchanged to the worker pod's shell.
+      The command can reference the injected distributed environment variables: $RANK $NODE_RANK $LOCAL_RANK $WORLD_SIZE
+      $NNODES $NPROC_PER_NODE $MASTER_ADDR $MASTER_PORT.
+    required: true
+  image:
+    description: 'Training/inference container image (required; must include the job code and dependencies).'
+    required: true
+  namespace:
+    description: 'K8s namespace.'
+    required: false
+    default: 'default'
+  timeout_minutes:
+    description: 'Minutes allowed for scheduling and execution together; exceeding the limit records timeout and cleans up resources.'
+    required: false
+    default: '60'
+  host_volumes:
+    description: 'Host directory mounts in /host/path1:/container/path1,/host/path2:/container/path2 format (comma-separated; leave empty for no additional mounts). /nas_aisw and /mnt/wl_nas are mounted by default and need not be repeated; entries with the same container paths are skipped automatically.'
+    required: false
+    default: ''
+  extra_env:
+    description: 'Additional environment variables in KEY1=VAL1,KEY2=VAL2 format (comma-separated).'
+    required: false
+    default: ''
+  master_port:
+    description: 'Rendezvous / distributed communication port.'
+    required: false
+    default: '29500'
+  cleanup_policy:
+    description: >-
+      Retained for compatibility but ignored at runtime. Every job resource is removed
+      regardless of success, failure, timeout or cancellation.
+    required: false
+    default: 'always'
+  source_dir:
+    description: >-
+      Source extraction path inside the PPU pod (default /workspace/source). If the workflow uses actions/checkout,
+      this action automatically archives $GITHUB_WORKSPACE and stages it on NAS, then extracts it to this path
+      before running command so PPU worker pods can access it.
+    required: false
+    default: '/workspace/source'
+  node_selector:
+    description: >-
+      Node selector in KEY1=VAL1,KEY2=VAL2 format (comma-separated), merged into the pod's spec.nodeSelector
+      to target nodes with matching labels (combined with the base ack.node.ppu.schedule label as a hard AND constraint).
+    required: false
+    default: ''
+  container_options:
+    description: >-
+      Container runtime options (a YAML fragment, optionally multiline). Supported keys: privileged: true/false
+      (maps to container securityContext.privileged); host_ipc: true/false (maps to pod spec.hostIPC);
+      host_network: true/false (maps to pod spec.hostNetwork; when true, dnsPolicy defaults to
+      ClusterFirstWithHostNet so the injected MASTER_ADDR can resolve); dns_policy:
+      "ClusterFirst" / "ClusterFirstWithHostNet" / "Default" (maps to pod spec.dnsPolicy;
+      an explicit value overrides the automatic default above); shm_size: "8Gi"
+      (maps to the /dev/shm emptyDir sizeLimit, default 64Gi); cap_add: "SYS_PTRACE,IPC_LOCK"
+      (maps to securityContext.capabilities.add, comma-separated); cpus: "8" / "1.5" / "500m"
+      (alias cpu, maps to container resources.limits.cpu); memory: "64Gi" / "64g" (maps to container
+      resources.limits.memory; Docker lowercase units b/k/m/g/t are converted using base 1024 to bytes/Ki/Mi/Gi/Ti).
+      When cpus/memory are unset, values are calculated from the card count: ZW-M890P uses 31 cores and 256Gi per card,
+      OAM-810E and its ZW-810E equivalent use 11 cores and 112Gi per card; OAM-810E is assumed when node_selector omits board-type.
+      Explicit values override the corresponding defaults. Unlisted keys are ignored (K8s has no container-level swap limit;
+      memory_swap is unsupported).
+    required: false
+    default: ''
+  artifact_paths:
+    description: |
+      Extra paths to stage to NAS alongside source code (one per line).
+      Files at these paths will be available in the PPU pod under source_dir.
+      Typically used for artifacts downloaded by actions/download-artifact.
+      Paths relative to GITHUB_WORKSPACE are also supported.
+    required: false
+    default: ''
+  job_suffix:
+    description: >-
+      Custom readable segment of resource names (replaces the default github.job + first matrix value), for readability only.
+      Resource names always end with a short hash derived from the runner name and matrix, so this input is not needed to prevent naming collisions.
+    required: false
+    default: ''
+  dmesg_policy:
+    description: >-
+      Set never (default) to turn off kernel log collection. Currently, on_failure behaves like always:
+      execution-window logs are collected, printed and kept on NAS for every result.
+    required: false
+    default: 'never'
+
+outputs:
+  job_name:
+    description: 'Workload identifier.'
+    value: ${{ steps.naming.outputs.job_name }}
+  job_status:
+    description: 'Terminal result: succeeded, failed, timeout or cancelled.'
+    value: ${{ steps.cleanup.outputs.job_status || steps.monitor.outputs.job_status || (steps.submit.outputs.job_status != 'scheduled' && steps.submit.outputs.job_status) || 'failed' }}
+  duration_seconds:
+    description: 'Job duration in seconds, including scheduling and execution.'
+    value: ${{ steps.monitor.outputs.duration_seconds || steps.submit.outputs.duration_seconds }}
+  queue_duration_seconds:
+    description: 'Time in seconds until all PPU pods are scheduled.'
+    value: ${{ steps.monitor.outputs.queue_duration_seconds || steps.submit.outputs.queue_duration_seconds }}
+  occupied_ppu_card_hours:
+    description: 'PPU card-hours from pod scheduling until completion.'
+    value: ${{ steps.monitor.outputs.occupied_ppu_card_hours || steps.submit.outputs.occupied_ppu_card_hours }}
+  execution_ppu_card_hours:
+    description: 'PPU card-hours while worker containers are running.'
+    value: ${{ steps.monitor.outputs.execution_ppu_card_hours || steps.submit.outputs.execution_ppu_card_hours }}
+  task_pods:
+    description: 'Comma-separated worker pod names.'
+    value: ${{ steps.monitor.outputs.task_pods || steps.submit.outputs.task_pods }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup kubectl
+      shell: bash
+      run: |
+        echo "::group::Check kubectl and install if needed"
+        # Prefer /opt/bin/kubectl, preinstalled by the cluster and mounted via hostPath.
+        if [ -x /opt/bin/kubectl ]; then
+          export PATH="/opt/bin:$PATH"
+          echo "/opt/bin" >> "$GITHUB_PATH"
+          echo "✓ kubectl is available via hostPath: /opt/bin/kubectl"
+          kubectl version --client 2>/dev/null || true
+        elif command -v kubectl >/dev/null 2>&1; then
+          echo "✓ kubectl is already installed; skipping installation: $(command -v kubectl)"
+        else
+          echo "kubectl not found; downloading and installing"
+          stable_version="$(curl -L -s --connect-timeout 5 --max-time 15 https://dl.k8s.io/release/stable.txt 2>/dev/null || echo 'v1.31.0')"
+          official_url="https://dl.k8s.io/release/${stable_version}/bin/linux/amd64/kubectl"
+          echo "Downloading version ${stable_version} from ${official_url}"
+          download_ok=false
+          for attempt in 1 2 3; do
+            echo "Attempt #${attempt}..."
+            if curl --fail -L --connect-timeout 10 --max-time 120 --retry 2 -o /tmp/kubectl "${official_url}"; then
+              download_ok=true
+              break
+            fi
+            echo "Download failed; retrying in 5s..."
+            sleep 5
+          done
+          if [ "$download_ok" != "true" ]; then
+            echo "::error::kubectl download failed after 3 retries"
+            exit 1
+          fi
+          # Verify that the download is an ELF binary, not an HTML error page.
+          if ! file /tmp/kubectl | grep -q ELF; then
+            echo "::error::Downloaded file is not a valid ELF binary"
+            file /tmp/kubectl
+            head -c 200 /tmp/kubectl
+            exit 1
+          fi
+          chmod +x /tmp/kubectl
+          if install -m 0755 /tmp/kubectl /usr/local/bin/kubectl 2>/dev/null; then
+            echo "✓ Installed to /usr/local/bin/kubectl"
+          else
+            mkdir -p "$HOME/.local/bin"
+            mv /tmp/kubectl "$HOME/.local/bin/kubectl"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "✓ /usr/local/bin is not writable; installed to $HOME/.local/bin/kubectl and added to GITHUB_PATH"
+          fi
+        fi
+        echo "--- kubectl version (client) ---"
+        kubectl version --client 2>&1 || true
+        echo "--- kubectl version (server) ---"
+        timeout --signal=KILL 10s kubectl version 2>&1 || echo "(server version unavailable)"
+        echo "::endgroup::"
+
+    - name: Validate inputs and check PodGroup CRD
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_NNODES: ${{ inputs.nnodes }}
+      run: |
+        echo "::group::Check action inputs and PodGroup availability"
+        if [ -z "$INPUT_IMAGE" ]; then
+          echo "::error::Input 'image' is required"
+          exit 1
+        fi
+        if [ -z "$INPUT_COMMAND" ]; then
+          echo "::error::Input 'command' is required"
+          exit 1
+        fi
+        if [ "$INPUT_NNODES" != "0" ]; then
+          if timeout --signal=KILL 10s kubectl get crd podgroups.scheduling.x-k8s.io &> /dev/null; then
+            echo "✓ PodGroup CRD check passed (scheduling.x-k8s.io)"
+          else
+            echo "::error::The required podgroups.scheduling.x-k8s.io CRD could not be verified; gang execution is unsupported"
+            exit 1
+          fi
+        fi
+        echo "✓ Input validation passed"
+        echo "::endgroup::"
+
+    - name: Resolve job name
+      id: naming
+      shell: bash
+      env:
+        GITHUB_JOB_NAME: ${{ github.job }}
+        INPUT_JOB_SUFFIX: ${{ inputs.job_suffix }}
+        MATRIX_JSON: ${{ toJSON(matrix) }}
+        PPU_RUNNER_NAME: ${{ runner.name }}
+      run: |
+        _job_name="$(bash "$GITHUB_ACTION_PATH/scripts/job-name.sh")"
+        echo "job_name=${_job_name}" >> "$GITHUB_OUTPUT"
+        echo "Job name: ${_job_name}"
+
+    - name: Stage source to NAS
+      shell: bash
+      env:
+        ARTIFACT_PATHS: ${{ inputs.artifact_paths }}
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+      run: |
+        echo "::group::Prepare source archive on NAS (tar)"
+        STAGE_TARBALL="/wl_nas/devops/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${JOB_NAME}/source.tar.gz"
+        echo "NAS staging tarball: $STAGE_TARBALL"
+        echo "Source directory:    $GITHUB_WORKSPACE"
+        # Ensure the NAS target directory exists and is writable.
+        if [ ! -d "/wl_nas/devops" ]; then
+          echo "[warn] NAS devops directory does not exist; attempting to create it..."
+          mkdir -p /wl_nas/devops && chmod 777 /wl_nas/devops
+        fi
+        mkdir -p "$(dirname "$STAGE_TARBALL")"
+        # Process artifact_paths: copy extra artifacts into the workspace to include in the archive.
+        if [ -n "${ARTIFACT_PATHS:-}" ]; then
+          echo "Processing additional artifact paths..."
+          while IFS= read -r _apath; do
+            # Skip empty and whitespace-only lines.
+            [ -z "$(printf '%s' "$_apath" | tr -d '[:space:]')" ] && continue
+            # Trim leading and trailing whitespace.
+            _apath="$(printf '%s' "$_apath" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            # Resolve relative paths against GITHUB_WORKSPACE.
+            if [[ "$_apath" != /* ]]; then
+              _apath="$GITHUB_WORKSPACE/$_apath"
+            fi
+            if [ ! -e "$_apath" ]; then
+              echo "[warn] Artifact path does not exist; skipping: $_apath"
+              continue
+            fi
+            _basename="$(basename "$_apath")"
+            # Copy only if the basename is absent from the workspace.
+            if [ ! -e "$GITHUB_WORKSPACE/$_basename" ]; then
+              cp -a "$_apath" "$GITHUB_WORKSPACE/$_basename"
+              echo "Staged additional artifact: $_apath -> $_basename"
+            else
+              echo "Artifact is already present in the workspace: $_basename"
+            fi
+          done <<< "$ARTIFACT_PATHS"
+        fi
+        # Archive the local workspace first, then copy to NAS to avoid excessive NFS file operations and silly renames.
+        echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+        echo "Top-level workspace contents:"
+        ls -la "$GITHUB_WORKSPACE/" | head -30 || true
+        echo "Workspace .github directory:"
+        ls -la "$GITHUB_WORKSPACE/.github/" 2>/dev/null | head -10 || echo "(.github directory does not exist)"
+        _local_tarball="/tmp/source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+        tar czf "$_local_tarball" \
+          --exclude='*/.git/config' --exclude='*/.git/config.worktree' \
+          --exclude='*/.git/modules/*/config' --exclude='*/.git/modules/*/config.worktree' \
+          --exclude='*/.git/worktrees/*/config' --exclude='*/.git/worktrees/*/config.worktree' \
+          -C "$GITHUB_WORKSPACE" .
+        cp "$_local_tarball" "$STAGE_TARBALL"
+        rm -f "$_local_tarball"
+        echo "SOURCE_STAGE_DIR=$STAGE_TARBALL" >> "$GITHUB_ENV"
+        echo "✓ Source archived and staged on NAS: $STAGE_TARBALL ($(du -h "$STAGE_TARBALL" | cut -f1))"
+        echo "::endgroup::"
+
+    - name: Wait for ${{ (contains(format(',{0},', inputs.node_selector), ',board-type=OAM-810E,') || contains(format(',{0},', inputs.node_selector), ',board-type=ZW-810E,')) && '810E' || contains(format(',{0},', inputs.node_selector), ',board-type=ZW-M890P,') && '890P' || 'PPU' }} pods to be scheduled
+      id: submit
+      shell: bash
+      env:
+        INPUT_NNODES: ${{ inputs.nnodes }}
+        INPUT_NPROC_PER_NODE: ${{ inputs.nproc_per_node }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_NAMESPACE: ${{ inputs.namespace }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        INPUT_HOST_VOLUMES: ${{ inputs.host_volumes }}
+        INPUT_EXTRA_ENV: ${{ inputs.extra_env }}
+        INPUT_MASTER_PORT: ${{ inputs.master_port }}
+        INPUT_CLEANUP_POLICY: ${{ inputs.cleanup_policy }}
+        INPUT_NODE_SELECTOR: ${{ inputs.node_selector }}
+        INPUT_SOURCE_DIR: ${{ inputs.source_dir }}
+        CONTAINER_OPTIONS: ${{ inputs.container_options }}
+        SOURCE_STAGE_DIR: ${{ env.SOURCE_STAGE_DIR }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_JOB_NAME: ${{ github.job }}
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+        INPUT_DMESG_POLICY: ${{ inputs.dmesg_policy }}
+        USER_ENV_JSON: ${{ toJSON(env) }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/submit.sh"
+
+    - name: Stream workload logs and wait for completion
+      id: monitor
+      if: success() && steps.submit.outputs.job_status == 'scheduled'
+      shell: bash
+      env:
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+        JOB_START_TIME: ${{ steps.submit.outputs.start_time }}
+        JOB_DEADLINE: ${{ steps.submit.outputs.deadline }}
+        INPUT_NAMESPACE: ${{ inputs.namespace }}
+        INPUT_NNODES: ${{ inputs.nnodes }}
+        INPUT_NPROC_PER_NODE: ${{ inputs.nproc_per_node }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/monitor.sh"
+
+    - name: Cleanup resources
+      id: cleanup
+      if: always()
+      shell: bash
+      env:
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+        INPUT_NAMESPACE: ${{ inputs.namespace }}
+        INPUT_NNODES: ${{ inputs.nnodes }}
+        INPUT_CLEANUP_POLICY: ${{ inputs.cleanup_policy }}
+        INPUT_JOB_STATUS: ${{ steps.monitor.outputs.job_status || steps.submit.outputs.job_status }}
+        INPUT_WORKFLOW_STATUS: ${{ job.status }}
+        SOURCE_STAGE_DIR: ${{ env.SOURCE_STAGE_DIR }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/cleanup.sh"
+
+    - name: Print PPU usage summary
+      if: always()
+      shell: bash
+      env:
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+        JOB_STATUS: ${{ steps.cleanup.outputs.job_status || steps.monitor.outputs.job_status || (steps.submit.outputs.job_status != 'scheduled' && steps.submit.outputs.job_status) || 'failed' }}
+        NNODES: ${{ inputs.nnodes }}
+        NPROC_PER_NODE: ${{ inputs.nproc_per_node }}
+        DURATION_SECONDS: ${{ steps.monitor.outputs.duration_seconds || steps.submit.outputs.duration_seconds }}
+        QUEUE_DURATION_SECONDS: ${{ steps.monitor.outputs.queue_duration_seconds || steps.submit.outputs.queue_duration_seconds }}
+        UNSCHEDULED_PODS: ${{ steps.monitor.outputs.unscheduled_pods || steps.submit.outputs.unscheduled_pods }}
+        POD_QUEUE: ${{ steps.monitor.outputs.pod_queue || steps.submit.outputs.pod_queue }}
+        QUEUE_REASON: ${{ steps.monitor.outputs.queue_reason || steps.submit.outputs.queue_reason }}
+        OCCUPIED_PPU_CARD_HOURS: ${{ steps.monitor.outputs.occupied_ppu_card_hours || steps.submit.outputs.occupied_ppu_card_hours }}
+        EXECUTION_PPU_CARD_HOURS: ${{ steps.monitor.outputs.execution_ppu_card_hours || steps.submit.outputs.execution_ppu_card_hours }}
+        TASK_PODS: ${{ steps.monitor.outputs.task_pods || steps.submit.outputs.task_pods }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/print-summary.sh"
+
+    - name: Print dmesg logs
+      if: always() && inputs.dmesg_policy != 'never'
+      shell: bash
+      env:
+        JOB_NAME: ${{ steps.naming.outputs.job_name }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/print-dmesg.sh"
+
+    - name: Report job failure
+      if: always() && steps.monitor.outputs.job_status != 'succeeded'
+      shell: bash
+      run: exit 1
