@@ -249,7 +249,10 @@ if [ -n "$NODE_SELECTOR" ]; then
       fi
     fi
 
-    [ "$_key" = "board-type" ] && BOARD_TYPE="$_val"
+    if [ "$_key" = "board-type" ]; then
+      BOARD_TYPE="$_val"
+      [ "$_val" = "ZW-810E" ] && _val="OAM-810E"
+    fi
     _ns_items+="    ${_key}: \"${_val}\""$'\n'
   done
   _ns_items="${_ns_items%$'\n'}"

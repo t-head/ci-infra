@@ -497,7 +497,8 @@ class LifecycleTests(unittest.TestCase):
                     self.assertEqual(rc, 0, text)
                     self.assertEqual(outputs["job_status"], "scheduled")
                     spec = self.worker_manifest()["spec"]
-                    self.assertEqual(spec["nodeSelector"], {"board-type": board, "pool": "fixture"})
+                    expected_board = "OAM-810E" if board == "ZW-810E" else board
+                    self.assertEqual(spec["nodeSelector"], {"board-type": expected_board, "pool": "fixture"})
                     resources = spec["containers"][0]["resources"]
                     self.assertEqual(resources["limits"]["cpu"], str(min(cards * 11, 176)))
                     self.assertEqual(resources["limits"]["memory"], str(min(cards * 112, 1792)) + "Gi")
@@ -514,7 +515,7 @@ class LifecycleTests(unittest.TestCase):
                     "submit.sh", INPUT_NODE_SELECTOR="board-type=ZW-810E", CONTAINER_OPTIONS=options)
                 self.assertEqual(rc, 0, text)
                 spec = self.worker_manifest()["spec"]
-                self.assertEqual(spec["nodeSelector"]["board-type"], "ZW-810E")
+                self.assertEqual(spec["nodeSelector"]["board-type"], "OAM-810E")
                 resources = spec["containers"][0]["resources"]
                 self.assertEqual(resources["limits"]["cpu"], cpu)
                 self.assertEqual(resources["limits"]["memory"], memory)
