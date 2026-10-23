@@ -388,10 +388,23 @@ class StagingTests(unittest.TestCase):
         sequence = next(job["steps"] for job in self.workflow["jobs"].values()
                         if any(step.get("run") == lifecycle for step in job["steps"]))
         index = next(index for index, step in enumerate(sequence) if step.get("run") == lifecycle)
-        alias = sequence[index + 1].get("run", "")
-        self.assertIn("test_810e_board_alias_defaults_and_selector", alias)
-        self.assertIn("test_810e_board_alias_preserves_explicit_limits", alias)
-        self.assertEqual(sequence[index + 2].get("run"), staging)
+        self.assertEqual(sequence[index + 1].get("run"), staging)
+
+    def test_ci_runs_real_zw_810e_workload(self):
+        extension = "$/" + ACTION.name
+        for job in self.workflow["jobs"].values():
+            entries = job.get("strategy", {}).get("matrix", {}).get("include", [])
+            for entry in entries:
+                board_key = next((key for key, value in entry.items() if value == "ZW-810E"), None)
+                if board_key is None:
+                    continue
+                expected_selector = "board-type=${{ matrix." + board_key + " }}"
+                action_steps = [step for step in job["steps"] if step.get("uses") == extension]
+                self.assertTrue(action_steps)
+                self.assertTrue(any(step.get("with", {}).get("node_selector") == expected_selector
+                                    for step in action_steps))
+                return
+        self.fail("expected a real ZW-810E action workload in the CI matrix")
 
     def test_scheduling_step_recognizes_810e_board_alias(self):
         step = next(step for step in self.action["runs"]["steps"] if step.get("id") == "submit")

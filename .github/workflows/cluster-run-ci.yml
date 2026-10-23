@@ -71,13 +71,6 @@ jobs:
         shell: bash
         run: python3 cluster-run/tests/test-lifecycle.py
 
-      - name: Verify ZW-810E equivalence
-        shell: bash
-        run: |
-          python3 cluster-run/tests/test-lifecycle.py \
-            LifecycleTests.test_810e_board_alias_defaults_and_selector \
-            LifecycleTests.test_810e_board_alias_preserves_explicit_limits
-
       - name: Cover source transfer and workflow assertions
         shell: bash
         run: python3 cluster-run/tests/test-staging.py
@@ -120,6 +113,10 @@ jobs:
             nodes: 0
             devices: 1
             board_type: OAM-810E
+          - label: one ZW-810E card
+            nodes: 0
+            devices: 1
+            board_type: ZW-810E
           - label: eight 810E cards
             nodes: 0
             devices: 8
