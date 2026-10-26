@@ -1,0 +1,46 @@
+name: Release PyPI Checks
+
+on:
+  pull_request:
+    paths:
+      - 'ci-workflows/release-pypi/**'
+      - '.github/workflows/matrix-release.yml'
+      - '.github/workflows/release-pypi-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ci-workflows/release-pypi/**'
+      - '.github/workflows/matrix-release.yml'
+      - '.github/workflows/release-pypi-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pypi-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: 离线回归 / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - name: 检出待测代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 安装测试依赖
+        run: python -m pip install --no-input pytest PyYAML packaging setuptools wheel requests cryptography
+      - name: 运行离线测试
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m pytest ci-workflows/release-pypi/tests -q -p no:cacheprovider
