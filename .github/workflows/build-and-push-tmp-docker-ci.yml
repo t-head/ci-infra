@@ -1,0 +1,46 @@
+name: Temporary Docker Checks
+
+on:
+  pull_request:
+    paths:
+      - 'ci-workflows/build-and-push-tmp-docker/**'
+      - '.github/workflows/build-and-push-tmp-docker.yml'
+      - '.github/workflows/build-and-push-tmp-docker-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ci-workflows/build-and-push-tmp-docker/**'
+      - '.github/workflows/build-and-push-tmp-docker.yml'
+      - '.github/workflows/build-and-push-tmp-docker-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-docker-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Offline regression / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - name: Check out code under test
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        run: python -m pip install --no-input pytest PyYAML
+      - name: Run offline tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m pytest ci-workflows/build-and-push-tmp-docker/tests -q -p no:cacheprovider

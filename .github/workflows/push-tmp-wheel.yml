@@ -1,0 +1,98 @@
+name: Reusable Push Temporary Wheel
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: 'Package name for temporary publishing'
+        required: true
+        type: string
+      wheel_name:
+        description: 'Full wheel filename within the artifact, without a path; searched recursively and must be unique'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Name of the artifact saved by the caller with actions/upload-artifact@v4 in the current run; the calling job must depend on the artifact-producing job via needs'
+        required: true
+        type: string
+      template_repository:
+        description: 'Repository containing this workflow and upload script, in owner/repo format'
+        required: false
+        type: string
+        default: t-head/ci-infra
+      template_ref:
+        description: 'Must match the ref used to call this workflow; a commit SHA is recommended; pass github.sha for same-repository relative-path calls'
+        required: true
+        type: string
+    outputs:
+      upload_url:
+        description: 'URL of the successfully uploaded wheel'
+        value: ${{ jobs.push-wheel.outputs.upload_url }}
+    secrets:
+      template_token:
+        description: 'Read-only token for checking out a private template repository; usually unnecessary for same-repository or public templates'
+        required: false
+      release_username:
+        description: 'Publishing username from a caller repository or organization Actions Secret'
+        required: true
+      release_token:
+        description: 'Publishing token from a caller repository or organization Actions Secret'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  push-wheel:
+    name: Validate and upload temporary wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      upload_url: ${{ steps.upload.outputs.upload_url }}
+    steps:
+      - name: Validate artifact name
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ARTIFACT_NAME//[[:space:]]/}" ]]; then
+            printf '%s\n' '::error::artifact_name must not be empty' >&2
+            exit 1
+          fi
+
+      - name: Check out template tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install wheel validation dependencies
+        shell: bash
+        run: python -m pip install --no-input packaging wheel
+
+      # Reusable workflows do not inherit local files from caller jobs; download only the specified artifact from the current run.
+      - name: Download wheel to upload
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/push-tmp-wheel-artifact
+
+      - name: Validate and upload wheel to temporary repository
+        id: upload
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/push-tmp-wheel-artifact
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          WHEEL_NAME: ${{ inputs.wheel_name }}
+          RELEASE_USERNAME: ${{ secrets.release_username }}
+          RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: python ci-template/ci-workflows/push-tmp-wheel/scripts/push_tmp_wheel.py

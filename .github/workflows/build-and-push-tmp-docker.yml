@@ -1,0 +1,142 @@
+name: Reusable Build And Push Temporary Docker
+
+# Run only with trusted caller code: Dockerfile RUN instructions execute during the build.
+# The Artifactory repository is /artifactory/docker_tmp/; Docker clients use the repository path mapping below.
+# Image reference: download.t-head.cn/docker_tmp/<docker_name>:<docker_tag>.
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile path relative to the caller repository root, e.g. docker/Dockerfile'
+        required: true
+        type: string
+      build_context:
+        description: 'Build context directory relative to the caller repository root; only local directories within the repository are supported'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Docker ARG values, one KEY=VALUE per line; may be empty; not shell arguments; do not pass passwords or tokens'
+        required: false
+        type: string
+        default: ''
+      docker_name:
+        description: 'Lowercase image name, e.g. demo or team/demo; exclude the registry, docker_tmp prefix, and tag'
+        required: true
+        type: string
+      docker_tag:
+        description: 'Single image tag, e.g. dev-20261026; at most 128 characters, without colons or paths'
+        required: true
+        type: string
+      template_repository:
+        description: 'Repository containing this workflow and validation script, in owner/repo format'
+        required: false
+        type: string
+        default: t-head/ci-infra
+      template_ref:
+        description: 'Must match the ref used to call this workflow; a commit SHA is recommended; pass github.sha for same-repository relative-path calls'
+        required: true
+        type: string
+    outputs:
+      image:
+        description: 'Full image reference in download.t-head.cn/docker_tmp/<docker_name>:<docker_tag> format'
+        value: ${{ jobs.build-and-push.outputs.image }}
+      digest:
+        description: 'Digest of the pushed image, e.g. sha256:...'
+        value: ${{ jobs.build-and-push.outputs.digest }}
+    secrets:
+      template_token:
+        description: 'Read-only token for checking out a private template repository; usually unnecessary for same-repository or public templates'
+        required: false
+      release_username:
+        description: 'Image registry publishing username from a caller repository or organization Actions Secret'
+        required: true
+      release_token:
+        description: 'Image registry publishing token from a caller repository or organization Actions Secret'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and push temporary Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      image: ${{ steps.validate.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@v4
+        with:
+          path: caller-source
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      # Isolate template scripts from the build context to keep templates and checkout credentials out of the image.
+      - name: Check out template tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+
+      - name: Set up Python for input validation
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate Docker build inputs
+        id: validate
+        shell: bash
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/caller-source
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: python ci-template/ci-workflows/build-and-push-tmp-docker/scripts/validate_inputs.py
+
+      - name: Validate publishing credentials
+        shell: bash
+        env:
+          RELEASE_USERNAME: ${{ secrets.release_username }}
+          RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_USERNAME//[[:space:]]/}" || -z "${RELEASE_TOKEN//[[:space:]]/}" ]]; then
+            printf '%s\n' '::error::Publishing username and token must not be empty' >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to temporary image registry
+        uses: docker/login-action@v3
+        with:
+          registry: download.t-head.cn
+          username: ${{ secrets.release_username }}
+          password: ${{ secrets.release_token }}
+          logout: true
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.validate.outputs.build_context }}
+          file: ${{ steps.validate.outputs.dockerfile }}
+          build-args: ${{ inputs.build_args }}
+          tags: ${{ steps.validate.outputs.image }}
+          platforms: linux/amd64
+          push: true
+
+      - name: Output image reference and digest
+        shell: bash
+        env:
+          IMAGE: ${{ steps.validate.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf 'Pushed image: %s\nImage digest: %s\n' "$IMAGE" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"

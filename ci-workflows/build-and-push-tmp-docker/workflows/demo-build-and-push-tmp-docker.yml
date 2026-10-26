@@ -1,0 +1,72 @@
+name: Demo Build And Push Temporary Docker
+
+# Copy to .github/workflows/demo-build-and-push-tmp-docker.yml in the caller repository before use.
+# Commit the Dockerfile and build context to the caller repository; manual runs build and push real images.
+# Run only on trusted branches; Dockerfile RUN instructions execute code.
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile path relative to the caller repository root'
+        required: true
+        type: string
+        default: Dockerfile
+      build_context:
+        description: 'Build context directory relative to the caller repository root'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Optional Docker ARG values, one KEY=VALUE per line; do not pass passwords or tokens'
+        required: false
+        type: string
+        default: ''
+      docker_name:
+        description: 'Lowercase image name, e.g. demo or team/demo; exclude the registry, docker_tmp prefix, and tag'
+        required: true
+        type: string
+      docker_tag:
+        description: 'Image tag, e.g. dev-20261026; + is unsupported; use a different tag for each build'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Call temporary Docker build and push template
+    # For production, pin both @main and template_ref to the same full commit SHA in the template repository.
+    uses: t-head/ci-infra/.github/workflows/build-and-push-tmp-docker.yml@main
+    with:
+      dockerfile: ${{ inputs.dockerfile }}
+      build_context: ${{ inputs.build_context }}
+      build_args: ${{ inputs.build_args }}
+      # For fixed multiline build arguments, replace build_args above with:
+      # build_args: |
+      #   PYTHON_VERSION=3.12
+      #   APP_VERSION=1.2.3.dev1
+      docker_name: ${{ inputs.docker_name }}
+      docker_tag: ${{ inputs.docker_tag }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      # Enable as needed for private template repositories, and allow cross-repository calls in the template repository Actions settings.
+      # template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show image reference and digest
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          IMAGE: ${{ needs.publish.outputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf 'Image reference: %s\nImage digest: %s\n' "$IMAGE" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
