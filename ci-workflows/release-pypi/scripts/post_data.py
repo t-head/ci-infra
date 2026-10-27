@@ -244,6 +244,7 @@ def build_payload(record, target):
         version, sub_version = tag_list
     elif len(tag_list) == 1:
         version = tag_list[0]
+    sub_version = sub_version.lower().replace("v", "")
     payload["subVersion"] = sub_version
     payload["artifactVersion"] = version
 
@@ -267,7 +268,7 @@ def build_payload(record, target):
     # 处理 cmdLine 和 specificLine
     payload["cmdLine"] = f"pip install {payload["item"]}=={payload["artifactVersion"]} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
     if payload["subVersion"]:
-        payload["specificLine"] = f"pip install {payload['item']}=={payload['artifactVersion']}+{payload['subVersion']}.sail{payload['sdkVersion']} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
+        payload["specificLine"] = f"pip install {payload['item']}=={payload['artifactVersion']}+v{payload['subVersion']}.sail{payload['sdkVersion']} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
     else:
         payload["specificLine"] = f"pip install {payload['item']}=={payload['artifactVersion']}+sail{payload['sdkVersion']} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
 
