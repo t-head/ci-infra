@@ -1,0 +1,84 @@
+name: Demo Build And Push Release Docker
+
+# Copy to .github/workflows/demo-build-and-push-docker.yml in the caller repository.
+# Manual runs build and push a real image and publish metadata; use only trusted branches and Dockerfiles.
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile path relative to the caller repository root'
+        required: true
+        type: string
+        default: Dockerfile
+      build_context:
+        description: 'Local build context directory relative to the caller repository root'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Optional Docker ARG values, one KEY=VALUE per line; never include credentials'
+        required: false
+        type: string
+        default: ''
+      docker_name:
+        description: 'Lowercase image name, such as team/demo, without registry, repository prefix, or tag'
+        required: true
+        type: string
+      docker_tag:
+        description: 'Release image tag, such as 1.0.0; use a distinct tag for each release'
+        required: true
+        type: string
+      network:
+        description: 'Release network metadata; does not configure the build network'
+        required: true
+        type: choice
+        options:
+          - mellanox
+          - EIC
+          - mellanox/EIC
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Call release Docker build and push template
+    # For production, pin both @main and template_ref to the same full commit SHA in the template repository.
+    uses: t-head/ci-infra/.github/workflows/build-and-push-docker.yml@main
+    with:
+      dockerfile: ${{ inputs.dockerfile }}
+      build_context: ${{ inputs.build_context }}
+      build_args: ${{ inputs.build_args }}
+      docker_name: ${{ inputs.docker_name }}
+      docker_tag: ${{ inputs.docker_tag }}
+      # Update the release metadata below to match the actual image environment; these fields do not automatically change the Docker build.
+      os: ubuntu24
+      python: 'py312'
+      hggcrt: '3'
+      sdk_version: '2.2.0'
+      torch: '2.10.0'
+      network: ${{ inputs.network }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      data_token: ${{ secrets.DATA_TOKEN }}
+      # Enable as needed for private templates, and allow cross-repository calls in the template repository Actions settings.
+      # template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show published image information
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          IMAGE: ${{ needs.publish.outputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SIZE: ${{ needs.publish.outputs.size }}
+        run: |
+          set -euo pipefail
+          printf 'Image address: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGE" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"

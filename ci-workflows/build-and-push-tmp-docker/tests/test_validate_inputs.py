@@ -88,7 +88,7 @@ def test_invalid_image_names(validator, name):
         validator.image_reference(name, "dev")
 
 
-@pytest.mark.parametrize("tag", ["dev", "1.2.3.dev1", "dev-20261026", "_test", "CUDA13", "a" * 128])
+@pytest.mark.parametrize("tag", ["dev", "1.2.3.dev1", "dev-20261026", "_test", "3", "a" * 128])
 def test_valid_tags(validator, tag):
     assert validator.image_reference("demo", tag).endswith(":" + tag)
 
