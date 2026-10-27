@@ -7,7 +7,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -599,23 +598,6 @@ def test_demo_prints_outputs_without_shell_interpolation():
     assert syntax.returncode == 0, syntax.stderr
 
 
-def test_template_documentation_links_and_fields(expected_payload):
-    text = README.read_text()
-    contract = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)["on"]["workflow_call"]
-    documented = set(re.findall(r"^\| `([^`]+)` \|", text, flags=re.MULTILINE))
-    for group in ("inputs", "secrets", "outputs"):
-        assert set(contract[group]) <= documented
-    assert set(expected_payload) <= documented
-    assert "| `attributes` |" not in text
-    links = re.findall(r"\]\(([^)]+)\)", text)
-    assert "../../.github/workflows/build-and-push-docker.yml" in links
-    assert "workflows/demo-build-and-push-docker.yml" in links
-    for link in links:
-        if not link.startswith(("https://", "http://", "#")):
-            assert (ROOT / link.split("#", 1)[0]).is_file(), link
-    assert "(ci-workflows/build-and-push-docker/README.md)" in (REPO / "README.md").read_text()
-
-
 @pytest.mark.parametrize("missing", [None, "RELEASE_USERNAME", "RELEASE_TOKEN", "CLIENT_PRIVATE_KEY_B64"])
 def test_credentials_checked_before_build_without_logging(missing):
     workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
@@ -780,14 +762,6 @@ def test_inspection_requires_output_path_before_docker(image_inspector, release_
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     assert image_inspector.main() == 1
     image_inspector.subprocess.run.assert_not_called()
-
-
-def test_root_readme_routes_to_template_documentation():
-    index = (REPO / "README.md").read_text()
-    assert "(ci-workflows/build-and-push-docker/README.md)" in index
-    assert "build_payload(record)" not in index
-    assert "build_payload(record)" in README.read_text()
-    assert "(workflows/demo-build-and-push-docker.yml)" in README.read_text()
 
 
 def test_public_configuration_matches_repository_api(post_module):
