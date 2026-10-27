@@ -32,7 +32,7 @@ Reusable workflows run in separate jobs and do not share local files with preced
 1. Copy [`workflows/demo-push-tmp-wheel.yml`](workflows/demo-push-tmp-wheel.yml) to `.github/workflows/demo-push-tmp-wheel.yml` in the project to publish.
 2. Configure `RELEASE_USERNAME` and `RELEASE_TOKEN` in the caller repository or organization Actions Secrets. The publishing account needs upload access to the destination temporary repository.
 3. Ensure the caller can use workflows from the template repository. Private template repositories must also allow cross-repository calls in Actions settings; configure `TEMPLATE_TOKEN` and uncomment its mapping in the example as needed.
-4. Adjust the example build environment and commands for the project. The example uses Python 3.12 and `python -m build --wheel` and requires a buildable Python project in the caller repository. If CUDA, PPU SDK, or other system dependencies are needed, configure the build runner/container and dependencies, and write build outputs to the directory expected by the example.
+4. Adjust the example build environment and commands for the project. The example uses Python 3.12 and `python -m build --wheel` and requires a buildable Python project in the caller repository. If hggcrt, PPU SDK, or other system dependencies are needed, configure the build runner/container and dependencies, and write build outputs to the directory expected by the example.
 5. After committing the example to the caller default branch, trigger it manually using **Run workflow** on the Actions page. Select a trusted branch to build and enter the actual package name and wheel filename. For example:
 
    ```text

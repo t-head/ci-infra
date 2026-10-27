@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: python -m pip install --no-input build
 
-      # Generic Python project example; replace the build environment and commands if CUDA, PPU SDK, or other dependencies are required.
+      # Generic Python project example; replace the build environment and commands if hggcrt, PPU SDK, or other dependencies are required.
       # The project build configuration determines the version; wheel_name does not change the version or rename files.
       - name: Build wheel
         shell: bash
