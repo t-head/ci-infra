@@ -102,10 +102,12 @@ while true; do
   STARTING=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Pending")] | length')
 
   if [ -f "$TASK_FILE" ] && { [ "$RUNNING" -gt 0 ] || [ "$SUCCEEDED" -gt 0 ]; }; then
-    TASK_RECORDED_STATUS=$(jq -r '.status // empty' "$TASK_FILE")
-    if [ "$TASK_RECORDED_STATUS" != "running" ]; then
-      jq '.status = "running"' "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-    fi
+    (
+      flock -w 5 9 || exit 0
+      if jq -e '(.status == "pending" or .status == "scheduled") and ((.end_time // "") == "")' "$TASK_FILE" >/dev/null; then
+        jq '.status = "running"' "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
+      fi
+    ) 9> "${TASK_FILE}.lock"
   fi
 
   if [ "$NOW" -ge "$DEADLINE" ]; then

@@ -117,27 +117,32 @@ set_output "task_pods" "$TASK_PODS"
 echo "Job: $JOB_NAME | Status: $FINAL_STATUS | Duration: ${DURATION}s | Pods: $TASK_PODS"
 
 if [ -f "$TASK_FILE" ]; then
-  jq \
-    --arg end_time "$METRICS_END_TIME" \
-    --arg status "$FINAL_STATUS" \
-    --argjson queue_duration_seconds "$QUEUE_DURATION_SECONDS" \
-    --argjson occupied_ppu_card_seconds "$OCCUPIED_PPU_CARD_SECONDS" \
-    --argjson execution_ppu_card_seconds "$EXECUTION_PPU_CARD_SECONDS" \
-    --argjson occupied_ppu_card_hours "$OCCUPIED_PPU_CARD_HOURS" \
-    --argjson execution_ppu_card_hours "$EXECUTION_PPU_CARD_HOURS" \
-    --argjson unscheduled_pods "$UNSCHEDULED_PODS" \
-    --arg pod_queue "$POD_QUEUE" \
-    --arg queue_reason "$QUEUE_REASON" \
-    '.end_time = $end_time
-     | .status = $status
-     | .queue_duration_seconds = $queue_duration_seconds
-     | .unscheduled_pods = $unscheduled_pods
-     | .pod_queue = ($pod_queue | if . == "" then [] else split(",") | map(split(":") | {pod: .[0], queue_seconds: (.[1] | tonumber), scheduled: (.[2] == "1")}) end)
-     | .queue_reason = $queue_reason
-     | .occupied_ppu_card_seconds = $occupied_ppu_card_seconds
-     | .execution_ppu_card_seconds = $execution_ppu_card_seconds
-     | .occupied_ppu_card_hours = $occupied_ppu_card_hours
-     | .execution_ppu_card_hours = $execution_ppu_card_hours' \
-    "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-  echo "Task record finalized: $TASK_FILE"
+  (
+    flock -w 5 9 || exit 0
+    if jq -e '(.status == "pending" or .status == "scheduled" or .status == "running") and ((.end_time // "") == "")' "$TASK_FILE" >/dev/null; then
+      jq \
+        --arg end_time "$METRICS_END_TIME" \
+        --arg status "$FINAL_STATUS" \
+        --argjson queue_duration_seconds "$QUEUE_DURATION_SECONDS" \
+        --argjson occupied_ppu_card_seconds "$OCCUPIED_PPU_CARD_SECONDS" \
+        --argjson execution_ppu_card_seconds "$EXECUTION_PPU_CARD_SECONDS" \
+        --argjson occupied_ppu_card_hours "$OCCUPIED_PPU_CARD_HOURS" \
+        --argjson execution_ppu_card_hours "$EXECUTION_PPU_CARD_HOURS" \
+        --argjson unscheduled_pods "$UNSCHEDULED_PODS" \
+        --arg pod_queue "$POD_QUEUE" \
+        --arg queue_reason "$QUEUE_REASON" \
+        '.end_time = $end_time
+         | .status = $status
+         | .queue_duration_seconds = $queue_duration_seconds
+         | .unscheduled_pods = $unscheduled_pods
+         | .pod_queue = ($pod_queue | if . == "" then [] else split(",") | map(split(":") | {pod: .[0], queue_seconds: (.[1] | tonumber), scheduled: (.[2] == "1")}) end)
+         | .queue_reason = $queue_reason
+         | .occupied_ppu_card_seconds = $occupied_ppu_card_seconds
+         | .execution_ppu_card_seconds = $execution_ppu_card_seconds
+         | .occupied_ppu_card_hours = $occupied_ppu_card_hours
+         | .execution_ppu_card_hours = $execution_ppu_card_hours' \
+        "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
+      echo "Task record finalized: $TASK_FILE"
+    fi
+  ) 9> "${TASK_FILE}.lock"
 fi

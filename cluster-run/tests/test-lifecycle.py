@@ -76,6 +76,13 @@ def fake_command(tool, args):
 
     if tool == "sleep":
         seconds = int(args[0])
+        if fixture.get("step_sleep") and seconds >= 30:
+            counter = root / "poll-sleeps"
+            index = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(index))
+            (root / f"poll-sleep-{index}").touch()
+            while not (root / f"release-poll-{index}").exists():
+                time.sleep(0.01)
         if fixture.get("block_sleep") and seconds >= 30:
             (root / "sleep-waiting").touch()
             while not (root / "release-sleep").exists():
@@ -182,6 +189,7 @@ def fake_command(tool, args):
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(shutil.which("jq"), "jq is required by the lifecycle scripts")
+        self.assertIsNotNone(shutil.which("flock"), "flock is required by the lifecycle scripts")
         self.temp = tempfile.TemporaryDirectory(prefix="ppu-lifecycle-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -206,7 +214,8 @@ class LifecycleTests(unittest.TestCase):
                                     "USER_ENV_JSON", "SOURCE_STAGE_DIR", "CONTAINER_OPTIONS")}
         self.env.update(
             PATH=str(self.bin) + os.pathsep + os.defpath + os.pathsep
-            + str(Path(shutil.which("jq")).parent),
+            + str(Path(shutil.which("jq")).parent) + os.pathsep
+            + str(Path(shutil.which("flock")).parent),
             LIFECYCLE_FIXTURE=str(self.root), JOB_NAME=self.root.name,
             INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0",
             INPUT_NAMESPACE="fixture", INPUT_NNODES="0", INPUT_NPROC_PER_NODE="8",
@@ -272,7 +281,7 @@ class LifecycleTests(unittest.TestCase):
         return self.finish(*self.start(script, **env))
 
     def wait_for(self, marker, process):
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while not (self.root / marker).exists():
             if process.poll() is not None or time.monotonic() >= deadline:
                 self.fail(f"Script did not reach {marker}")
@@ -444,6 +453,134 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(rc, 0, text)
                 self.assertEqual(outputs["job_status"], expected)
                 self.assertEqual(json.loads(task.read_text())["status"], expected)
+
+    def paused_poller(self, script, phase="Running"):
+        for marker in ("poll-sleeps", "poll-sleep-1", "poll-sleep-2",
+                       "release-poll-1", "release-poll-2"):
+            (self.root / marker).unlink(missing_ok=True)
+        active = pod(0, phase, EPOCH, started=EPOCH,
+                     finished=EPOCH + 20 if phase == "Succeeded" else None)
+        self.configure([pod(0), pod(1)], later=[(EPOCH + 30, [active, pod(1)])],
+                       step_sleep=True)
+        task = self.root / "tasks" / (self.env["JOB_NAME"] + ".json")
+        task.parent.mkdir(exist_ok=True)
+        task.write_text(json.dumps({"status": "pending"}))
+        process, output = self.start(script, INPUT_NNODES="2", INPUT_TIMEOUT_MINUTES="5",
+                                     JOB_DEADLINE=str(EPOCH + 300))
+        self.wait_for("poll-sleep-1", process)
+        return process, output, task
+
+    def finish_paused_poller(self, process, output):
+        process.send_signal(signal.SIGTERM)
+        (self.root / "release-poll-2").touch()
+        return self.finish(process, output)
+
+    def test_pollers_promote_only_unfinished_records(self):
+        for script in ("submit.sh", "monitor.sh"):
+            for phase in ("Running", "Succeeded"):
+                for status in ("pending", "scheduled", "running", "cancelled",
+                               "failed", "succeeded", "timeout"):
+                    with self.subTest(script=script, phase=phase, status=status):
+                        process, output, task = self.paused_poller(script, phase)
+                        record = {"status": status, "execution_ppu_card_hours": 1.25}
+                        task.write_text(json.dumps(record))
+                        before = task.stat().st_mtime_ns
+                        (self.root / "release-poll-1").touch()
+                        self.wait_for("poll-sleep-2", process)
+                        expected = dict(record, status="running") if status in (
+                            "pending", "scheduled", "running") else record
+                        try:
+                            self.assertEqual(json.loads(task.read_text()), expected)
+                            if expected == record:
+                                self.assertEqual(task.stat().st_mtime_ns, before)
+                        finally:
+                            rc, _, text = self.finish_paused_poller(process, output)
+                            self.assertEqual(rc, 130, text)
+                        if status in ("cancelled", "failed", "succeeded", "timeout"):
+                            self.assertEqual(json.loads(task.read_text()), record)
+
+    def test_pollers_preserve_records_with_an_end_time(self):
+        for script in ("submit.sh", "monitor.sh"):
+            with self.subTest(script=script):
+                process, output, task = self.paused_poller(script)
+                record = {"status": "running", "end_time": timestamp(EPOCH + 10),
+                          "occupied_ppu_card_hours": 2.5, "execution_ppu_card_hours": 1.25}
+                task.write_text(json.dumps(record))
+                before = task.stat().st_mtime_ns
+                (self.root / "release-poll-1").touch()
+                self.wait_for("poll-sleep-2", process)
+                try:
+                    self.assertEqual(json.loads(task.read_text()), record)
+                    self.assertEqual(task.stat().st_mtime_ns, before)
+                finally:
+                    rc, _, text = self.finish_paused_poller(process, output)
+                    self.assertEqual(rc, 130, text)
+                self.assertEqual(json.loads(task.read_text()), record)
+
+    def test_cleanup_finalization_survives_a_resumed_poll(self):
+        for script in ("submit.sh", "monitor.sh"):
+            with self.subTest(script=script):
+                process, output, task = self.paused_poller(script)
+                task.write_text(json.dumps({"status": "running",
+                                            "execution_ppu_card_hours": 1.25}))
+                rc, outputs, text = self.run_script(
+                    "cleanup.sh", INPUT_NNODES="2", INPUT_JOB_STATUS="scheduled",
+                    INPUT_WORKFLOW_STATUS="cancelled")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "cancelled")
+                finalized = task.read_bytes()
+                before = task.stat().st_mtime_ns
+                (self.root / "release-poll-1").touch()
+                self.wait_for("poll-sleep-2", process)
+                try:
+                    self.assertEqual(task.read_bytes(), finalized)
+                    self.assertEqual(task.stat().st_mtime_ns, before)
+                finally:
+                    rc, _, text = self.finish_paused_poller(process, output)
+                    self.assertEqual(rc, 130, text)
+                self.assertEqual(task.read_bytes(), finalized)
+
+    def test_task_writers_read_the_record_after_acquiring_its_lock(self):
+        real_flock = shutil.which("flock")
+        for script in ("submit.sh", "monitor.sh", "cleanup.sh", "report-job.sh"):
+            with self.subTest(script=script):
+                (self.bin / "flock").unlink(missing_ok=True)
+                (self.root / "task-lock-waiting").unlink(missing_ok=True)
+                if script in ("submit.sh", "monitor.sh"):
+                    process, output, task = self.paused_poller(script)
+                else:
+                    self.configure([pod(0, "Running", EPOCH, started=EPOCH)])
+                    task = self.root / "tasks" / (self.env["JOB_NAME"] + ".json")
+                    task.parent.mkdir(exist_ok=True)
+                    task.write_text(json.dumps({"status": "running"}))
+                wrapper = self.bin / "flock"
+                wrapper.write_text("#!/bin/sh\n: > "
+                                   + shlex.quote(str(self.root / "task-lock-waiting"))
+                                   + "\nexec " + shlex.quote(real_flock) + ' "$@"\n')
+                wrapper.chmod(0o755)
+                record = {"status": "cancelled", "end_time": timestamp(EPOCH + 10),
+                          "execution_ppu_card_hours": 1.25}
+                with Path(str(task) + ".lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    if script in ("submit.sh", "monitor.sh"):
+                        (self.root / "release-poll-1").touch()
+                    else:
+                        process, output = self.start(
+                            script, INPUT_JOB_STATUS="scheduled",
+                            INPUT_WORKFLOW_STATUS="cancelled", JOB_STATUS="timeout")
+                    self.wait_for("task-lock-waiting", process)
+                    task.write_text(json.dumps(record))
+                if script in ("submit.sh", "monitor.sh"):
+                    self.wait_for("poll-sleep-2", process)
+                    try:
+                        self.assertEqual(json.loads(task.read_text()), record)
+                    finally:
+                        rc, _, text = self.finish_paused_poller(process, output)
+                        self.assertEqual(rc, 130, text)
+                else:
+                    rc, _, text = self.finish(process, output)
+                    self.assertEqual(rc, 0, text)
+                self.assertEqual(json.loads(task.read_text()), record)
 
     def worker_manifest(self):
         path = self.root / "manifests" / "pod-worker-0.yaml"
