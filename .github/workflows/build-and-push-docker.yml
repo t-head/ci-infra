@@ -2,7 +2,7 @@ name: Reusable Build And Push Release Docker
 
 # Build only trusted caller code; Dockerfile RUN instructions execute code.
 # The Artifactory repository is /artifactory/docker_release/; Docker clients use the address below.
-# The image address is fixed to download.t-head.cn/docker_release/<docker_name>:<docker_tag>.
+# The image address is fixed to download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>.
 on:
   workflow_call:
     inputs:
@@ -21,13 +21,14 @@ on:
         type: string
         default: ''
       docker_name:
-        description: 'Lowercase image name, such as demo or team/demo, without a registry, repository prefix, or tag'
+        description: 'Lowercase base image name, such as demo or team/demo; the exact Git tag or full commit SHA is appended automatically'
         required: true
         type: string
       docker_tag:
-        description: 'Single image tag, such as 1.0.0; up to 128 characters, without colons or paths'
-        required: true
+        description: 'Optional image tag, such as 1.0.0; defaults to the current UTC date (YYYY-MM-DD); up to 128 characters, without colons or paths'
+        required: false
         type: string
+        default: ''
       os:
         description: 'Required release metadata: operating system, such as ubuntu24.04; does not select the runner'
         required: true
@@ -63,7 +64,7 @@ on:
         type: string
     outputs:
       image:
-        description: 'Full image address in the format download.t-head.cn/docker_release/<docker_name>:<docker_tag>'
+        description: 'Full image address in the format download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>'
         value: ${{ jobs.build-and-push.outputs.image }}
       digest:
         description: 'Digest of the pushed image or image index, such as sha256:...'
@@ -191,6 +192,8 @@ jobs:
         shell: bash
         env:
           INPUTS_JSON: ${{ toJSON(inputs) }}
+          SOURCE_REVISION: ${{ steps.validate.outputs.source_revision }}
+          RESOLVED_DOCKER_TAG: ${{ steps.validate.outputs.docker_tag }}
           IMAGE: ${{ steps.validate.outputs.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
           SIZE: ${{ steps.inspect.outputs.size }}

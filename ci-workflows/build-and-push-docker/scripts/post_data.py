@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from validate_inputs import image_reference, release_metadata, string_input
+from validate_inputs import release_metadata, string_input, versioned_image_reference
 
 
 REQUEST_TIMEOUT = (30, 300)
@@ -186,7 +186,7 @@ def read_record():
         docker_name (str): Image name, optionally namespaced, without the registry address or tag.
         docker_tag (str): Image tag.
         image (str): Full image address in the format
-            download.t-head.cn/docker_release/<docker_name>:<docker_tag>.
+            download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>.
         digest (str): Pushed digest as 64 lowercase hexadecimal characters, without the sha256: prefix.
         size (int): Total size in bytes of the linux/amd64 image config and stored layers,
             excluding manifest JSON and attestations; not the locally unpacked size.
@@ -196,11 +196,15 @@ def read_record():
     inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
     record = release_metadata(inputs)
     name = string_input(inputs, "docker_name")
-    tag = string_input(inputs, "docker_tag")
-    expected_image = image_reference(name, tag)
+    input_tag = string_input(inputs, "docker_tag", "")
+    tag = os.environ.get("RESOLVED_DOCKER_TAG", "")
+    if input_tag and tag != input_tag:
+        raise ValueError("RESOLVED_DOCKER_TAG must match the supplied docker_tag")
+    revision = os.environ.get("SOURCE_REVISION", "")
+    expected_image = versioned_image_reference(name, revision, tag)
     image = os.environ.get("IMAGE", "")
     if image != expected_image:
-        raise ValueError("IMAGE must match docker_name and docker_tag in docker_release")
+        raise ValueError("IMAGE must match docker_name, SOURCE_REVISION, and RESOLVED_DOCKER_TAG in docker_release")
     digest = os.environ.get("DIGEST", "")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("DIGEST must be the sha256 digest returned by the successful image push")
