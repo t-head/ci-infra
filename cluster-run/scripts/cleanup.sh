@@ -32,30 +32,42 @@ log_info "Performing full cleanup: $JOB_NAME (namespace=$NAMESPACE)"
 # --- Update the task record ---
 TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"
 TASK_FILE="${TASK_DIR}/${JOB_NAME}.json"
-TASK_STATUS="${INPUT_JOB_STATUS:-}"
-case "$TASK_STATUS" in
-  ""|unknown|pending|running|scheduled)
-    if [ -f "$TASK_FILE" ]; then
-      TASK_STATUS="$(jq -r '.status // empty' "$TASK_FILE")"
+(
+  TASK_RECORD_LOCKED=false
+  if [ -f "$TASK_FILE" ]; then
+    exec 9> "${TASK_FILE}.lock"
+    if flock -w 5 9; then
+      TASK_RECORD_LOCKED=true
+    else
+      log_warn "Task record is locked; skipping its update"
     fi
-    ;;
-esac
-case "$TASK_STATUS" in
-  ""|unknown|pending|running|scheduled)
-    TASK_STATUS="failed"
-    [ "${INPUT_WORKFLOW_STATUS:-}" = "cancelled" ] && TASK_STATUS="cancelled"
-    ;;
-esac
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  echo "job_status=$TASK_STATUS" >> "$GITHUB_OUTPUT"
-fi
-if [ -f "$TASK_FILE" ] && command -v jq >/dev/null 2>&1; then
-  TASK_END_TIME="$(date +%Y-%m-%dT%H:%M:%S%z)"
-  jq --arg end_time "$TASK_END_TIME" --arg status "$TASK_STATUS" \
-    '.end_time = $end_time | .status = $status' \
-    "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-  log_info "Task record updated: ${TASK_FILE} (status=${TASK_STATUS})"
-fi
+  fi
+  TASK_STATUS="${INPUT_JOB_STATUS:-}"
+  case "$TASK_STATUS" in
+    ""|unknown|pending|running|scheduled)
+      if [ -f "$TASK_FILE" ]; then
+        TASK_STATUS="$(jq -r '.status // empty' "$TASK_FILE")"
+      fi
+      ;;
+  esac
+  case "$TASK_STATUS" in
+    ""|unknown|pending|running|scheduled)
+      TASK_STATUS="failed"
+      [ "${INPUT_WORKFLOW_STATUS:-}" = "cancelled" ] && TASK_STATUS="cancelled"
+      ;;
+  esac
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "job_status=$TASK_STATUS" >> "$GITHUB_OUTPUT"
+  fi
+  if [ "$TASK_RECORD_LOCKED" = true ] && command -v jq >/dev/null 2>&1; then
+    TASK_END_TIME="$(date +%Y-%m-%dT%H:%M:%S%z)"
+    if jq --arg end_time "$TASK_END_TIME" --arg status "$TASK_STATUS" \
+      '.end_time = (if (.end_time // "") == "" then $end_time else .end_time end) | .status = $status' \
+      "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"; then
+      log_info "Task record updated: ${TASK_FILE} (status=${TASK_STATUS})"
+    fi
+  fi
+)
 
 POD_SELECTOR="ppu-job=$JOB_NAME"
 

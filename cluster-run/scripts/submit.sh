@@ -797,10 +797,12 @@ while true; do
 
   POD_SNAPSHOT=$(kube_request get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
   if [ -f "${TASK_FILE:-}" ] && printf '%s' "$POD_SNAPSHOT" | jq -e 'any(.items[]; .status.phase == "Running" or .status.phase == "Succeeded")' >/dev/null; then
-    TASK_RECORDED_STATUS=$(jq -r '.status // empty' "$TASK_FILE")
-    if [ "$TASK_RECORDED_STATUS" != "running" ]; then
-      jq '.status = "running"' "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-    fi
+    (
+      flock -w 5 9 || exit 0
+      if jq -e '(.status == "pending" or .status == "scheduled") and ((.end_time // "") == "")' "$TASK_FILE" >/dev/null; then
+        jq '.status = "running"' "$TASK_FILE" > "${TASK_FILE}.tmp" && mv "${TASK_FILE}.tmp" "$TASK_FILE"
+      fi
+    ) 9> "${TASK_FILE}.lock"
   fi
   SCHEDULED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length')
   if [ "$SCHEDULED" -eq "$NNODES" ]; then
