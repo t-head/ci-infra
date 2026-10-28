@@ -1,9 +1,11 @@
 """Validate release Docker build inputs and metadata, with the target repository fixed to docker_release."""
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -52,6 +54,28 @@ def image_reference(name, tag):
     return f"{repository}:{tag}"
 
 
+def versioned_image_reference(name, revision, tag):
+    image_reference(name, tag)
+    if not re.fullmatch(NAME_COMPONENT, revision):
+        raise ValueError("Git tag or commit must be a valid lowercase Docker name suffix; uppercase letters, paths, and + are not supported")
+    return image_reference(f"{name}-{revision}", tag)
+
+
+def source_revision(source):
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        tags = subprocess.run(
+            ["git", "-C", str(source), "tag", "--points-at", commit, "--sort=refname"],
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout.splitlines()
+    except (subprocess.SubprocessError, OSError) as error:
+        raise ValueError(f"Failed to resolve caller Git tag or commit: {type(error).__name__}") from None
+    return tags[0] if tags else commit
+
+
 def local_path(source, value, key, *, directory):
     path = Path(value)
     if (
@@ -95,12 +119,15 @@ def validate_inputs(inputs, source):
     source = source.resolve(strict=True)
     if not source.is_dir():
         raise ValueError("SOURCE_DIR must be the caller source directory")
-    image = image_reference(string_input(inputs, "docker_name"), string_input(inputs, "docker_tag"))
+    tag = string_input(inputs, "docker_tag", "") or datetime.now(timezone.utc).date().isoformat()
+    revision = source_revision(source)
+    image = versioned_image_reference(string_input(inputs, "docker_name"), revision, tag)
     context = local_path(source, string_input(inputs, "build_context", "."), "build_context", directory=True)
     dockerfile = local_path(source, string_input(inputs, "dockerfile"), "dockerfile", directory=False)
     validate_build_args(string_input(inputs, "build_args", ""))
     # Resolve the Dockerfile relative to the caller repository root; it may be outside the build context.
-    return {"image": image, "build_context": context, "dockerfile": dockerfile}
+    return {"image": image, "build_context": context, "dockerfile": dockerfile,
+            "source_revision": revision, "docker_tag": tag}
 
 
 def main():
