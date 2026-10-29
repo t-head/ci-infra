@@ -228,7 +228,7 @@ def get_runtime_version_by_env():
 
 def get_sdk_version_by_env():
     """
-    通过读取环境变量 SAIL_PYPI_SDK_VESION 获取 SDK 版本号。
+    通过读取环境变量 SAIL_PYPI_SDK_VERSION 获取 SDK 版本号。
 
     该环境变量用于在无法通过其他途径自动检测 SDK 版本时，由用户手动指定。预期格式为纯版本号字符串，如 "1.7.0"。
 
@@ -237,15 +237,15 @@ def get_sdk_version_by_env():
     """
     try:
         # SDK_VESION_FOR_PYPI=1.7.0
-        output = os.getenv('SAIL_PYPI_SDK_VESION')
+        output = os.getenv('SAIL_PYPI_SDK_VERSION')
         if output is not None:
-            print(f"Get sdk version by env 'SAIL_PYPI_SDK_VESION': {output}")
+            print(f"Get sdk version by env 'SAIL_PYPI_SDK_VERSION': {output}")
             return output
         else:
-            print(f"Can not get env 'SAIL_PYPI_SDK_VESION': {output}. Example: SAIL_PYPI_SDK_VESION=1.7.0")
+            print(f"Can not get env 'SAIL_PYPI_SDK_VERSION': {output}. Example: SAIL_PYPI_SDK_VERSION=1.7.0")
             return None
     except Exception as e:
-        print(f"Unexpected error for get env SAIL_PYPI_SDK_VESION: {e}")
+        print(f"Unexpected error for get env SAIL_PYPI_SDK_VERSION: {e}")
         return None
 
 
