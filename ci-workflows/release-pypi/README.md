@@ -229,7 +229,7 @@ Relevant environment variables:
 | --- | --- |
 | `HGGCRT_VERSION` | Explicit Runtime version, such as `hggcrt3`; if unset or incorrectly formatted, detection falls back to `hgcc --version` |
 | `SAIL_SDK_MATCH_STRATEGY` | Set to `off` to construct the wheel URL directly using local naming rules |
-| `SAIL_PYPI_SDK_VESION` | SDK version lookup entry provided by the template; `VESION` is the existing spelling, and its use depends on the matching strategy |
+| `SAIL_PYPI_SDK_VERSION` | SDK version lookup entry provided by the template; `VESION` is the existing spelling, and its use depends on the matching strategy |
 
 ## Repository Structure
 
