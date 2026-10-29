@@ -38,6 +38,11 @@ DEFAULT_INPUTS = {
 REVISION = "v1.2.3"
 IMAGE = f"download.t-head.cn/docker_release/team/demo-{REVISION}:1.0.0"
 DIGEST = "sha256:" + "a" * 64
+FREEZE_OUTPUT = "numpy==2.1.0\ntorch==2.5.8\n"
+PACKAGE_LIST = [
+    {"packageName": "numpy", "packageVersion": "2.1.0"},
+    {"packageName": "torch", "packageVersion": "2.5.8"},
+]
 
 
 def load_module(name, path, monkeypatch):
@@ -56,6 +61,10 @@ def validator(monkeypatch):
 @pytest.fixture
 def post_module(validator, monkeypatch):
     module = load_module("docker_release_post_data", POST_SCRIPT, monkeypatch)
+    monkeypatch.setattr(module, "subprocess", SimpleNamespace(
+        run=Mock(return_value=SimpleNamespace(stdout=FREEZE_OUTPUT)),
+        SubprocessError=subprocess.SubprocessError,
+    ))
     monkeypatch.setattr(module, "requests", SimpleNamespace(
         post=Mock(side_effect=AssertionError("Real HTTP requests are prohibited in tests")),
         RequestException=requests.RequestException,
@@ -346,12 +355,156 @@ def test_validator_cli_outputs_only_on_success(source, override):
         assert not output_file.exists()
 
 
+@pytest.mark.parametrize("output,expected", [
+    (FREEZE_OUTPUT, PACKAGE_LIST),
+    ("\r\n# comment\r\n torch == 2.5.8 \r\nnumpy==2.1.0\r\n", PACKAGE_LIST),
+    ("", []), ("\n# comment only\n", []), (None, []), (b"torch==2.5.8", []), ([], []),
+    ("My_Pkg==1.0\nmy-pkg==1.0\n", [{"packageName": "My_Pkg", "packageVersion": "1.0"}]),
+    ("demo==1.0\nDemo==2.0\n", [{"packageName": "demo", "packageVersion": "1.0"}]),
+    ("torch==2.5.8+cu124\n", [{"packageName": "torch", "packageVersion": "2.5.8+cu124"}]),
+    ("demo===1!2.0rc1.post2.dev3\n", [{"packageName": "demo", "packageVersion": "1!2.0rc1.post2.dev3"}]),
+])
+def test_parse_pip_freeze(post_module, output, expected):
+    assert post_module.parse_pip_freeze(output) == expected
+    post_module.subprocess.run.assert_not_called()
+
+
+@pytest.mark.parametrize("output", [
+    "torch", "torch>=2.5.8", "torch==", "==2.5.8", "torch==2.5.8 extra", "--index-url secret",
+    "torch==2.5.8\x00", "torch==https://secret.example", "torch====2.5.8", "bad/name==1.0",
+    "demo @ https://secret.example\nunparseable",
+])
+def test_bad_freeze_lines_are_skipped_without_blocking_publication(
+    post_module, release_env, monkeypatch, output, capsys,
+):
+    post_module.subprocess.run.return_value.stdout = "numpy==2.1.0\n" + output + "\ntorch==2.5.8\n"
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == PACKAGE_LIST
+    post_module.requests.post.assert_not_called()
+    post_module.subprocess.run.assert_called_once()
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert "secret.example" not in captured.out
+
+
+def test_package_collection_uses_pushed_image_not_runner(post_module, release_env, monkeypatch):
+    monkeypatch.setenv("CLIENT_PRIVATE_KEY_B64", "test-private-key")
+    monkeypatch.setenv("RELEASE_TOKEN", "test-registry-token")
+    packages = post_module.collect_image_packages(IMAGE, DIGEST)
+    assert packages == PACKAGE_LIST
+    post_module.subprocess.run.assert_called_once()
+    command = post_module.subprocess.run.call_args.args[0]
+    container = command[command.index("--name") + 1]
+    assert container.startswith("release-packages-")
+    assert command == [
+        "docker", "run", "--rm", "--name", container, "--platform", "linux/amd64",
+        "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--entrypoint", "pip", IMAGE.rsplit(":", 1)[0] + "@" + DIGEST,
+        "--disable-pip-version-check", "freeze", "--all",
+    ]
+    assert post_module.subprocess.run.call_args.kwargs == {
+        "check": True, "capture_output": True, "text": True, "timeout": 900,
+    }
+    assert "test-private-key" not in repr(command)
+    assert "test-registry-token" not in repr(command)
+
+
+@pytest.mark.parametrize("unversioned", [
+    "torch @ file:///opt/wheels/torch.whl",
+    "torch @ https://user:secret@example.invalid/torch.whl",
+    "-e git+https://example.invalid/repo.git@main#egg=torch",
+    "# Editable install with no version control\n-e /opt/torch",
+    "--editable /opt/torch",
+])
+def test_reference_installs_are_skipped_without_fallback(post_module, release_env, unversioned, capsys):
+    post_module.subprocess.run.return_value.stdout = "numpy==2.1.0\n" + unversioned + "\n"
+    record = post_module.read_record()
+    assert post_module.build_payload(record)["packageList"] == [PACKAGE_LIST[0]]
+    post_module.subprocess.run.assert_called_once()
+    assert post_module.subprocess.run.call_args.args[0][-2:] == ["freeze", "--all"]
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err
+
+
+@pytest.mark.parametrize("output", ["", "unexpected", "torch @ file:///opt/torch.whl", None])
+def test_unparseable_freeze_publishes_empty_list(post_module, release_env, monkeypatch, output, capsys):
+    post_module.subprocess.run.return_value.stdout = output
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    post_module.requests.post.assert_not_called()
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("image,digest", [
+    (None, DIGEST), ("", DIGEST), (IMAGE.replace("docker_release", "docker_tmp"), DIGEST),
+    (IMAGE.replace("download.t-head.cn", "example.invalid"), DIGEST),
+    (IMAGE.rsplit(":", 1)[0], DIGEST), (IMAGE + "\ninjected", DIGEST),
+    (IMAGE, None), (IMAGE, "sha256:abc"), (IMAGE, DIGEST + "\n"),
+])
+def test_package_inspection_skips_unsafe_references(post_module, image, digest):
+    assert post_module.collect_image_packages(image, digest) == []
+    post_module.subprocess.run.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.CalledProcessError(127, "docker", output=FREEZE_OUTPUT, stderr="sensitive-error"),
+    subprocess.TimeoutExpired("docker", 900, output=FREEZE_OUTPUT, stderr="sensitive-error"),
+    FileNotFoundError("sensitive-error"),
+    UnicodeDecodeError("utf-8", b"\xff", 0, 1, "sensitive-error"),
+    RuntimeError("sensitive-error"),
+])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_package_collection_failure_cleans_up_and_publishes_empty_list(
+    post_module, release_env, monkeypatch, capsys, error, cleanup_fails,
+):
+    cleanup = OSError("sensitive-cleanup-error") if cleanup_fails else SimpleNamespace(stdout="")
+    post_module.subprocess.run.side_effect = [error, cleanup]
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    post_module.requests.post.assert_not_called()
+    run_call, cleanup_call = post_module.subprocess.run.call_args_list
+    command = run_call.args[0]
+    container = command[command.index("--name") + 1]
+    assert cleanup_call.args[0] == ["docker", "rm", "--force", container]
+    assert cleanup_call.kwargs == {"check": False, "capture_output": True, "text": True, "timeout": 30}
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert "sensitive" not in captured.out
+
+
+@pytest.mark.parametrize("helper", ["run_image_pip", "parse_pip_freeze"])
+def test_unexpected_package_collection_errors_do_not_block_publication(
+    post_module, release_env, monkeypatch, helper, capsys,
+):
+    monkeypatch.setattr(post_module, helper, Mock(side_effect=RuntimeError("sensitive-error")))
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    assert not capsys.readouterr().err
+
+
+def test_package_list_is_not_taken_from_workflow_inputs(post_module, release_env, monkeypatch):
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(dict(DEFAULT_INPUTS, packageList=[{"packageName": "fake"}])))
+    assert post_module.read_record()["packageList"] == PACKAGE_LIST
+
+
 def test_release_record_contains_only_whitelisted_fields(post_module, release_env, monkeypatch):
     monkeypatch.setenv("INPUTS_JSON", json.dumps(dict(DEFAULT_INPUTS, build_args="TOKEN=do-not-copy", arbitrary="ignored")))
     expected = {key: DEFAULT_INPUTS[key] for key in (*FIELDS, "docker_name", "docker_tag")}
     record = post_module.read_record()
     assert record == dict(expected, image=IMAGE, digest="a" * 64, size=123456789,
-                          idempotentKey="1483ef298defabb255077b71b79a8379")
+                          idempotentKey="1483ef298defabb255077b71b79a8379", packageList=PACKAGE_LIST)
     assert type(record["size"]) is int
 
 
@@ -408,6 +561,7 @@ def test_invalid_release_data_never_calls_api(post_module, release_env, monkeypa
     assert post_module.main() == 1
     client.assert_not_called()
     post_module.requests.post.assert_not_called()
+    post_module.subprocess.run.assert_not_called()
 
 
 @pytest.fixture
@@ -417,6 +571,7 @@ def expected_payload():
         "artifactType": "docker",
         "businessType": "DOCKER",
         "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "packageList": PACKAGE_LIST,
         "osTypeList": ["ubuntu24.04"],
         "hggcrtVersion": "3",
         "ppuSdk": "2.2.0",
@@ -443,7 +598,8 @@ def test_release_payload_mapping(post_module, release_env, monkeypatch, expected
     assert record == original
     assert type(record["size"]) is int
     assert payload["osTypeList"] == [record["os"]]
-    assert all(isinstance(value, str) for key, value in payload.items() if key != "osTypeList")
+    assert payload["packageList"] == PACKAGE_LIST
+    assert all(isinstance(value, str) for key, value in payload.items() if key not in {"osTypeList", "packageList"})
     assert "attributes" not in payload
     post_module.requests.post.assert_not_called()
 
@@ -727,6 +883,7 @@ def test_demo_resolved_inputs_pass_validation(validator, source, post_module, re
     client.save_artifact.assert_called_once_with({
         "artifactName": "team/demo", "artifactType": "docker", "businessType": "DOCKER",
         "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "packageList": PACKAGE_LIST,
         "osTypeList": [inputs["os"]], "hggcrtVersion": inputs["hggcrt"],
         "ppuSdk": inputs["sdk_version"], "python": inputs["python"],
         "image": IMAGE, "digest": "a" * 64, "packageSize": "123456789",

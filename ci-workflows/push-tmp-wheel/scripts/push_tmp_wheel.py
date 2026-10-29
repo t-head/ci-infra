@@ -19,7 +19,7 @@ from packaging.version import Version
 from wheel.wheelfile import WheelError, WheelFile
 
 
-ARTIFACTORY_URL = "https://download.t-head.cn/artifactory/pypi_tmp_generic/"
+ARTIFACTORY_URL = "https://download.t-head.cn/artifactory/pypi_tmp/"
 PACKAGE_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 WHEEL_PATTERN = (
     r"[A-Za-z0-9_][A-Za-z0-9_.]*-[A-Za-z0-9][A-Za-z0-9_.+!]*-"
