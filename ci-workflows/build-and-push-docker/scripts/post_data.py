@@ -6,8 +6,10 @@ import json
 import os
 import re
 import requests
+import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,7 +18,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from validate_inputs import release_metadata, string_input, versioned_image_reference
+from validate_inputs import REGISTRY, REPOSITORY, image_reference, release_metadata, string_input, versioned_image_reference
 
 
 REQUEST_TIMEOUT = (30, 300)
@@ -173,10 +175,67 @@ def check_response(response):
         raise ValueError("The API returned HTML, possibly a login page; publishing success cannot be confirmed")
 
 
+def parse_pip_freeze(output):
+    if not isinstance(output, str):
+        return []
+    packages = {}
+    name_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(rf"({name_pattern})\s*={{2,3}}\s*([A-Za-z0-9][A-Za-z0-9.!+_-]*)", line)
+        if not match:
+            continue
+        name, version = match.groups()
+        key = re.sub(r"[-_.]+", "-", name).lower()
+        packages.setdefault(key, {"packageName": name, "packageVersion": version})
+    return [packages[key] for key in sorted(packages)]
+
+
+def run_image_pip(reference, *arguments):
+    container = f"release-packages-{uuid.uuid4().hex}"
+    try:
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--name", container, "--platform", "linux/amd64",
+             "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+             "--entrypoint", "pip", reference, "--disable-pip-version-check", *arguments],
+            check=True, capture_output=True, text=True, timeout=900,
+        )
+    except Exception:
+        try:
+            subprocess.run(
+                ["docker", "rm", "--force", container],
+                check=False, capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            pass
+        return ""
+    return result.stdout
+
+
+def collect_image_packages(image, digest):
+    try:
+        prefix = f"{REGISTRY}/{REPOSITORY}/"
+        if not isinstance(image, str) or not image.startswith(prefix):
+            return []
+        name, separator, tag = image[len(prefix):].rpartition(":")
+        if not separator or image_reference(name, tag) != image:
+            return []
+        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return []
+        reference = f"{image.rsplit(':', 1)[0]}@{digest}"
+        frozen = run_image_pip(reference, "freeze", "--all")
+        return parse_pip_freeze(frozen)
+    except Exception:
+        # 包清单仅作补充信息，采集或解析异常不得阻断发布。
+        return []
+
+
 def read_record():
     """Collect only release fields and pushed image details, excluding build arguments and credentials from payload assembly.
 
-    Return a dict containing these 12 keys:
+    返回包含以下 13 个字段的字典：
         os (str): Operating system, preserving the original input.
         python (str): Python version, preserving the original input.
         hggcrt (str): HGGCRT version, preserving the original input.
@@ -192,6 +251,7 @@ def read_record():
             excluding manifest JSON and attestations; not the locally unpacked size.
         idempotentKey (str): MD5 of the full image string encoded as UTF-8,
             represented as 32 lowercase hexadecimal characters, unaffected by digest or size changes.
+        packageList (list[dict[str, str]]): 镜像中安装的包，包含 packageName 和 packageVersion。
     """
     inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
     record = release_metadata(inputs)
@@ -214,6 +274,7 @@ def read_record():
     record.update(docker_name=name, docker_tag=tag, image=image,
                   digest=digest.removeprefix("sha256:"), size=int(size))
     record["idempotentKey"] = hashlib.md5(image.encode("utf-8"), usedforsecurity=False).hexdigest()
+    record["packageList"] = collect_image_packages(image, digest)
     return record
 
 
@@ -223,6 +284,7 @@ def build_payload(record):
         "artifactType": "docker",
         "businessType": "DOCKER",
         "idempotentKey": record["idempotentKey"],
+        "packageList": record["packageList"],
         "osTypeList": [record["os"]],
         "hggcrtVersion": record["hggcrt"],
         "ppuSdk": record["sdk_version"],

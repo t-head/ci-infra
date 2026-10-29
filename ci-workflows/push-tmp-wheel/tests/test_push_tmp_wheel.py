@@ -100,7 +100,7 @@ def test_valid_wheel_upload_is_exact_and_https_only(make_wheel, run_publish, wor
     assert args[args.index("--retry") + 1] == "3"
     assert "--location" not in args
     assert "--insecure" not in args
-    url = "https://download.t-head.cn/artifactory/pypi_tmp_generic/demo_package/" + WHEEL_NAME
+    url = "https://download.t-head.cn/artifactory/pypi_tmp/demo_package/" + WHEEL_NAME
     assert args[-2:] == ["--", url]
     assert path.read_bytes() == before
     assert (workspace / "outputs").read_text() == f"upload_url={url}\n"
@@ -395,7 +395,7 @@ def test_readme_documents_interface_and_local_links():
         assert f"]({relative})" in text
         assert (ROOT / relative).is_file()
     assert "1.2.3.dev12+gabc123" in text
-    assert "https://download.t-head.cn/artifactory/pypi_tmp_generic/{package_name}/{wheel_name}" in text
+    assert "https://download.t-head.cn/artifactory/pypi_tmp/{package_name}/{wheel_name}" in text
     assert "| `template_repository` | No | `t-head/ci-infra` |" in text
     assert "python -m pytest ci-workflows/push-tmp-wheel/tests" in text
 
