@@ -126,7 +126,7 @@ def test_sdk_package_name_and_url(script, sdk_version, suffix, runtime_version, 
     filename = f"ppu_hggcrt{runtime_version}_{os_version}-{sdk_version}-{suffix}.run"
     assert script.get_sdk_package_name(sdk_version, runtime_version, os_version) == filename
     assert script.get_sdk_url(sdk_version, runtime_version, os_version) == (
-        f"https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v{sdk_version}/{filename}"
+        f"https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v{sdk_version}/{filename}"
     )
 
 
@@ -134,9 +134,41 @@ def test_sdk_package_name_and_url(script, sdk_version, suffix, runtime_version, 
 @pytest.mark.parametrize("runtime_version", ["3", "hggcrt3", "HGGCRT3", "hggc3", "HGGC3"])
 def test_sdk_url_normalizes_existing_version_prefixes(script, sdk_version, runtime_version):
     assert script.get_sdk_url(sdk_version, runtime_version, "ubuntu2404") == (
-        "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
+        "https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
         "ppu_hggcrt3_ubuntu2404-2.2.0-663c22.run"
     )
+
+
+@pytest.mark.parametrize("pccl_version", ["2.1.1", "2.2.0", "2.2.1"])
+@pytest.mark.parametrize("runtime_version", ["2", "3"])
+@pytest.mark.parametrize("os_version", ALL_VERSIONS["os_versions"])
+def test_pccl_url(script, pccl_version, runtime_version, os_version):
+    assert script.get_pccl_url(pccl_version, runtime_version, os_version) == (
+        f"https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v{pccl_version}/"
+        f"pccl_hggcrt{runtime_version}_{os_version}-v{pccl_version}.tar.gz"
+    )
+
+
+@pytest.mark.parametrize("pccl_version", ["2.1.1", "2.2.0", "2.2.1"])
+@pytest.mark.parametrize("tag", ["1.0.0", "1.0.0rc1"])
+def test_pccl_version_is_shared_without_expanding_matrix(run_matrix, monkeypatch, pccl_version, tag):
+    monkeypatch.setenv("GITHUB_REF_NAME", tag)
+    entries = run_matrix(dict(DEFAULT_INPUTS, pccl_version=pccl_version,
+                              runtime_versions='["2", "3"]', sdk_versions='["2.1.1", "2.2.0"]'))
+    assert len(entries) == 4
+    assert len({entry["pccl_url"] for entry in entries}) == 2
+    for entry in entries:
+        assert entry["pccl_url"] == (
+            f"https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v{pccl_version}/"
+            f"pccl_hggcrt{entry['runtime_version']}_ubuntu2204-v{pccl_version}.tar.gz"
+        )
+
+
+@pytest.mark.parametrize("pccl_version", [None, 2, False, [], {}, "", " ", "2.3.0", "../2.2.1", "$(id)"])
+def test_invalid_pccl_version_rejected_before_output(run_matrix, output_file, pccl_version):
+    with pytest.raises(SystemExit, match="pccl_version"):
+        run_matrix(dict(DEFAULT_INPUTS, pccl_version=pccl_version))
+    output_file.assert_not_called()
 
 
 @pytest.mark.parametrize("os_version,python_version", SYNTHETIC_PAIRS)
@@ -151,8 +183,12 @@ def test_each_synthetic_image(script, run_matrix, capsys, os_version, python_ver
         "sdk_version": "2.1.1",
         "image": script.IMAGES_MAP[f"{os_version}-py{python_version}"],
         "sdk_url": (
-            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
             f"ppu_hggcrt3_{os_version}-2.1.1-a5c56e.run"
+        ),
+        "pccl_url": (
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v2.2.1/"
+            f"pccl_hggcrt3_{os_version}-v2.2.1.tar.gz"
         ),
         "tag": "1.0.0+v0.3.0",
         "release_version": "1.0.0+v0.3.0.sail2.1.1",
@@ -171,8 +207,12 @@ def test_package_name_changes_wheel_name_without_changing_axes(script, run_matri
         **expected_versions,
         "image": script.IMAGES_MAP["ubuntu2204-py310"],
         "sdk_url": (
-            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
             "ppu_hggcrt3_ubuntu2204-2.1.1-a5c56e.run"
+        ),
+        "pccl_url": (
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v2.2.1/"
+            "pccl_hggcrt3_ubuntu2204-v2.2.1.tar.gz"
         ),
         "tag": "1.0.0+v0.3.0",
         "release_version": "1.0.0+v0.3.0.sail2.1.1",
@@ -193,12 +233,15 @@ def test_full_five_axis_cartesian_product(script, run_matrix, monkeypatch, capsy
     )
     assert len(result) == 96
     for entry in result:
-        assert set(entry) == set(fields) | {"image", "sdk_url", "tag", "release_version", "whl_name"}
+        assert set(entry) == set(fields) | {"image", "sdk_url", "pccl_url", "tag", "release_version", "whl_name"}
         assert entry["tag"] == "1.0.0+v0.3.0"
         assert entry["image"] == images[image_key(entry)]
         assert entry["sdk_url"] == script.get_sdk_url(
             sdk_version=entry["sdk_version"], runtime_version=entry["runtime_version"],
             os_version=entry["os_version"],
+        )
+        assert entry["pccl_url"] == script.get_pccl_url(
+            pccl_version="2.2.1", runtime_version=entry["runtime_version"], os_version=entry["os_version"],
         )
         assert entry["release_version"] == f"1.0.0+v0.3.0.sail{entry['sdk_version']}"
         assert entry["whl_name"] == (
@@ -229,14 +272,18 @@ def test_normalizes_numeric_python_and_deduplicates_all_axes(run_matrix):
 def test_sdk_resolver_is_used_while_torch_remains_disabled(script, run_matrix, monkeypatch):
     torch_resolver = create_autospec(script.get_torch_url)
     sdk_resolver = create_autospec(script.get_sdk_url, return_value="https://test.invalid/sdk.run")
+    pccl_resolver = create_autospec(script.get_pccl_url, return_value="https://test.invalid/pccl.tar.gz")
     monkeypatch.setattr(script, "get_torch_url", torch_resolver)
     monkeypatch.setattr(script, "get_sdk_url", sdk_resolver)
-    result = run_matrix(dict(DEFAULT_INPUTS, python_versions='[310,"310"]'))
+    monkeypatch.setattr(script, "get_pccl_url", pccl_resolver)
+    result = run_matrix(dict(DEFAULT_INPUTS, python_versions='[310,"310"]', pccl_version="2.2.0"))
     torch_resolver.assert_not_called()
     sdk_resolver.assert_called_once_with(sdk_version="2.1.1", runtime_version="3", os_version="ubuntu2204")
     assert result[0]["python_version"] == "310"
     assert "torch_url" not in result[0]
     assert result[0]["sdk_url"] == "https://test.invalid/sdk.run"
+    pccl_resolver.assert_called_once_with(pccl_version="2.2.0", runtime_version="3", os_version="ubuntu2204")
+    assert result[0]["pccl_url"] == "https://test.invalid/pccl.tar.gz"
 
 
 def test_only_selected_image_mapping_is_required(script, run_matrix, monkeypatch):
@@ -365,8 +412,12 @@ def test_script_entrypoint_uses_real_image_mapping(monkeypatch, torch_version):
         "sdk_version": "2.2.0",
         "image": namespace["IMAGES_MAP"]["ubuntu2404-py312"],
         "sdk_url": (
-            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
             "ppu_hggcrt3_ubuntu2404-2.2.0-663c22.run"
+        ),
+        "pccl_url": (
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v2.2.1/"
+            "pccl_hggcrt3_ubuntu2404-v2.2.1.tar.gz"
         ),
         "tag": "1.0.0+v0.3.0",
         "release_version": "1.0.0+v0.3.0.sail2.2.0",
@@ -801,7 +852,7 @@ def run_normalize():
     ("deep.gemm", "deep.gemm"), ("x", "x"),
 ])
 def test_entry_normalizes_only_hyphens_and_preserves_other_inputs(run_normalize, name, expected):
-    inputs = dict(DEFAULT_INPUTS, package_name=name, framework="torch",
+    inputs = dict(DEFAULT_INPUTS, package_name=name, framework="torch", pccl_version="2.2.0",
                   build_command='printf "a=b\\n"\npython setup.py bdist_wheel')
     result, values = run_normalize(inputs)
     assert result.returncode == 0, result.stderr
@@ -852,6 +903,10 @@ def test_workflow_uses_caller_history_and_exposes_generated_fields():
     assert setup["uses"] == "actions/setup-python@v5"
     assert setup["with"]["python-version"] == "3.12"
     assert install["run"] == "python3 -m pip install --no-input packaging"
+    pccl_input = workflow["on"]["workflow_call"]["inputs"]["pccl_version"]
+    assert pccl_input["type"] == "string"
+    assert pccl_input["required"] == "false"
+    assert pccl_input["default"] == "2.2.1"
     tag_input = workflow["on"]["workflow_call"]["inputs"]["tag_version"]
     assert tag_input["type"] == "string"
     assert tag_input["required"] == "false"

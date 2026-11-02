@@ -32,6 +32,10 @@ def get_sdk_url(sdk_version, runtime_version, os_version):
     sdk_package_name = get_sdk_package_name(sdk_version, runtime_version, os_version)
     return f"https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v{sdk_version}/{sdk_package_name}"
 
+def get_pccl_url(pccl_version, runtime_version, os_version):
+    _pccl_version = pccl_version.lower().replace("v", "")
+    _runtime_version = runtime_version.lower().replace("hggcrt", "").replace("hggc", "")
+    return f"https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v{_pccl_version}/pccl_hggcrt{_runtime_version}_{os_version}-v{_pccl_version}.tar.gz"
 
 def fail(message):
     raise SystemExit(f"::error::{message}")
@@ -113,6 +117,9 @@ def main():
         fail("package_name 必须是合法的 Python 包名")
     # wheel 分发名称中的分隔符统一为下划线。
     wheel_package_name = re.sub(r"[-_.]+", "_", package_name)
+    pccl_version = inputs.get("pccl_version", "2.2.1")
+    if not isinstance(pccl_version, str) or pccl_version not in {"2.1.1", "2.2.0", "2.2.1"}:
+        fail("pccl_version 必须是 2.1.1、2.2.0 或 2.2.1")
     candidates = {
         "python_versions": {"38", "310", "312"},
         "os_versions": {"ubuntu2004", "ubuntu2204", "ubuntu2404", "alios7u2"},
@@ -159,6 +166,11 @@ def main():
         entry["image"] = IMAGES_MAP[key]
         entry["sdk_url"] = get_sdk_url(
             sdk_version=entry["sdk_version"],
+            runtime_version=entry["runtime_version"],
+            os_version=entry["os_version"],
+        )
+        entry["pccl_url"] = get_pccl_url(
+            pccl_version=pccl_version,
             runtime_version=entry["runtime_version"],
             os_version=entry["os_version"],
         )
