@@ -22,15 +22,15 @@ DEFAULT_INPUTS = {
     "python_versions": '["310"]',
     "os_versions": '["ubuntu2204"]',
     "runtime_versions": '["3"]',
-    "torch_versions": '["2.8.0"]',
-    "sdk_versions": '["2.1.0"]',
+    "torch_versions": '["2.10.0"]',
+    "sdk_versions": '["2.1.1"]',
 }
 ALL_VERSIONS = {
     "python_versions": ["38", "310", "312"],
     "os_versions": ["ubuntu2004", "ubuntu2204", "ubuntu2404", "alios7u2"],
     "runtime_versions": ["2", "3"],
-    "torch_versions": ["2.8.0", "2.10.0", "2.13.0"],
-    "sdk_versions": ["2.1.0", "2.2.0"],
+    "torch_versions": ["2.10.0", "2.13.0"],
+    "sdk_versions": ["2.1.1", "2.2.0"],
 }
 SYNTHETIC_PAIRS = [
     ("ubuntu2004", "38"),
@@ -43,20 +43,13 @@ SYNTHETIC_PAIRS = [
 
 
 def image_key(entry):
-    return (
-        f"{entry['os_version']}-py{entry['python_version']}-sdk{entry['sdk_version']}"
-        f"-hggcrt{entry['runtime_version']}-torch{entry['torch_version']}"
-    )
+    return f"{entry['os_version']}-py{entry['python_version']}"
 
 
 def make_images(pairs):
     return {
-        f"{os_version}-py{python_version}-sdk{sdk}-hggcrt{runtime}-torch{torch}":
-            f"test.invalid/matrix:{os_version}-py{python_version}-sdk{sdk}-hggcrt{runtime}-torch{torch}"
-        for (os_version, python_version), sdk, runtime, torch in itertools.product(
-            pairs, ALL_VERSIONS["sdk_versions"], ALL_VERSIONS["runtime_versions"],
-            ["", *ALL_VERSIONS["torch_versions"]],
-        )
+        f"{os_version}-py{python_version}": f"test.invalid/matrix:{os_version}-py{python_version}"
+        for os_version, python_version in pairs
     }
 
 
@@ -122,13 +115,28 @@ def test_parse_json_rejects_invalid_json(script, raw):
         script.parse_json(raw, "参数")
 
 
-@pytest.mark.parametrize("name,versions", [
-    ("get_torch_url", {"python_version": "310", "os_version": "ubuntu2204",
-                       "runtime_version": "3", "torch_version": "2.8.0", "sdk_version": "2.1.0"}),
-    ("get_sdk_url", {"os_version": "ubuntu2204", "runtime_version": "3", "sdk_version": "2.1.0"}),
-])
-def test_url_stubs_return_empty_string(script, name, versions):
-    assert getattr(script, name)(**versions) == ""
+def test_torch_url_stub_returns_empty_string(script):
+    assert script.get_torch_url("310", "ubuntu2204", "3", "2.10.0", "2.1.1") == ""
+
+
+@pytest.mark.parametrize("sdk_version,suffix", [("2.1.1", "a5c56e"), ("2.2.0", "663c22")])
+@pytest.mark.parametrize("runtime_version", ["2", "3"])
+@pytest.mark.parametrize("os_version", ALL_VERSIONS["os_versions"])
+def test_sdk_package_name_and_url(script, sdk_version, suffix, runtime_version, os_version):
+    filename = f"ppu_hggcrt{runtime_version}_{os_version}-{sdk_version}-{suffix}.run"
+    assert script.get_sdk_package_name(sdk_version, runtime_version, os_version) == filename
+    assert script.get_sdk_url(sdk_version, runtime_version, os_version) == (
+        f"https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v{sdk_version}/{filename}"
+    )
+
+
+@pytest.mark.parametrize("sdk_version", ["2.2.0", "v2.2.0", "V2.2.0"])
+@pytest.mark.parametrize("runtime_version", ["3", "hggcrt3", "HGGCRT3", "hggc3", "HGGC3"])
+def test_sdk_url_normalizes_existing_version_prefixes(script, sdk_version, runtime_version):
+    assert script.get_sdk_url(sdk_version, runtime_version, "ubuntu2404") == (
+        "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
+        "ppu_hggcrt3_ubuntu2404-2.2.0-663c22.run"
+    )
 
 
 @pytest.mark.parametrize("os_version,python_version", SYNTHETIC_PAIRS)
@@ -139,12 +147,16 @@ def test_each_synthetic_image(script, run_matrix, capsys, os_version, python_ver
         "python_version": python_version,
         "os_version": os_version,
         "runtime_version": "3",
-        "torch_version": "2.8.0",
-        "sdk_version": "2.1.0",
-        "image": script.IMAGES_MAP[f"{os_version}-py{python_version}-sdk2.1.0-hggcrt3-torch2.8.0"],
+        "torch_version": "2.10.0",
+        "sdk_version": "2.1.1",
+        "image": script.IMAGES_MAP[f"{os_version}-py{python_version}"],
+        "sdk_url": (
+            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
+            f"ppu_hggcrt3_{os_version}-2.1.1-a5c56e.run"
+        ),
         "tag": "1.0.0+v0.3.0",
-        "release_version": "1.0.0+v0.3.0.sail2.1.0",
-        "whl_name": f"deep_gemm-1.0.0+hggcrt3torch2.8.0{os_version}oe-cp{python_version}-cp{python_version}-linux_x86_64.whl",
+        "release_version": "1.0.0+v0.3.0.sail2.1.1",
+        "whl_name": f"deep_gemm-1.0.0+hggcrt3torch2.10.0{os_version}oe-cp{python_version}-cp{python_version}-linux_x86_64.whl",
     }]
     assert capsys.readouterr().out == "已生成 1 个矩阵任务\n"
 
@@ -157,10 +169,14 @@ def test_package_name_changes_wheel_name_without_changing_axes(script, run_matri
     }
     assert run_matrix(inputs) == [{
         **expected_versions,
-        "image": script.IMAGES_MAP["ubuntu2204-py310-sdk2.1.0-hggcrt3-torch2.8.0"],
+        "image": script.IMAGES_MAP["ubuntu2204-py310"],
+        "sdk_url": (
+            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.1.1/"
+            "ppu_hggcrt3_ubuntu2204-2.1.1-a5c56e.run"
+        ),
         "tag": "1.0.0+v0.3.0",
-        "release_version": "1.0.0+v0.3.0.sail2.1.0",
-        "whl_name": "another_package-1.0.0+hggcrt3torch2.8.0ubuntu2204oe-cp310-cp310-linux_x86_64.whl",
+        "release_version": "1.0.0+v0.3.0.sail2.1.1",
+        "whl_name": "another_package-1.0.0+hggcrt3torch2.10.0ubuntu2204oe-cp310-cp310-linux_x86_64.whl",
     }]
 
 
@@ -175,17 +191,21 @@ def test_full_five_axis_cartesian_product(script, run_matrix, monkeypatch, capsy
     assert [tuple(entry[key] for key in fields) for entry in result] == list(
         itertools.product(*ALL_VERSIONS.values())
     )
-    assert len(result) == 144
+    assert len(result) == 96
     for entry in result:
-        assert set(entry) == set(fields) | {"image", "tag", "release_version", "whl_name"}
+        assert set(entry) == set(fields) | {"image", "sdk_url", "tag", "release_version", "whl_name"}
         assert entry["tag"] == "1.0.0+v0.3.0"
         assert entry["image"] == images[image_key(entry)]
+        assert entry["sdk_url"] == script.get_sdk_url(
+            sdk_version=entry["sdk_version"], runtime_version=entry["runtime_version"],
+            os_version=entry["os_version"],
+        )
         assert entry["release_version"] == f"1.0.0+v0.3.0.sail{entry['sdk_version']}"
         assert entry["whl_name"] == (
             f"deep_gemm-1.0.0+hggcrt{entry['runtime_version']}torch{entry['torch_version']}"
             f"{entry['os_version']}oe-cp{entry['python_version']}-cp{entry['python_version']}-linux_x86_64.whl"
         )
-    assert capsys.readouterr().out == "已生成 144 个矩阵任务\n"
+    assert capsys.readouterr().out == "已生成 96 个矩阵任务\n"
 
 
 def test_normalizes_numeric_python_and_deduplicates_all_axes(run_matrix):
@@ -193,35 +213,35 @@ def test_normalizes_numeric_python_and_deduplicates_all_axes(run_matrix):
         "python_versions": '[312,"312",38,"38",310]',
         "os_versions": '["alios7u2","alios7u2"]',
         "runtime_versions": '["3","2","3"]',
-        "torch_versions": '["2.13.0","2.8.0","2.13.0"]',
-        "sdk_versions": '["2.2.0","2.1.0","2.2.0"]',
+        "torch_versions": '["2.13.0","2.10.0","2.13.0"]',
+        "sdk_versions": '["2.2.0","2.1.1","2.2.0"]',
     }
     result = run_matrix(inputs)
     fields = [key.removesuffix("s") for key in inputs]
     expected = itertools.product(
         ["312", "38", "310"], ["alios7u2"], ["3", "2"],
-        ["2.13.0", "2.8.0"], ["2.2.0", "2.1.0"],
+        ["2.13.0", "2.10.0"], ["2.2.0", "2.1.1"],
     )
     assert [tuple(entry[key] for key in fields) for entry in result] == list(expected)
     assert len(result) == 24
 
 
-def test_disabled_url_resolvers_are_not_called(script, run_matrix, monkeypatch):
+def test_sdk_resolver_is_used_while_torch_remains_disabled(script, run_matrix, monkeypatch):
     torch_resolver = create_autospec(script.get_torch_url)
-    sdk_resolver = create_autospec(script.get_sdk_url)
+    sdk_resolver = create_autospec(script.get_sdk_url, return_value="https://test.invalid/sdk.run")
     monkeypatch.setattr(script, "get_torch_url", torch_resolver)
     monkeypatch.setattr(script, "get_sdk_url", sdk_resolver)
     result = run_matrix(dict(DEFAULT_INPUTS, python_versions='[310,"310"]'))
     torch_resolver.assert_not_called()
-    sdk_resolver.assert_not_called()
+    sdk_resolver.assert_called_once_with(sdk_version="2.1.1", runtime_version="3", os_version="ubuntu2204")
     assert result[0]["python_version"] == "310"
     assert "torch_url" not in result[0]
-    assert "sdk_url" not in result[0]
+    assert result[0]["sdk_url"] == "https://test.invalid/sdk.run"
 
 
 def test_only_selected_image_mapping_is_required(script, run_matrix, monkeypatch):
     monkeypatch.setattr(script, "IMAGES_MAP", {
-        "ubuntu2204-py310-sdk2.1.0-hggcrt3-torch2.8.0": "test.invalid/matrix:custom",
+        "ubuntu2204-py310": "test.invalid/matrix:custom",
         "unused-py38": None,
     })
     assert run_matrix()[0]["image"] == "test.invalid/matrix:custom"
@@ -274,6 +294,8 @@ def test_rejects_invalid_version_elements(run_matrix, output_file, name, value):
     ("os_versions", "ubuntu1804"),
     ("runtime_versions", "4"),
     ("torch_versions", "2.7.0"),
+    ("torch_versions", "2.8.0"),
+    ("sdk_versions", "2.1.0"),
     ("sdk_versions", "2.3.0"),
 ])
 def test_rejects_unsupported_candidates(run_matrix, output_file, name, value):
@@ -297,7 +319,7 @@ def test_rejects_unconfigured_python_os_pair(run_matrix, output_file):
 
 @pytest.mark.parametrize("image", [None, "", " ", "test image", "test\nimage", 123, [], {}])
 def test_rejects_invalid_selected_image(script, run_matrix, output_file, monkeypatch, image):
-    monkeypatch.setattr(script, "IMAGES_MAP", {"ubuntu2204-py310-sdk2.1.0-hggcrt3-torch2.8.0": image})
+    monkeypatch.setattr(script, "IMAGES_MAP", {"ubuntu2204-py310": image})
     with pytest.raises(SystemExit, match="ubuntu2204-py310"):
         run_matrix()
     output_file.assert_not_called()
@@ -341,7 +363,11 @@ def test_script_entrypoint_uses_real_image_mapping(monkeypatch, torch_version):
         "runtime_version": "3",
         "torch_version": torch_version,
         "sdk_version": "2.2.0",
-        "image": namespace["IMAGES_MAP"][f"ubuntu2404-py312-sdk2.2.0-hggcrt3-torch{torch_version}"],
+        "image": namespace["IMAGES_MAP"]["ubuntu2404-py312"],
+        "sdk_url": (
+            "https://download-admin.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/"
+            "ppu_hggcrt3_ubuntu2404-2.2.0-663c22.run"
+        ),
         "tag": "1.0.0+v0.3.0",
         "release_version": "1.0.0+v0.3.0.sail2.2.0",
         "whl_name": (
@@ -366,7 +392,7 @@ def test_requested_release_and_wheel_example(script, run_matrix, monkeypatch):
 def test_empty_torch_omits_entire_suffix(run_matrix, python_version, runtime_version):
     entries = run_matrix(dict(DEFAULT_INPUTS, python_versions=json.dumps([python_version]),
                               os_versions='["alios7u2"]', runtime_versions=json.dumps([runtime_version]),
-                              torch_versions='["", ""]', sdk_versions='["2.1.0", "2.2.0"]'))
+                              torch_versions='["", ""]', sdk_versions='["2.1.1", "2.2.0"]'))
     assert len(entries) == 2
     for entry in entries:
         assert entry["torch_version"] == ""
@@ -383,24 +409,24 @@ def test_empty_and_nonempty_torch_expand_independently(run_matrix):
     assert "torch" not in entries[0]["whl_name"]
     assert "torch2.10.0" in entries[1]["whl_name"]
     assert entries[0]["release_version"] == entries[1]["release_version"]
-    assert entries[0]["image"] != entries[1]["image"]
+    assert entries[0]["image"] == entries[1]["image"]
+    assert entries[0]["sdk_url"] == entries[1]["sdk_url"]
 
 
-def test_empty_torch_still_requires_its_own_image(script, run_matrix, monkeypatch, output_file):
-    monkeypatch.setattr(script, "IMAGES_MAP", {
-        "ubuntu2204-py310-sdk2.1.0-hggcrt3-torch2.8.0": "test.invalid/torch:existing"
-    })
-    with pytest.raises(SystemExit, match="缺少 ubuntu2204-py310-sdk2.1.0-hggcrt3-torch 或"):
-        run_matrix(dict(DEFAULT_INPUTS, torch_versions='[""]'))
-    output_file.assert_not_called()
+def test_sdk_and_runtime_variants_share_base_image_but_use_distinct_installers(run_matrix):
+    entries = run_matrix(dict(DEFAULT_INPUTS, sdk_versions='["2.1.1", "2.2.0"]',
+                              runtime_versions='["2", "3"]', torch_versions='[""]'))
+    assert len(entries) == 4
+    assert len({entry["image"] for entry in entries}) == 1
+    assert len({entry["sdk_url"] for entry in entries}) == 4
 
 
 @pytest.mark.parametrize("prefix", ["", "v", "V"])
 @pytest.mark.parametrize("tag,version,release_version", [
-    ("1.0.0+v0.3.0", "1.0.0", "1.0.0+v0.3.0.sail2.1.0"),
-    ("1.0.0+V0.3.0", "1.0.0", "1.0.0+V0.3.0.sail2.1.0"),
-    ("1.2.3", "1.2.3", "1.2.3+sail2.1.0"),
-    ("1.0.0b1+v0.3.0", "1.0.0b1", "1.0.0b1+v0.3.0.sail2.1.0"),
+    ("1.0.0+v0.3.0", "1.0.0", "1.0.0+v0.3.0.sail2.1.1"),
+    ("1.0.0+V0.3.0", "1.0.0", "1.0.0+V0.3.0.sail2.1.1"),
+    ("1.2.3", "1.2.3", "1.2.3+sail2.1.1"),
+    ("1.0.0b1+v0.3.0", "1.0.0b1", "1.0.0b1+v0.3.0.sail2.1.1"),
 ])
 def test_trigger_tag_normalized_and_wheel_uses_public_version(
     run_matrix, monkeypatch, prefix, tag, version, release_version
@@ -421,7 +447,7 @@ def test_rc_tags_generate_build_matrix_without_release_fields(script, run_matrix
     monkeypatch.setenv("GITHUB_REF_NAME", tag)
     runner = create_autospec(script.subprocess.run)
     monkeypatch.setattr(script.subprocess, "run", runner)
-    entries = run_matrix(dict(DEFAULT_INPUTS, torch_versions='["", "2.8.0"]'))
+    entries = run_matrix(dict(DEFAULT_INPUTS, torch_versions='["", "2.10.0"]'))
     assert len(entries) == 2
     for entry in entries:
         assert entry["image"] == script.IMAGES_MAP[image_key(entry)]
@@ -480,11 +506,11 @@ def test_rc_script_entrypoint_outputs_build_matrix(monkeypatch):
 ])
 @pytest.mark.parametrize("prefix", ["", "v", "V"])
 @pytest.mark.parametrize("tag_version,public_version,release_version", [
-    ("2.4.0", "2.4.0", "2.4.0+sail2.1.0"),
-    ("2.4.0+v0.5.0", "2.4.0", "2.4.0+v0.5.0.sail2.1.0"),
-    ("2.4.0+V0.5.0", "2.4.0", "2.4.0+V0.5.0.sail2.1.0"),
-    ("2.4.0.post1", "2.4.0.post1", "2.4.0.post1+sail2.1.0"),
-    ("2.4.0.dev1+build_2", "2.4.0.dev1", "2.4.0.dev1+build_2.sail2.1.0"),
+    ("2.4.0", "2.4.0", "2.4.0+sail2.1.1"),
+    ("2.4.0+v0.5.0", "2.4.0", "2.4.0+v0.5.0.sail2.1.1"),
+    ("2.4.0+V0.5.0", "2.4.0", "2.4.0+V0.5.0.sail2.1.1"),
+    ("2.4.0.post1", "2.4.0.post1", "2.4.0.post1+sail2.1.1"),
+    ("2.4.0.dev1+build_2", "2.4.0.dev1", "2.4.0.dev1+build_2.sail2.1.1"),
 ])
 def test_tag_version_overrides_repository_and_drives_all_matrix_versions(
     script, run_matrix, monkeypatch, ref_type, ref_name, prefix, tag_version, public_version, release_version
@@ -494,7 +520,7 @@ def test_tag_version_overrides_repository_and_drives_all_matrix_versions(
     monkeypatch.delenv("SOURCE_DIR", raising=False)
     runner = create_autospec(script.subprocess.run, side_effect=AssertionError("不应读取仓库 tag"))
     monkeypatch.setattr(script.subprocess, "run", runner)
-    entries = run_matrix(dict(DEFAULT_INPUTS, tag_version=prefix + tag_version, torch_versions='["", "2.8.0"]'))
+    entries = run_matrix(dict(DEFAULT_INPUTS, tag_version=prefix + tag_version, torch_versions='["", "2.10.0"]'))
     assert len(entries) == 2
     for entry in entries:
         assert entry["tag"] == tag_version
@@ -549,7 +575,7 @@ def test_empty_tag_version_preserves_repository_selection(
     monkeypatch.setenv("GITHUB_REF_NAME", prefix + "3.0.0" if ref_type == "tag" else "main")
     entry = run_matrix(dict(DEFAULT_INPUTS, tag_version=""))[0]
     assert entry["tag"] == "3.0.0"
-    assert entry["release_version"] == "3.0.0+sail2.1.0"
+    assert entry["release_version"] == "3.0.0+sail2.1.1"
 
 
 def test_tag_trigger_does_not_read_git_or_template_ref(script, run_matrix, monkeypatch):
@@ -557,7 +583,7 @@ def test_tag_trigger_does_not_read_git_or_template_ref(script, run_matrix, monke
     monkeypatch.setattr(script.subprocess, "run", runner)
     monkeypatch.setenv("SOURCE_DIR", "template-repository-must-not-be-read")
     entry = run_matrix(dict(DEFAULT_INPUTS, template_ref="v9.9.9"))[0]
-    assert entry["release_version"] == "1.0.0+v0.3.0.sail2.1.0"
+    assert entry["release_version"] == "1.0.0+v0.3.0.sail2.1.1"
     runner.assert_not_called()
 
 
@@ -669,7 +695,7 @@ def test_branch_uses_only_current_commit_tag(
     monkeypatch.setenv("GITHUB_REF_NAME", "feat/add-release-workflow")
     entry = run_matrix(dict(DEFAULT_INPUTS, template_ref="v8.8.8"))[0]
     assert entry["tag"] == tag
-    assert entry["release_version"] == "1.0.0+v0.3.0.sail2.1.0"
+    assert entry["release_version"] == "1.0.0+v0.3.0.sail2.1.1"
     assert entry["whl_name"].startswith("deep_gemm-1.0.0+")
 
 
@@ -718,7 +744,7 @@ def test_multiple_head_tags_select_highest_eligible_version(
     monkeypatch.setenv("GITHUB_REF_NAME", "feature/rc-fix")
     entry = run_matrix()[0]
     assert entry["tag"] == "1.10.0"
-    assert entry["release_version"] == "1.10.0+sail2.1.0"
+    assert entry["release_version"] == "1.10.0+sail2.1.1"
     assert entry["whl_name"].startswith("deep_gemm-1.10.0+")
 
 
@@ -745,7 +771,7 @@ def test_branch_version_tag_with_v_prefix(
     monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
     entry = run_matrix()[0]
     assert entry["tag"] == f"2.0.0+{local_version}"
-    assert entry["release_version"] == f"2.0.0+{local_version}.sail2.1.0"
+    assert entry["release_version"] == f"2.0.0+{local_version}.sail2.1.1"
     assert entry["whl_name"].startswith("deep_gemm-2.0.0+")
 
 
