@@ -146,8 +146,15 @@ def install_sdk_step(workflow):
 
 
 @pytest.fixture
-def build_env(workspace):
+def install_pccl_step(workflow):
+    return next(step for step in workflow["jobs"]["matrix-job"]["steps"]
+                if step.get("name") == "下载并安装 PCCL")
+
+
+@pytest.fixture
+def build_env(workspace, install_pccl_step):
     env = dict(os.environ, RUNNER_TEMP=str(workspace), TEST_PYTHON=sys.executable,
+               PCCL_PATH=install_pccl_step["env"]["PCCL_PATH"],
                TORCH_VERSION="2.10.0", TEST_PHASE="build", TEST_PIP_EXIT="0",
                TEST_SOURCE_EXIT="0", TEST_FAIL_LDCONFIG_PHASE="")
     env.pop("SDK_READY", None)
@@ -193,6 +200,72 @@ Path(args[args.index("-O") + 1]).write_text(
         result = subprocess.run(["bash"], input=BUILD_SHIM + shim + script,
                                 cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
         if result.returncode == 0:
+            env["TEST_PHASE"] = "build"
+            result = subprocess.run(["bash"], input=BUILD_SHIM + build_step["run"],
+                                    cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        events = workspace / "events"
+        return result, events.read_text().splitlines() if events.exists() else []
+
+    return run
+
+
+@pytest.fixture
+def run_pccl_install(install_pccl_step, build_step, workspace, build_env):
+    def run(**overrides):
+        env = dict(build_env, PCCL_URL="https://test.invalid/pccl.tar.gz", TEST_PHASE="pccl",
+                   PCCL_PATH=str(workspace / "installed-pccl"), GITHUB_ENV=str(workspace / "github-env"),
+                   TEST_PCCL_MODE="valid", TEST_WGET_EXIT="0",
+                   BUILD_COMMAND='pccl-probe\nprintf "build\\n" >> "$RUNNER_TEMP/events"')
+        env.update(overrides)
+        env = {key: value for key, value in env.items() if value is not None}
+        shim = r'''
+        wget() {
+          "$TEST_PYTHON" -c '
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+
+root = Path(os.environ["RUNNER_TEMP"])
+args = sys.argv[1:]
+(root / "pccl-wget-args.json").write_text(json.dumps(args))
+with (root / "events").open("a") as output:
+    output.write("pccl-download\n")
+if os.environ["TEST_WGET_EXIT"] != "0":
+    sys.exit(int(os.environ["TEST_WGET_EXIT"]))
+target = Path(args[args.index("-O") + 1])
+mode = os.environ["TEST_PCCL_MODE"]
+if mode in ("empty", "corrupt"):
+    target.write_bytes(b"" if mode == "empty" else b"not a tar archive")
+else:
+    with tarfile.open(target, "w:gz") as archive:
+        if mode == "symlink":
+            info = tarfile.TarInfo("pccl")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "missing-target"
+            archive.addfile(info)
+        else:
+            files = {"pccl/bin/pccl-probe": b"#!/bin/sh\nexit 0\n", "pccl/lib/libpccl.so": b"test library"}
+            if mode == "missing":
+                files = {"other/marker": b"missing pccl directory"}
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o755
+                archive.addfile(info, io.BytesIO(data))
+' "$@"
+        }
+        '''
+        script = install_pccl_step["run"].replace(
+            "/etc/ld.so.conf.d/pccl.conf", shlex.quote(str(workspace / "pccl.conf"))
+        )
+        result = subprocess.run(["bash"], input=BUILD_SHIM + shim + script,
+                                cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        if result.returncode == 0:
+            env.pop("PCCL_PATH", None)
+            env.update(line.split("=", 1) for line in (workspace / "github-env").read_text().splitlines())
             env["TEST_PHASE"] = "build"
             result = subprocess.run(["bash"], input=BUILD_SHIM + build_step["run"],
                                     cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
@@ -563,10 +636,21 @@ def test_curl_failure_propagates(run_upload, exit_code):
     assert "已上传" not in result.stdout
 
 
-def test_sdk_install_precedes_build_for_all_matrix_jobs(workflow, install_sdk_step, build_step):
+def test_sdk_install_precedes_build_for_all_matrix_jobs(workflow, install_sdk_step, install_pccl_step, build_step):
     job = workflow["jobs"]["matrix-job"]
     steps = job["steps"]
-    assert steps.index(install_sdk_step) + 1 == steps.index(build_step)
+    assert steps.index(install_sdk_step) + 1 == steps.index(install_pccl_step)
+    assert steps.index(install_pccl_step) + 1 == steps.index(build_step)
+    assert install_pccl_step["shell"] == "bash"
+    assert "if" not in install_pccl_step
+    assert "continue-on-error" not in install_pccl_step
+    assert job["env"]["PCCL_URL"] == "${{ matrix.pccl_url }}"
+    assert "PCCL_PATH" not in job["env"]
+    assert install_pccl_step["env"]["PCCL_PATH"] == "/usr/local/pccl"
+    assert "PCCL_URL=$PCCL_URL" in steps[0]["run"]
+    assert "PCCL_PATH" not in steps[0]["run"]
+    assert "${{" not in install_pccl_step["run"]
+    assert build_step["run"].index("source /usr/local/PPU_SDK/envsetup.sh") < build_step["run"].index("export PATH=")
     assert install_sdk_step["shell"] == "bash"
     assert "if" not in install_sdk_step
     assert "continue-on-error" not in install_sdk_step
@@ -575,6 +659,82 @@ def test_sdk_install_precedes_build_for_all_matrix_jobs(workflow, install_sdk_st
     assert job["env"]["SDK_URL"] == "${{ matrix.sdk_url }}"
     assert build_step["env"]["BUILD_COMMAND"] == "${{ inputs.build_command }}"
     assert "${{" not in install_sdk_step["run"]
+
+
+@pytest.mark.parametrize("library_path", [None, "", "/sdk/lib:/existing/lib"])
+def test_pccl_install_persists_path_and_configures_build_environment(run_pccl_install, workspace, library_path):
+    url = "https://test.invalid/pccl.tar.gz?key=a&other=b"
+    marker = workspace / "unrelated-file"
+    marker.write_text("keep")
+    result, events = run_pccl_install(PCCL_URL=url, LD_LIBRARY_PATH=library_path, BUILD_COMMAND=(
+        'test "$SDK_READY" = yes\npccl-probe\n'
+        'printf "%s\\n" "$PCCL_PATH" "$PATH" "$LD_LIBRARY_PATH" "$PCCL_URL"\n'
+        'printf "build\\n" >> "$RUNNER_TEMP/events"'
+    ))
+    assert result.returncode == 0, result.stderr
+    assert events == ["pccl-download", "ldconfig:pccl", "ldconfig:build", "source", "pip", "build"]
+    pccl_path = str(workspace / "installed-pccl")
+    lines = result.stdout.splitlines()
+    assert lines[0] == pccl_path
+    assert lines[1].startswith(pccl_path + "/bin:")
+    assert lines[2] == pccl_path + "/lib" + (":" + library_path if library_path else "")
+    assert lines[3] == url
+    assert (workspace / "github-env").read_text() == f"PCCL_PATH={pccl_path}\n"
+    assert (workspace / "pccl.conf").read_text() == pccl_path + "/lib\n"
+    assert (workspace / "installed-pccl/lib/libpccl.so").read_bytes() == b"test library"
+    args = json.loads((workspace / "pccl-wget-args.json").read_text())
+    assert args[-2:] == ["--", url]
+    assert {"--https-only", "--tries=3", "--timeout=30"}.issubset(args)
+    assert "--no-check-certificate" not in args
+    assert not Path(args[args.index("-O") + 1]).parent.exists()
+    assert marker.read_text() == "keep"
+
+
+@pytest.mark.parametrize("url", [None, ""])
+def test_missing_pccl_url_prevents_download_and_build(run_pccl_install, url):
+    result, events = run_pccl_install(PCCL_URL=url)
+    assert result.returncode != 0
+    assert "PCCL_URL" in result.stderr
+    assert events == []
+
+
+@pytest.mark.parametrize("mode", ["empty", "corrupt", "missing", "symlink"])
+def test_invalid_pccl_archive_prevents_build_and_cleans_download(run_pccl_install, workspace, mode):
+    result, events = run_pccl_install(TEST_PCCL_MODE=mode)
+    assert result.returncode != 0
+    assert events == ["pccl-download"]
+    assert not (workspace / "github-env").exists()
+    assert not (workspace / "installed-pccl").exists()
+    assert not list(workspace.glob("pccl.*"))
+
+
+@pytest.mark.parametrize("exit_code", ["4", "8"])
+def test_pccl_download_failure_prevents_build_and_cleans_download(run_pccl_install, workspace, exit_code):
+    result, events = run_pccl_install(TEST_WGET_EXIT=exit_code)
+    assert result.returncode == int(exit_code)
+    assert events == ["pccl-download"]
+    assert not (workspace / "github-env").exists()
+    assert not list(workspace.glob("pccl.*"))
+
+
+def test_pccl_ldconfig_failure_prevents_build_and_environment_export(run_pccl_install, workspace):
+    result, events = run_pccl_install(TEST_FAIL_LDCONFIG_PHASE="pccl")
+    assert result.returncode == 19
+    assert events == ["pccl-download", "ldconfig:pccl"]
+    assert not (workspace / "github-env").exists()
+    args = json.loads((workspace / "pccl-wget-args.json").read_text())
+    assert not Path(args[args.index("-O") + 1]).parent.exists()
+
+
+def test_existing_pccl_directory_is_not_overwritten(run_pccl_install, workspace):
+    target = workspace / "installed-pccl"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_text("keep")
+    result, events = run_pccl_install()
+    assert result.returncode != 0
+    assert events == []
+    assert marker.read_text() == "keep"
 
 
 def test_sdk_download_install_and_environment_precede_build(run_sdk_install, workspace):
