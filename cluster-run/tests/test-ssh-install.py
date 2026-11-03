@@ -707,6 +707,19 @@ class SSHInstallTests(unittest.TestCase):
                 self.assertIn("verification", result.stderr)
                 self.assertFalse((self.root / "installed").exists())
 
+    def test_rpm_systems_dispatch_without_touching_apt(self):
+        marker = self.root / "rpm-dispatched"
+        helper = self.root / "install-ssh-rpm.sh"
+        helper.write_text("#!/bin/bash\nprintf '%s\\n' rpm > " + shlex.quote(str(marker)) + "\n")
+        for name, version in (("centos", "7"), ("centos", "9"), ("alinux", "2.1903"), ("alinux", "3.2104")):
+            with self.subTest(os=name, version=version):
+                marker.unlink(missing_ok=True)
+                self.set_os(name, version)
+                result = self.run_installer()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(marker.read_text(), "rpm\n")
+        self.assertFalse(self.calls("apt-get"))
+
     def test_root_and_unsupported_os_boundaries(self):
         self.fixture(uid=1000)
         result = self.run_installer()

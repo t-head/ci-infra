@@ -837,7 +837,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn(f"host-{index}", projected_keys)
             self.assertNotIn(f"host-{1 - index}", projected_keys,
                              "A node must not receive another node's private SSH host key")
-            self.assertTrue({"host-0.pub", "host-1.pub", "nodes.json", "job-id"}.issubset(projected_keys))
+            self.assertTrue({"host-0.pub", "host-1.pub", "nodes.json", "job-id", "install-ssh-rpm.sh"}.issubset(projected_keys))
             self.assertEqual(volumes[mounts["/run/cluster"]["name"]]["emptyDir"]["medium"], "Memory")
             readiness = " ".join(container["readinessProbe"]["exec"]["command"])
             self.assertIn("/run/cluster/ready", readiness)
@@ -1201,6 +1201,30 @@ class LifecycleTests(unittest.TestCase):
         self.assert_secret_deleted()
         self.assertLessEqual(int((self.root / "clock").read_text()), EPOCH + 60)
         self.assertNotIn("All associated pods have terminated", text)
+
+    def test_master_source_directory_is_absolute_after_staging(self):
+        archive = self.root / "source.tar.gz"
+        source = self.root / "required.txt"
+        source.write_text("staged")
+        with tarfile.open(archive, "w:gz") as handle:
+            handle.add(source, arcname="required.txt")
+        for staged in (False, True):
+            for relative in (False, True):
+                with self.subTest(staged=staged, relative=relative):
+                    directory = self.root / (f"source-{staged}-{relative} quoted")
+                    directory.mkdir()
+                    (directory / "required.txt").write_text("existing")
+                    self.submit_master(2, SOURCE_STAGE_DIR=str(archive) if staged else "",
+                                       INPUT_SOURCE_DIR=directory.name if relative else str(directory))
+                    container = self.worker_manifest()["spec"]["containers"][0]
+                    values = {item["name"]: item["value"] for item in container["env"] if "value" in item}
+                    prefix = container["args"][0].split("mkdir -p /run/cluster", 1)[0]
+                    result = subprocess.run(["/bin/bash", "-c", prefix +
+                                             '\ntest "$SOURCE_DIR" = "$PWD"\ntest -f "$SOURCE_DIR/required.txt"'],
+                                            cwd=self.root, env={**self.env, **values},
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((directory / "required.txt").read_text(), "staged" if staged else "existing")
 
     def test_source_extraction_failure_stops_multiline_workload(self):
         archive = self.root / "broken source.tar.gz"

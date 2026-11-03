@@ -57,7 +57,13 @@ remaining >/dev/null || fail 'PPU_DEADLINE expired'
 [ -r /etc/os-release ] || fail 'missing /etc/os-release'
 # os-release is a trusted local system file, never a NAS manifest.
 . /etc/os-release
-case "${ID:-}" in debian|ubuntu) ;; *) fail "unsupported OS: ${ID:-unknown}" ;; esac
+case "${ID:-}" in
+  debian|ubuntu) ;;
+  centos|alinux)
+    exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/install-ssh-rpm.sh"
+    ;;
+  *) fail "unsupported OS: ${ID:-unknown}" ;;
+esac
 case "${VERSION_ID:-}" in ''|*[!0-9.]*) fail 'unsupported OS version' ;; esac
 for tool in timeout sha256sum dpkg dpkg-query dpkg-deb apt-get awk sort; do
   command -v "$tool" >/dev/null || fail "required tool unavailable: $tool"

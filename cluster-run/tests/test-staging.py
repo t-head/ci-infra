@@ -443,6 +443,7 @@ class StagingTests(unittest.TestCase):
         self.assertTrue(any("sudo python3" in run and "cluster-run/tests/test-master-runtime.py" in run
                             for run in runs), "Real sshd tests must run as root in the isolated Ubuntu job")
         self.assertTrue(any("python3 cluster-run/tests/test-ssh-install.py" in run for run in runs))
+        self.assertTrue(any("python3 cluster-run/tests/test-ssh-rpm.py" in run for run in runs))
         dependencies = next(run for run in runs if "apt-get install" in run)
         for package in ("openssh-server", "openssh-client", "jq", "util-linux", "sudo"):
             self.assertIn(package, dependencies)
@@ -526,6 +527,25 @@ class StagingTests(unittest.TestCase):
             self.assertIn(required, scripts)
         self.assertNotIn("--fake", scripts)
 
+    def test_ci_covers_rpm_images_signed_cache_and_public_key_ssh(self):
+        job = self.workflow["jobs"]["rpm-ssh-cache-check"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["needs"], "checks")
+        entries = job["strategy"]["matrix"]["include"]
+        self.assertEqual({entry["os"] for entry in entries},
+                         {"CentOS 7", "CentOS Stream 8", "CentOS Stream 9",
+                          "Alibaba Cloud Linux 2", "Alibaba Cloud Linux 3"})
+        script = "\n".join(step.get("run", "") for step in job["steps"])
+        for expected in ("docker image inspect", "/action/install-ssh.sh", "--network none",
+                         "AuthenticationMethods publickey", "ChallengeResponseAuthentication no",
+                         "cluster_ssh_options", "rpm-ssh-ok", "COMPLETE", "offline cache hit"):
+            self.assertIn(expected, script)
+        self.assertIn("-o StrictHostKeyChecking=yes", (ACTION / "scripts/master-worker.sh").read_text())
+        self.assertNotIn("--privileged", script)
+        self.assertNotIn("--nogpgcheck", script)
+        self.assertEqual(script.count('"$image" /bin/bash -c "$smoke"'), 2,
+                         "Cold and fresh offline containers must both authenticate against real sshd")
+
     def test_ci_master_matrix_and_trusted_runner_gate(self):
         job = self.master_job()
         self.assertEqual(job["needs"], ["checks", "ssh-cache-check"])
@@ -579,6 +599,16 @@ class StagingTests(unittest.TestCase):
         (proof / "timeout-command-started").write_text("started")
         result = self.shell(step["run"], env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ci_master_entry_is_recorded_before_ssh_smoke_can_fail(self):
+        launch = next(step for step in self.master_job()["steps"] if step.get("id") == "master")
+        command = launch["with"]["command"].replace("${{ env.MASTER_SMOKE_COMMAND }}", "set -e; false")
+        command = command.replace("${{ matrix.workload }}", ":")
+        proof = self.root / "entry-proof"
+        proof.mkdir()
+        result = self.shell(command, dict(self.env, CI_MASTER_PROOF_DIR=str(proof)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((proof / "master-command-reached").read_text(), "reached")
 
     def test_ci_master_evidence_cleanup_stays_within_its_owned_directory(self):
         step = next(step for step in self.master_job()["steps"] if step["name"] == "Remove master execution evidence")

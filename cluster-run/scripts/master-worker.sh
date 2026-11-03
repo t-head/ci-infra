@@ -198,7 +198,7 @@ cluster_ssh_options() {
         -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
         -o PreferredAuthentications=publickey -o ClearAllForwardings=yes
         -o ForwardAgent=no -o ForwardX11=no -o PermitLocalCommand=no
-        -o ControlMaster=no -o ControlPath=none -o ProxyCommand=none -o ProxyJump=none
+        -o ControlMaster=no -o ControlPath=none -o ProxyCommand=none
         -o ConnectionAttempts=1 -o ConnectTimeout=2 -o ServerAliveInterval=2
         -o ServerAliveCountMax=2 -o LogLevel=ERROR)
 }
@@ -323,7 +323,7 @@ cluster_initialize() {
             printf 'Port %s\nListenAddress %s\nHostKey /run/cluster/host-%s\n' "$CLUSTER_INIT_PORT" "$CLUSTER_BIND" "$NODE_RANK"
             printf '%s\n' 'PidFile /run/cluster/sshd.pid' 'AuthorizedKeysFile /run/cluster/authorized_keys' \
                 'PermitRootLogin prohibit-password' 'PubkeyAuthentication yes' 'PasswordAuthentication no' \
-                'KbdInteractiveAuthentication no' 'AuthenticationMethods publickey' 'UsePAM yes' \
+                'KbdInteractiveAuthentication no' 'ChallengeResponseAuthentication no' 'AuthenticationMethods publickey' 'UsePAM yes' \
                 'StrictModes yes' 'AllowUsers root' 'AllowAgentForwarding no' 'AllowTcpForwarding no' \
                 'AllowStreamLocalForwarding no' 'X11Forwarding no' 'PermitTunnel no' \
                 'PermitUserEnvironment no' 'PermitUserRC no' 'PrintMotd no' 'PrintLastLog no' \

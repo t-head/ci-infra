@@ -576,7 +576,13 @@ fi
 if [ "$MASTER_MULTI" = true ]; then
   printf -v _setup_quoted '%q' "$SETUP_COMMAND"
   printf -v _command_quoted '%q' "$USER_COMMAND"
-  COMMAND="${SOURCE_PREPARE}mkdir -p /run/cluster
+  if [ -n "$SOURCE_STAGE_DIR" ]; then
+    COMMAND="$SOURCE_PREPARE"
+  else
+    COMMAND='cd -- "$SOURCE_DIR" || exit $?'$'\n'
+  fi
+  COMMAND+='export SOURCE_DIR="$PWD"'$'\n'
+  COMMAND+="mkdir -p /run/cluster
 printf '%s\\n' ${_setup_quoted} > /run/cluster/setup.sh
 printf '%s\\n' ${_command_quoted} > /run/cluster/command.sh
 exec /bin/bash /run/cluster-config/master-worker.sh"

@@ -150,6 +150,10 @@ jobs:
         shell: bash
         run: python3 cluster-run/tests/test-ssh-install.py
 
+      - name: Cover RPM installation and signed cache behavior
+        shell: bash
+        run: python3 cluster-run/tests/test-ssh-rpm.py
+
       - name: Verify generated names
         shell: bash
         run: |
@@ -339,6 +343,88 @@ jobs:
             | tee "$RUNNER_TEMP/openssh-offline.log"
           grep -q 'authenticated offline cache hit' "$RUNNER_TEMP/openssh-offline.log"
 
+  rpm-ssh-cache-check:
+    name: Verify SSH installation on ${{ matrix.os }}
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: CentOS 7
+            image: quay.io/centos/centos:7.9.2009
+          - os: CentOS Stream 8
+            image: quay.io/centos/centos:stream8
+          - os: CentOS Stream 9
+            image: quay.io/centos/centos:stream9
+          - os: Alibaba Cloud Linux 2
+            image: alibaba-cloud-linux-2-registry.cn-hangzhou.cr.aliyuncs.com/alinux2/alinux2:latest
+          - os: Alibaba Cloud Linux 3
+            image: alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:220901.1
+    steps:
+      - name: Fetch source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install signed RPM dependencies and verify SSH
+        shell: bash
+        env:
+          RPM_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/openssh-rpm-cache"
+          mkdir -p "$cache"
+          docker pull "$RPM_IMAGE"
+          image="$(docker image inspect --format '{{.Id}}' "$RPM_IMAGE")"
+          deadline="$(( $(date +%s) + 900 ))"
+          smoke='set -euo pipefail
+          /bin/bash /action/install-ssh.sh
+          mkdir -p /run/sshd /run/cluster
+          chmod 0700 /run/cluster
+          ssh-keygen -q -t ed25519 -N "" -f /run/cluster/identity
+          ssh-keygen -q -t ed25519 -N "" -f /run/cluster/hostkey
+          printf "restrict " > /run/cluster/authorized_keys
+          cat /run/cluster/identity.pub >> /run/cluster/authorized_keys
+          read -r type key comment < /run/cluster/hostkey.pub
+          printf "rpm-check %s %s\n" "$type" "$key" > /run/cluster/known_hosts
+          printf "%s\n" "Port 2222" "ListenAddress 127.0.0.1" "HostKey /run/cluster/hostkey" "AuthorizedKeysFile /run/cluster/authorized_keys" "PidFile /run/cluster/sshd.pid" "PermitRootLogin prohibit-password" "PubkeyAuthentication yes" "PasswordAuthentication no" "KbdInteractiveAuthentication no" "ChallengeResponseAuthentication no" "AuthenticationMethods publickey" "UsePAM yes" "PermitUserRC no" > /run/cluster/sshd_config
+          /usr/sbin/sshd -t -f /run/cluster/sshd_config
+          /usr/sbin/sshd -D -e -f /run/cluster/sshd_config &
+          listener=$!
+          trap "kill $listener 2>/dev/null || true; wait $listener 2>/dev/null || true" EXIT
+          source /action/master-worker.sh
+          cluster_ssh_options
+          for attempt in {1..10}; do
+            if result=$(/usr/bin/ssh "${CLUSTER_SSH_ARGS[@]}" -o HostKeyAlias=rpm-check -p 2222 root@127.0.0.1 "printf rpm-ssh-ok"); then
+              test "$result" = rpm-ssh-ok
+              break
+            fi
+            test "$attempt" -lt 10
+            sleep 1
+          done
+          /usr/bin/jq --version'
+          docker run --rm \
+            -e PPU_DEADLINE="$deadline" \
+            -v "$PWD/cluster-run/scripts:/action:ro" \
+            -v "$cache:/mnt/wl_nas/devops/cache/openssh" \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/pki/tls/certs/ca-bundle.crt:ro \
+            "$image" /bin/bash -c "$smoke" 2>&1 \
+            | tee "$RUNNER_TEMP/rpm-download.log"
+          test -n "$(sudo find "$cache" -name COMPLETE -type f -print -quit)"
+          deadline="$(( $(date +%s) + 600 ))"
+          docker run --rm --network none \
+            -e PPU_DEADLINE="$deadline" \
+            -v "$PWD/cluster-run/scripts:/action:ro" \
+            -v "$cache:/mnt/wl_nas/devops/cache/openssh:ro" \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/pki/tls/certs/ca-bundle.crt:ro \
+            "$image" /bin/bash -c "$smoke" 2>&1 \
+            | tee "$RUNNER_TEMP/rpm-offline.log"
+          grep -qi 'offline cache hit' "$RUNNER_TEMP/rpm-offline.log"
+
   master-lifecycle-check:
     name: Inspect ${{ matrix.label }} lifecycle
     needs: [checks, ssh-cache-check]
@@ -421,9 +507,9 @@ jobs:
           timeout_minutes: ${{ matrix.minutes }}
           job_suffix: ${{ matrix.label }}
           command: |
-            ${{ env.MASTER_SMOKE_COMMAND }}
             printf reached > "$CI_MASTER_PROOF_DIR/master-command-reached"
             chmod 0644 "$CI_MASTER_PROOF_DIR/master-command-reached"
+            ${{ env.MASTER_SMOKE_COMMAND }}
             ${{ matrix.workload }}
 
       - name: Assert master terminal state

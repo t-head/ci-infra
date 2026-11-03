@@ -53,6 +53,41 @@ jobs:
 | `0` (default) | Single pod | One pod, no `PodGroup` or headless `Service` |
 | `1..N` | Gang | `N` worker pods, a `PodGroup` (`minMember=N`) and a headless `Service` for rendezvous |
 
+`launch_mode` controls execution independently of allocation. `each-node` is the
+unchanged default: every pod runs setup and then command. In multi-node `master`
+mode, all pods install SSH, establish trusted passwordless connections, and run
+setup; only worker-0 executes the foreground command. Worker SSH services remain
+supervised until allocation cleanup. MPI is one possible master-mode launcher,
+not a separate launch mode.
+
+### Automatic SSH installation
+
+Multi-node master mode installs `openssh-server`, the client package, `jq` and
+required package dependencies inside each root container. Compatible installed
+tools are reused. Otherwise, matching authenticated packages are read from
+`/mnt/wl_nas/devops/cache/openssh`, or downloaded from Aliyun repositories and
+cached. Global APT/YUM repository configuration is not replaced.
+
+| Image OS | Installation path |
+| --- | --- |
+| Ubuntu 20.04/22.04/24.04; Debian 11/12/13 | APT and authenticated distro metadata |
+| CentOS Linux 7 (x86_64) | YUM and signed RPM packages |
+| CentOS Linux 8; CentOS Stream 8/9 (x86_64/aarch64) | DNF and signed RPM packages |
+| Alibaba Cloud Linux 2/3 (x86_64/aarch64) | YUM/DNF and signed RPM packages |
+
+CentOS releases that are end-of-life use the corresponding Aliyun archive;
+installation support does not provide ongoing security maintenance. CentOS 7
+uses signed EPEL 7 packages for `jq`. RPM signing keys must match the fixed
+vendor identities; an arbitrary NAS checksum or repository key is not trusted.
+
+The container must have a writable root filesystem, Bash, its package manager,
+GNU timeout/checksum tools, and a usable TLS trust store. RPM installation also
+needs RPM signature tooling and key-download tooling. Frameworks such as MPI,
+PCCL and the accelerator SDK are still supplied by the image or `setup_command`.
+No privileged mode, source compilation, or multi-source fallback is enabled by
+SSH installation. Master mode additionally requires namespace-scoped Secret
+permissions and a runner-owned NAS runtime root prepared by cluster operations.
+
 ### What reaches the worker
 
 Staging omits Git config files from repositories, submodules and worktrees so checkout
@@ -69,7 +104,10 @@ that name. Existing destinations are kept as-is, while missing paths are warning
 | Name | Required | Default | Description |
 |------|----------|---------|-------------|
 | `image` | yes | | Container image with job code and dependencies |
-| `command` | yes | | Shell command executed in each worker pod (`/bin/bash -c`) |
+| `command` | yes | | Foreground shell command, on each node or only worker-0 according to launch mode |
+| `launch_mode` | no | `each-node` | `each-node` or `master` |
+| `setup_command` | no | | Per-node initialization; multi-node master establishes SSH first and retains exported variables |
+| `ssh_port` | no | `2222` | Preferred SSH port; occupied ports use discovered per-node alternatives |
 | `nnodes` | no | `0` | Single-pod mode at `0`; otherwise the number of gang-scheduled pods |
 | `nproc_per_node` | no | `1` | PPU cards requested per pod (`alibabacloud.com/ppu`) |
 | `namespace` | no | `default` | Kubernetes namespace |
@@ -121,6 +159,15 @@ Each worker pod receives:
 | `MASTER_ADDR` | Standalone pod: `127.0.0.1`; gang workers: worker-0 headless `Service` DNS name |
 | `MASTER_PORT` | `master_port` input |
 | `NODE_NAME` | Kubernetes node name |
+| `SOURCE_DIR` | Source extraction directory |
+| `CLUSTER_HOSTS_FILE` | Multi-node master: local ordered FQDN list |
+| `CLUSTER_NODES_FILE` | Multi-node master: local node metadata with actual SSH ports |
+
+Master mode provides `cluster-ssh` and `cluster-exec` to select each destination's
+actual port and enforce host-key verification. Remote commands restore the
+destination node's exported environment; node-level RANK/WORLD_SIZE are not MPI
+process ranks. The orchestrator must wait for all remote tasks and propagate
+their failures before exiting.
 
 Variables declared in the workflow or job `env` context are forwarded automatically.
 

@@ -40,7 +40,7 @@ prepare_master_secret() {
     mv "$MASTER_KEYS_DIR/secret.tmp" "$manifest"
   done
   local script
-  for script in install-ssh.sh master-worker.sh master-session.sh cluster-ssh.sh cluster-exec.sh; do
+  for script in install-ssh.sh install-ssh-rpm.sh master-worker.sh master-session.sh cluster-ssh.sh cluster-exec.sh; do
     jq --arg key "$script" --rawfile body "$scripts_dir/$script" \
       '.data[$key] = ($body | @base64)' "$manifest" > "$MASTER_KEYS_DIR/secret.tmp"
     mv "$MASTER_KEYS_DIR/secret.tmp" "$manifest"
@@ -52,7 +52,7 @@ prepare_master_secret() {
 
 master_secret_items() {
   local rank=$1 i key
-  for key in identity identity.pub nodes.json job-id install-ssh.sh master-worker.sh master-session.sh cluster-ssh.sh cluster-exec.sh "host-${rank}"; do
+  for key in identity identity.pub nodes.json job-id install-ssh.sh install-ssh-rpm.sh master-worker.sh master-session.sh cluster-ssh.sh cluster-exec.sh "host-${rank}"; do
     printf '            - key: %s\n              path: %s\n' "$key" "$key"
   done
   for ((i=0; i<NNODES; i++)); do

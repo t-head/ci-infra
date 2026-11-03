@@ -39,7 +39,7 @@ inputs:
       Multi-node master mode also provides CLUSTER_HOSTS_FILE and CLUSTER_NODES_FILE, plus cluster-ssh and cluster-exec.
     required: true
   image:
-    description: 'Training/inference container image (required; must include the job code and dependencies).'
+    description: 'Workload image with code/framework dependencies; multi-node master requires a writable root Debian/Ubuntu/CentOS/Alibaba Cloud Linux image with package-manager and trust tooling.'
     required: true
   namespace:
     description: 'K8s namespace.'
