@@ -77,7 +77,7 @@ cached. Global APT/YUM repository configuration is not replaced.
 
 CentOS releases that are end-of-life use the corresponding Aliyun archive;
 installation support does not provide ongoing security maintenance. CentOS 7
-uses signed EPEL 7 packages for `jq`. RPM signing keys must match the fixed
+and Alibaba Cloud Linux 2 use signed EPEL 7 packages for `jq`. RPM signing keys must match the fixed
 vendor identities; an arbitrary NAS checksum or repository key is not trusted.
 
 The container must have a writable root filesystem, Bash, its package manager,

@@ -352,7 +352,9 @@ class SSHRPMTests(unittest.TestCase):
 
     def vendor_key(self, package):
         if self.os_id == "alinux":
-            return "RPM-GPG-KEY-ALIYUN" if self.os_version.startswith("2") else "RPM-GPG-KEY-ALINUX-3"
+            if self.os_version.startswith("2"):
+                return "RPM-GPG-KEY-EPEL-7" if package in ("jq", "oniguruma") else "RPM-GPG-KEY-ALIYUN"
+            return "RPM-GPG-KEY-ALINUX-3"
         if self.os_version.startswith("7"):
             return "RPM-GPG-KEY-EPEL-7" if package in ("jq", "oniguruma") else "RPM-GPG-KEY-CentOS-7"
         return "RPM-GPG-KEY-CentOS-Official"
@@ -450,6 +452,23 @@ class SSHRPMTests(unittest.TestCase):
         self.assertEqual(self.generations(), [generation])
         self.assertEqual(len([c for c in self.calls("rpm") if "-qa" in c["args"]]), 1)
 
+    def test_alinux2_epel_jq_and_offline_cache(self):
+        for arch in ("x86_64", "aarch64"):
+            with self.subTest(arch=arch):
+                self.fresh_job(arch=arch, offline=False)
+                self.set_os("alinux", "2.1903")
+                self.issue_repo()
+                self.success(self.run_installer())
+                repos = self.calls("dnf")[0]["repos"]
+                self.assertIn(f"https://mirrors.aliyun.com/epel-archive/7/{arch}", repos)
+                imports = [c for c in self.calls("rpmkeys") if "--import" in c["args"]]
+                self.assertTrue(any("RPM-GPG-KEY-EPEL-7" in c["args"][-1] for c in imports))
+                self.fresh_job(offline=True)
+                result = self.run_installer()
+                self.success(result)
+                self.assertIn("authenticated offline RPM cache hit", result.stdout)
+                self.assertFalse(self.calls("curl"))
+
     def test_signed_file_dependencies_work_without_find(self):
         self.fixture(yum_cache_layout=True)
         tool = self.root / "bin/find"
@@ -491,7 +510,10 @@ class SSHRPMTests(unittest.TestCase):
                 self.issue_repo()
                 self.success(self.run_installer())
                 self.assertIn("https://mirrors.aliyun.com/" + expected, self.calls("dnf")[0]["repos"])
-                self.assertNotIn("epel", self.calls("dnf")[0]["repos"].lower())
+                if name == "alinux" and version.startswith("2"):
+                    self.assertIn(f"https://mirrors.aliyun.com/epel-archive/7/{arch}", self.calls("dnf")[0]["repos"])
+                else:
+                    self.assertNotIn("epel", self.calls("dnf")[0]["repos"].lower())
                 self.assertEqual(len([c for c in self.calls("rpm") if "-qa" in c["args"]]), 1)
         self.assertEqual(len(self.generations()), len(cases))
 

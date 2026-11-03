@@ -107,6 +107,11 @@ case "${ID:-}" in
       *) fail "unsupported Alibaba Cloud Linux version/architecture: ${VERSION_ID:-unknown}/$ARCH" ;;
     esac
     for repo in os updates plus; do add_repo "alinux-$repo" "https://mirrors.aliyun.com/alinux/$RELEASE/$repo/$ARCH" 0; done
+    if [ "$RELEASE" = 2.1903 ]; then
+      add_key RPM-GPG-KEY-EPEL-7 https://mirrors.aliyun.com/epel/RPM-GPG-KEY-EPEL-7 \
+        028b9accc59bab1d21f2f3f544df5469910581e728a64fd8c411a725a82300c2
+      add_repo epel "https://mirrors.aliyun.com/epel-archive/7/$ARCH" 1
+    fi
     ;;
   *) fail "unsupported OS: ${ID:-unknown}" ;;
 esac
@@ -302,7 +307,7 @@ verify_bundle() {
   [ "$actual" -eq "$count" ] || return 1
   for target in openssh-server openssh-clients jq; do
     if ! awk -F '|' -v t="$target" '$2 == t {found=1} END {exit !found}' "$WORK/names"; then
-      installed_target "$target" || return 1
+      installed_target "$target" || { warn "required RPM missing from bundle and image: $target"; return 1; }
     fi
   done
   # Reject unrelated signed packages; rpm --test checks exact dependency versions.
