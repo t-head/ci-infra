@@ -39,22 +39,31 @@ def upload_wheel(path, batch_url, username, token):
     if ":" in username or any(char in username + token for char in "\r\n\x00"):
         raise ValueError("Publishing credentials have an invalid format")
     url = batch_url + quote(path.name, safe="")
-    # Disable default curl configuration and redirects; do not log commands containing credentials or response bodies.
     result = subprocess.run(
         [
-            "curl", "--disable", "--fail", "--silent", "--show-error", "--retry", "3",
+            "curl", "--disable", "--fail-with-body", "--silent", "--show-error", "--retry", "3",
             "--connect-timeout", "30", "--max-time", "600", "--proto", "=https",
             "--user", f"{username}:{token}", "--upload-file", str(path.resolve()),
-            "--output", os.devnull, "--write-out", "%{http_code}", "--", url,
+            "--write-out", "\n%{http_code}", "--", url,
         ],
         capture_output=True,
         text=True,
         timeout=1500,
         check=False,
     )
-    status = result.stdout.strip()
+    response_body, _, status = result.stdout.rpartition("\n")
+    status = status.strip()
+    safe_status = status if re.fullmatch(r"[0-9]{3}", status) else "unknown"
+    print(f"Artifactory response for {url}: curl exit code {result.returncode}, HTTP {safe_status}", flush=True)
+    for label, content in (("Response body", response_body or "(empty)"), ("curl stderr", result.stderr)):
+        if not content:
+            continue
+        for secret in sorted({username, token}, key=len, reverse=True):
+            content = content.replace(secret, "***")
+        print(f"{label}:", flush=True)
+        for line in content.splitlines():
+            print(f"  {line}", flush=True)
     if result.returncode or not re.fullmatch(r"2[0-9]{2}", status):
-        safe_status = status if re.fullmatch(r"[0-9]{3}", status) else "unknown"
         raise ValueError(f"Artifactory upload failed: curl exit code {result.returncode}, HTTP {safe_status}")
     return url
 
