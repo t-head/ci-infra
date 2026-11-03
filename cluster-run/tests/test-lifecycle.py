@@ -211,7 +211,7 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(shutil.which("jq"), "jq is required by the lifecycle scripts")
         self.assertIsNotNone(shutil.which("flock"), "flock is required by the lifecycle scripts")
-        self.temp = tempfile.TemporaryDirectory(prefix="ppu-lifecycle-")
+        self.temp = tempfile.TemporaryDirectory(prefix="ppu-lifecycle_")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.scripts = self.root / "scripts"
@@ -242,7 +242,7 @@ class LifecycleTests(unittest.TestCase):
             + str(Path(shutil.which("jq")).parent) + os.pathsep
             + str(Path(shutil.which("flock")).parent),
             HOME=str(self.home), TMPDIR=str(self.root),
-            LIFECYCLE_FIXTURE=str(self.root), JOB_NAME=self.root.name,
+            LIFECYCLE_FIXTURE=str(self.root), JOB_NAME=self.root.name.replace("_", "-"),
             INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0",
             INPUT_NAMESPACE="fixture", INPUT_NNODES="0", INPUT_NPROC_PER_NODE="8",
             INPUT_TIMEOUT_MINUTES="1", JOB_START_TIME=str(EPOCH),
@@ -1007,6 +1007,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(json.loads(task.read_text()), record)
 
     def test_master_cleanup_removes_only_job_runtime_and_secret_preserving_cache_and_status(self):
+        self.assertIn("_", self.root.name)
+        self.assertRegex(self.env["JOB_NAME"], r"^[a-z0-9][a-z0-9-]*$")
         self.configure([pod(0)])
         own = self.runtime / (self.env["JOB_NAME"] + "-0-1-fixture")
         sibling = self.runtime / "other-job-id"
