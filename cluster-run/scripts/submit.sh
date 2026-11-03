@@ -29,12 +29,16 @@ set_output "occupied_ppu_card_hours" "0.0000"
 set_output "execution_ppu_card_hours" "0.0000"
 
 FINAL_STATUS="failed"
+MASTER_KEYS_DIR=""
 _on_exit() {
   local rc=$?
   trap - EXIT TERM INT
   if [ "$FINAL_STATUS" = "failed" ] && [ -n "${DEADLINE:-}" ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
     FINAL_STATUS="timeout"
     set_output "job_status" "$FINAL_STATUS"
+  fi
+  if [ -n "${MASTER_KEYS_DIR:-}" ] && [ -d "$MASTER_KEYS_DIR" ]; then
+    rm -rf -- "$MASTER_KEYS_DIR"
   fi
   if [ -n "${WAIT_PID:-}" ]; then
     kill "$WAIT_PID" 2>/dev/null || true
@@ -67,6 +71,23 @@ yaml_escape_value() {
 
 NNODES="${INPUT_NNODES:-0}"
 NPROC="${INPUT_NPROC_PER_NODE:-1}"
+LAUNCH_MODE="${INPUT_LAUNCH_MODE:-each-node}"
+SETUP_COMMAND="${INPUT_SETUP_COMMAND:-}"
+SSH_PORT="${INPUT_SSH_PORT:-2222}"
+case "$LAUNCH_MODE" in
+  each-node|master) ;;
+  *) log_error "launch_mode must be each-node or master"; exit 1 ;;
+esac
+if ! [[ "$NNODES" =~ ^(0|[1-9][0-9]*)$ ]] || ! [[ "$NPROC" =~ ^[1-9][0-9]*$ ]]; then
+  log_error "nnodes must be nonnegative and nproc_per_node must be positive integers"
+  exit 1
+fi
+if ! [[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$SSH_PORT" -gt 65535 ]; then
+  log_error "ssh_port must be between 1 and 65535"
+  exit 1
+fi
+MASTER_MULTI=false
+[ "$LAUNCH_MODE" != master ] || [ "$NNODES" -le 1 ] || MASTER_MULTI=true
 
 # nnodes=0 selects single-node mode: one pod, no gang scheduling or service.
 SINGLE_MODE=false
@@ -75,6 +96,8 @@ if [ "$NNODES" -eq 0 ]; then
   NNODES=1
 fi
 COMMAND="${INPUT_COMMAND:-}"
+USER_COMMAND="$COMMAND"
+SOURCE_PREPARE=""
 IMAGE="${INPUT_IMAGE:-}"
 NAMESPACE="${INPUT_NAMESPACE:-default}"
 TIMEOUT_MINUTES="${INPUT_TIMEOUT_MINUTES:-60}"
@@ -156,6 +179,14 @@ if [ "$SINGLE_MODE" = false ]; then
   fi
 fi
 
+master_reserved_env() {
+  [ "$LAUNCH_MODE" = master ] || return 1
+  case "$1" in
+    NNODES|NPROC_PER_NODE|WORLD_SIZE|MASTER_PORT|LOCAL_RANK|NODE_RANK|RANK|MASTER_ADDR|NODE_NAME|LAUNCH_MODE|SOURCE_DIR|POD_IP|HOST_IP|POD_UID|PPU_*|CLUSTER_*|BASH_ENV|ENV) return 0 ;;
+  esac
+  return 1
+}
+
 EXTRA_ENV_YAML=""
 if [ -n "$EXTRA_ENV" ]; then
   IFS=',' read -ra _env_pairs <<< "$EXTRA_ENV"
@@ -165,6 +196,14 @@ if [ -n "$EXTRA_ENV" ]; then
     _val="${_pair#*=}"
     _key=$(echo "$_key" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -z "$_key" ] && continue
+    if ! [[ "$_key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || [[ "$_pair" != *=* ]]; then
+      log_error "extra_env requires valid NAME=value entries"
+      exit 1
+    fi
+    if master_reserved_env "$_key"; then
+      log_error "extra_env cannot override master runtime variable: $_key"
+      exit 1
+    fi
     _val=$(yaml_escape_value "$_val")
     EXTRA_ENV_YAML+="        - name: ${_key}"$'\n'
     EXTRA_ENV_YAML+="          value: \"${_val}\""$'\n'
@@ -201,6 +240,7 @@ if [[ -n "${USER_ENV_JSON:-}" && "${USER_ENV_JSON}" != "{}" && "${USER_ENV_JSON}
     case "$_key" in
       INPUT_*|CONTAINER_OPTIONS|SOURCE_STAGE_DIR|USER_ENV_JSON|GITHUB_*) continue ;;
     esac
+    master_reserved_env "$_key" && continue
     _val=$(printf '%s' "${_b64val}" | base64 -d && printf '.')
     _val="${_val%.}"
     _val=$(yaml_escape_value "$_val")
@@ -528,9 +568,23 @@ if [ -n "$SOURCE_STAGE_DIR" ]; then
   fi
   printf -v EXTRACT_CMD 'mkdir -p %q && tar xzf %q -C %q && cd %q' \
     "$SOURCE_MOUNT_PATH" "$TARBALL_PATH_IN_POD" "$SOURCE_MOUNT_PATH" "$SOURCE_MOUNT_PATH"
-  COMMAND="${EXTRACT_CMD} || exit \$?
-${COMMAND}"
+  SOURCE_PREPARE="${EXTRACT_CMD} || exit \$?"$'\n'
+  COMMAND="${SOURCE_PREPARE}${COMMAND}"
   log_info "Source tarball extraction injected: ${TARBALL_PATH_IN_POD} → ${SOURCE_MOUNT_PATH}"
+fi
+
+if [ "$MASTER_MULTI" = true ]; then
+  printf -v _setup_quoted '%q' "$SETUP_COMMAND"
+  printf -v _command_quoted '%q' "$USER_COMMAND"
+  COMMAND="${SOURCE_PREPARE}mkdir -p /run/cluster
+printf '%s\\n' ${_setup_quoted} > /run/cluster/setup.sh
+printf '%s\\n' ${_command_quoted} > /run/cluster/command.sh
+exec /bin/bash /run/cluster-config/master-worker.sh"
+elif [ -n "$SETUP_COMMAND" ]; then
+  COMMAND="${SOURCE_PREPARE}set -e
+${SETUP_COMMAND}
+set +e
+${USER_COMMAND}"
 fi
 
 if [ "$DMESG_POLICY" != "never" ]; then
@@ -593,6 +647,29 @@ while true; do
   [ "$WAIT_SECONDS" -gt 0 ] && sleep "$WAIT_SECONDS"
 done
 
+MASTER_SERVICE_OPTIONS=""
+MASTER_POD_OPTIONS=""
+MASTER_CONTAINER_OPTIONS=""
+MASTER_VOLUME_MOUNTS=""
+MASTER_VOLUME_DEFS=""
+if [ "$MASTER_MULTI" = true ]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/prepare-master.sh"
+  kube_request delete secret "${JOB_NAME}-ssh" -n "$NAMESPACE" --ignore-not-found=true --wait=false
+  prepare_master_secret
+  MASTER_SERVICE_OPTIONS="  publishNotReadyAddresses: true"
+  MASTER_POD_OPTIONS="  automountServiceAccountToken: false
+  activeDeadlineSeconds: $((DEADLINE - $(date +%s)))"
+  MASTER_CONTAINER_OPTIONS="      readinessProbe:
+        exec:
+          command: [\"/bin/bash\", \"-c\", \"test -f /run/cluster/ready\"]
+        periodSeconds: 3"
+  MASTER_VOLUME_MOUNTS="        - name: cluster-config
+          mountPath: /run/cluster-config
+          readOnly: true
+        - name: cluster-runtime
+          mountPath: /run/cluster"
+fi
+
 # --- Create Headless Service ---
 if [ "$SINGLE_MODE" = false ]; then
   SVC_MANIFEST="$MANIFEST_DIR/service.yaml"
@@ -604,6 +681,7 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   clusterIP: None
+${MASTER_SERVICE_OPTIONS}
   selector:
     ppu-job: ${JOB_NAME}
   ports:
@@ -674,6 +752,18 @@ MASTER_ADDR="${JOB_NAME}-worker-0.${JOB_NAME}.${NAMESPACE}.svc.cluster.local"
 
 # --- Create N Pods in a loop ---
 for i in $(seq 0 $(( NNODES - 1 ))); do
+  if [ "$MASTER_MULTI" = true ]; then
+    MASTER_VOLUME_DEFS="    - name: cluster-runtime
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Mi
+    - name: cluster-config
+      secret:
+        secretName: ${JOB_NAME}-ssh
+        defaultMode: 0400
+        items:
+$(master_secret_items "$i")"
+  fi
   POD_MANIFEST="$MANIFEST_DIR/pod-worker-${i}.yaml"
   cat > "$POD_MANIFEST" <<POD_EOF
 apiVersion: v1
@@ -689,6 +779,7 @@ spec:
   hostname: ${JOB_NAME}-worker-${i}
   subdomain: ${JOB_NAME}
   restartPolicy: Never
+${MASTER_POD_OPTIONS}
 ${POD_AFFINITY_YAML}
 ${NODE_SELECTOR_YAML}
 ${POD_LEVEL_OPTIONS_YAML}
@@ -709,6 +800,7 @@ ${POD_LEVEL_OPTIONS_YAML}
       args:
         - |
 ${SCRIPT_INDENTED}
+${MASTER_CONTAINER_OPTIONS}
       env:
         - name: NNODES
           value: "${NNODES}"
@@ -726,6 +818,26 @@ ${SCRIPT_INDENTED}
           value: "${i}"
         - name: MASTER_ADDR
           value: "${MASTER_ADDR}"
+        - name: LAUNCH_MODE
+          value: "${LAUNCH_MODE}"
+        - name: SOURCE_DIR
+          value: "$(yaml_escape_value "$SOURCE_MOUNT_PATH")"
+        - name: PPU_SSH_PORT
+          value: "${SSH_PORT}"
+        - name: PPU_DEADLINE
+          value: "${DEADLINE}"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         - name: NODE_NAME
           valueFrom:
             fieldRef:
@@ -745,6 +857,7 @@ ${SECURITY_CONTEXT_YAML}
           mountPath: /dev/shm
 ${DEFAULT_NAS_VOLUME_MOUNTS}
 ${HOST_VOLUME_MOUNTS}
+${MASTER_VOLUME_MOUNTS}
   volumes:
     - name: dshm
       emptyDir:
@@ -752,6 +865,7 @@ ${HOST_VOLUME_MOUNTS}
         sizeLimit: ${SHM_SIZE_LIMIT}
 ${DEFAULT_NAS_VOLUME_DEFS}
 ${HOST_VOLUME_DEFS}
+${MASTER_VOLUME_DEFS}
 POD_EOF
 
   log_info "Creating Pod: ${JOB_NAME}-worker-${i}"

@@ -14,6 +14,11 @@ FINAL_STATUS="failed"
 LOG_PID=""
 WAIT_PID=""
 DRAIN_LOGS=false
+LAUNCH_MODE="${INPUT_LAUNCH_MODE:-each-node}"
+MASTER_MULTI=false
+[ "$LAUNCH_MODE" != master ] || [ "$NNODES" -le 1 ] || MASTER_MULTI=true
+READY_WORKERS=" "
+NOT_READY_SINCE=0
 
 set_output() {
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -51,7 +56,11 @@ _on_signal() {
 trap '_on_exit' EXIT
 trap '_on_signal' TERM INT
 
-echo "Streaming worker-0 logs; waiting for all ${NNODES} worker pods to finish"
+if [ "$MASTER_MULTI" = true ]; then
+  echo "Streaming worker-0 logs; supervising ${NNODES} nodes until master completes"
+else
+  echo "Streaming worker-0 logs; waiting for all ${NNODES} worker pods to finish"
+fi
 (
   trap - EXIT
   _log_child=""
@@ -110,22 +119,77 @@ while true; do
     ) 9> "${TASK_FILE}.lock"
   fi
 
+  MASTER_COMPLETED=0
+  WORKER_COMPLETED=0
+  if [ "$MASTER_MULTI" = true ]; then
+    MASTER_COMPLETED=$(printf '%s' "$POD_SNAPSHOT" | jq --arg master "$POD_W0" '[.items[] | select(.metadata.name == $master and .status.phase == "Succeeded")] | length')
+    WORKER_COMPLETED=$(printf '%s' "$POD_SNAPSHOT" | jq --arg master "$POD_W0" '[.items[] | select(.metadata.name != $master and .status.phase == "Succeeded")] | length')
+    POD_COUNT=$(printf '%s' "$POD_SNAPSHOT" | jq '.items | length')
+    if [ "$POD_COUNT" -ne "$NNODES" ]; then
+      echo "::error::Master allocation lost a worker (expected=$NNODES actual=$POD_COUNT)"
+      exit 0
+    fi
+    ABNORMAL=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.metadata.deletionTimestamp != null or .status.phase == "Unknown" or (.status.phase != "Failed" and (any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0))))] | length')
+    if [ "$ABNORMAL" -gt 0 ]; then
+      echo "::error::Master allocation contains a deleting, unknown or initialization-failed pod"
+      FINAL_STATUS="failed"
+      exit 0
+    fi
+    LOST_READY=false
+    while IFS='|' read -r name ready; do
+      if [ "$ready" = True ]; then
+        case "$READY_WORKERS" in *" $name "*) ;; *) READY_WORKERS+="$name " ;; esac
+      else
+        case "$READY_WORKERS" in *" $name "*) LOST_READY=true ;; esac
+      fi
+    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r --arg master "$POD_W0" '.items[] | select(.metadata.name != $master and .status.phase == "Running") | [.metadata.name, ([.status.conditions[]? | select(.type == "Ready") | .status] | first // "False")] | join("|")')
+    if [ "$LOST_READY" = true ]; then
+      [ "$NOT_READY_SINCE" -ne 0 ] || NOT_READY_SINCE=$NOW
+      if [ $((NOW - NOT_READY_SINCE)) -ge 30 ]; then
+        echo "::error::A previously ready worker remained unavailable for 30 seconds"
+        exit 0
+      fi
+    else
+      NOT_READY_SINCE=0
+    fi
+  fi
+
   if [ "$NOW" -ge "$DEADLINE" ]; then
     FINAL_STATUS="timeout"
     SUCCEEDED=0
     FAILED=0
-    while IFS='|' read -r phase finished_at; do
+    MASTER_COMPLETED=0
+    WORKER_COMPLETED=0
+    while IFS='|' read -r pod_name phase finished_at; do
       [ -n "$finished_at" ] || continue
       finished_epoch=$(date -d "$finished_at" +%s)
       [ "$finished_epoch" -le "$DEADLINE" ] || continue
       case "$phase" in
-        Succeeded) SUCCEEDED=$(( SUCCEEDED + 1 )) ;;
+        Succeeded)
+          SUCCEEDED=$(( SUCCEEDED + 1 ))
+          if [ "$pod_name" = "$POD_W0" ]; then
+            MASTER_COMPLETED=1
+          else
+            WORKER_COMPLETED=$(( WORKER_COMPLETED + 1 ))
+          fi
+          ;;
         Failed) FAILED=$(( FAILED + 1 )) ;;
       esac
-    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // "")] | join("|")')
+    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.metadata.name, .status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // "")] | join("|")')
   fi
 
-  if [ "$SUCCEEDED" -eq "$NNODES" ] || [ "$FAILED" -gt 0 ]; then
+  if [ "$MASTER_MULTI" = true ] && [ "$WORKER_COMPLETED" -gt 0 ]; then
+    echo "::error::A worker SSH service exited before allocation cleanup"
+    FINAL_STATUS="failed"
+    exit 0
+  fi
+  COMPLETE=false
+  if [ "$MASTER_MULTI" = true ]; then
+    [ "$MASTER_COMPLETED" -eq 0 ] || COMPLETE=true
+  elif [ "$SUCCEEDED" -eq "$NNODES" ]; then
+    COMPLETE=true
+  fi
+  if [ "$COMPLETE" = true ] || [ "$FAILED" -gt 0 ]; then
     W0_PHASE=$(printf '%s' "$POD_SNAPSHOT" | jq -r --arg pod "$POD_W0" '.items[] | select(.metadata.name == $pod) | .status.phase')
     case "$W0_PHASE" in Succeeded|Failed) DRAIN_LOGS=true ;; esac
     if [ "$FAILED" -gt 0 ]; then
@@ -134,7 +198,11 @@ while true; do
       exit 0
     fi
     FINAL_STATUS="succeeded"
-    echo "All worker pods succeeded"
+    if [ "$MASTER_MULTI" = true ]; then
+      echo "Master completed successfully; worker services will be cleaned up"
+    else
+      echo "All worker pods succeeded"
+    fi
     exit 0
   fi
 

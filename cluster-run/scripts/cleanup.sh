@@ -10,6 +10,8 @@ JOB_NAME="${JOB_NAME:-}"
 # cleanup_policy has been removed: always perform full cleanup.
 NNODES="${INPUT_NNODES:-0}"
 SOURCE_STAGE_DIR="${SOURCE_STAGE_DIR:-}"
+LAUNCH_MODE="${INPUT_LAUNCH_MODE:-each-node}"
+MASTER_RUNTIME_DIR="${MASTER_RUNTIME_DIR:-}"
 
 # Resolve job name outputs job_name before any resources are created; an empty value means none exist yet.
 if [ -z "$JOB_NAME" ]; then
@@ -43,6 +45,10 @@ TASK_FILE="${TASK_DIR}/${JOB_NAME}.json"
     fi
   fi
   TASK_STATUS="${INPUT_JOB_STATUS:-}"
+  if [ "$TASK_RECORD_LOCKED" = true ]; then
+    RECORDED_STATUS=$(jq -r 'if (.end_time // "") != "" and (.status == "succeeded" or .status == "failed" or .status == "timeout" or .status == "cancelled") then .status else "" end' "$TASK_FILE")
+    [ -z "$RECORDED_STATUS" ] || TASK_STATUS="$RECORDED_STATUS"
+  fi
   case "$TASK_STATUS" in
     ""|unknown|pending|running|scheduled)
       if [ -f "$TASK_FILE" ]; then
@@ -100,16 +106,20 @@ cleanup_sleep() {
 
 # Retry deletion to handle transient failures such as etcd NOSPACE.
 kube_delete_retry() {
-  local max_retries=3 delay=5 attempt resource
+  local max_retries=3 delay=5 attempt resource delete_output
   local -a pending=("$@") failed=() delete_args=()
   for ((attempt=1; attempt<=max_retries; attempt++)); do
     failed=()
     for resource in "${pending[@]}"; do
       delete_args=("$JOB_NAME")
       [ "$resource" != pods ] || delete_args=(-l "$POD_SELECTOR")
-      if ! kube_request "$FORCE_RESERVE" delete "$resource" "${delete_args[@]}" \
-        -n "$NAMESPACE" --wait=false --ignore-not-found=true 2>/dev/null; then
+      [ "$resource" != secret ] || delete_args=("${JOB_NAME}-ssh")
+      if delete_output=$(kube_request "$FORCE_RESERVE" delete "$resource" "${delete_args[@]}" \
+        -n "$NAMESPACE" --wait=false --ignore-not-found=true 2>&1); then
+        [ -z "$delete_output" ] || log_info "$delete_output"
+      else
         failed+=("$resource")
+        log_warn "Could not delete ${resource}: ${delete_output}"
       fi
     done
     [ "${#failed[@]}" -ne 0 ] || return 0
@@ -133,6 +143,9 @@ if [ "$NNODES" != "0" ]; then
   PENDING_RESOURCES+=(svc podgroups.scheduling.x-k8s.io)
 else
   log_info "Single-card/multi-card mode (nnodes=0): no service/podgroup to clean up; skipping."
+fi
+if [ "$LAUNCH_MODE" = master ] && [ "$NNODES" -gt 1 ]; then
+  PENDING_RESOURCES+=(secret)
 fi
 kube_delete_retry "${PENDING_RESOURCES[@]}" || CLEANUP_CONFIRMED=false
 
@@ -173,6 +186,20 @@ while true; do
   cleanup_sleep 5 "$REQUEST_RESERVE" || continue
 done
 
+if [ "$LAUNCH_MODE" = master ] && [ -n "$MASTER_RUNTIME_DIR" ]; then
+  MASTER_RUNTIME_ROOT="/wl_nas/devops/runtime/master"
+  runtime_name="${MASTER_RUNTIME_DIR#"$MASTER_RUNTIME_ROOT/"}"
+  if [ "$PODS_CONFIRMED" = true ] && [[ "$runtime_name" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+    && [[ "$runtime_name" == "$JOB_NAME-"* ]] \
+    && [ "$MASTER_RUNTIME_DIR" = "$MASTER_RUNTIME_ROOT/$runtime_name" ] \
+    && [ ! -L "$MASTER_RUNTIME_ROOT" ] && [ ! -L "$MASTER_RUNTIME_DIR" ]; then
+    rm -rf -- "$MASTER_RUNTIME_DIR" || CLEANUP_CONFIRMED=false
+  else
+    log_warn "Master runtime directory removal was not safe or pods remain unconfirmed"
+    CLEANUP_CONFIRMED=false
+  fi
+fi
+
 if [ -d "/tmp/training-manifests" ]; then
   log_info "Removing temporary manifest files"
   rm -rf /tmp/training-manifests
@@ -183,4 +210,8 @@ if [ "$CLEANUP_CONFIRMED" = true ] && [ "$PODS_CONFIRMED" = true ]; then
   log_info "Cleanup complete: $JOB_NAME"
 else
   log_warn "Cleanup ended without confirmed cluster resource removal: $JOB_NAME. Finalizers may still retain pods; they were left untouched."
+  if [ "$LAUNCH_MODE" = master ]; then
+    log_error "Master resources were not fully removed; check Secret permissions and remaining pods"
+    exit 1
+  fi
 fi

@@ -54,8 +54,18 @@ def fake_command(tool, args):
             if args[2] != "podgroups.scheduling.x-k8s.io":
                 raise ValueError("Only x-k8s.io PodGroups are supported")
             return fixture.get("crd_status", 0)
+        if args[:2] == ["auth", "can-i"]:
+            if not os.environ.get("STAGING_API_TIMEOUT"):
+                raise ValueError("Secret permission checks must have an outer deadline")
+            denied = fixture.get("denied_secret_verb") == args[2]
+            print("no" if denied else "yes")
+            return int(denied)
         if args[0] == "delete":
             return 0
+        if args[0] == "get" and args[1] in ("svc", "podgroups.scheduling.x-k8s.io", "secret", "secrets"):
+            if fixture.get("remaining_resource") == args[1]:
+                print(args[1] + "/remaining")
+            return fixture.get("resource_query_status", 0)
         if args[:2] == ["get", "pods"]:
             print(fixture.get("pods", ""), end="")
             return fixture.get("query_status", 0)
@@ -321,7 +331,8 @@ class StagingTests(unittest.TestCase):
         self.fake("kubectl")
         self.fake("timeout")
         script = self.step("Validate inputs and check PodGroup CRD")
-        env = dict(self.env, INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0")
+        env = dict(self.env, INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0",
+                   INPUT_LAUNCH_MODE="each-node", INPUT_SSH_PORT="2222", INPUT_SETUP_COMMAND="")
         for nodes, status, expected in (("0", 42, 0), ("2", 0, 0), ("2", 42, 1)):
             with self.subTest(nodes=nodes, status=status):
                 self.fixture(crd_status=status)
@@ -358,6 +369,7 @@ class StagingTests(unittest.TestCase):
 
     def test_ci_query_failures_and_remaining_pods_fail(self):
         self.fake("kubectl")
+        self.fake("timeout")
         scripts = [step["run"] for job in self.workflow["jobs"].values() for step in job["steps"]
                    if "kubectl get pods" in step.get("run", "")]
         self.assertTrue(scripts)
@@ -367,7 +379,8 @@ class StagingTests(unittest.TestCase):
                         if step.get("run") == script)
             for key in step.get("env", {}):
                 env[key] = "success" if "OUTCOME" in key else "succeeded"
-            env.update(NAMESPACE="fixture", TEST_NAMESPACE="fixture")
+            env.update(NAMESPACE="fixture", TEST_NAMESPACE="fixture", ALLOCATION_NAME="fixture-job")
+            script = script.replace("/wl_nas/devops/runtime/master", str(self.nas / "runtime"))
             for status, pods, expected in ((0, "", 0), (0, "pod/remaining\n", 1), (37, "", 37)):
                 with self.subTest(query_status=status, pods=pods):
                     self.fixture(query_status=status, pods=pods)
@@ -389,6 +402,190 @@ class StagingTests(unittest.TestCase):
                         if any(step.get("run") == lifecycle for step in job["steps"]))
         index = next(index for index, step in enumerate(sequence) if step.get("run") == lifecycle)
         self.assertEqual(sequence[index + 1].get("run"), staging)
+
+    def test_master_action_inputs_and_internal_output_handoff(self):
+        existing = {"nnodes", "nproc_per_node", "command", "image", "namespace", "timeout_minutes",
+                    "host_volumes", "extra_env", "master_port", "cleanup_policy", "source_dir",
+                    "node_selector", "container_options", "artifact_paths", "job_suffix", "dmesg_policy"}
+        self.assertEqual(set(self.action["inputs"]) - existing, {"launch_mode", "setup_command", "ssh_port"})
+        for key, default in (("launch_mode", "each-node"), ("setup_command", ""), ("ssh_port", "2222")):
+            self.assertEqual(str(self.action["inputs"][key]["default"]), default)
+            self.assertIs(self.action["inputs"][key].get("required", False), False)
+        steps = {step["id"]: step for step in self.action["runs"]["steps"] if "id" in step}
+        for key in ("launch_mode", "setup_command", "ssh_port"):
+            self.assertEqual(steps["submit"]["env"]["INPUT_" + key.upper()], "${{ inputs." + key + " }}")
+        for name in ("monitor", "cleanup"):
+            self.assertEqual(steps[name]["env"]["INPUT_LAUNCH_MODE"], "${{ inputs.launch_mode }}")
+            self.assertEqual(steps[name]["env"]["MASTER_RUNTIME_DIR"], "${{ steps.submit.outputs.master_runtime_dir }}")
+        self.assertEqual(steps["monitor"]["env"]["JOB_DEADLINE"], "${{ steps.submit.outputs.deadline }}")
+        self.assertEqual(steps["cleanup"]["if"], "always()")
+
+    def test_master_preflight_validates_mode_and_port_without_cluster_side_effects(self):
+        self.fake("kubectl")
+        self.fake("timeout")
+        script = self.step("Validate inputs and check PodGroup CRD")
+        env = dict(self.env, INPUT_IMAGE="fixture:latest", INPUT_COMMAND="exit 0", INPUT_NNODES="0",
+                   INPUT_LAUNCH_MODE="master", INPUT_SSH_PORT="2222", INPUT_SETUP_COMMAND="")
+        for mode, port, expected in (("each-node", "1", 0), ("master", "65535", 0),
+                                     ("each_node", "2222", 1), ("MASTER", "2222", 1),
+                                     ("master", "0", 1), ("master", "65536", 1),
+                                     ("master", "22x", 1), ("master", "2222;exit 0", 1)):
+            with self.subTest(mode=mode, port=port):
+                result = self.shell(script, dict(env, INPUT_LAUNCH_MODE=mode, INPUT_SSH_PORT=port))
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::", result.stdout + result.stderr)
+        self.assertFalse((self.root / "calls.jsonl").exists(), "Standalone preflight must not contact a cluster")
+
+    def test_ci_covers_real_runtime_and_installer_with_required_linux_tools(self):
+        steps = self.workflow["jobs"]["checks"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        self.assertTrue(any("sudo python3" in run and "cluster-run/tests/test-master-runtime.py" in run
+                            for run in runs), "Real sshd tests must run as root in the isolated Ubuntu job")
+        self.assertTrue(any("python3 cluster-run/tests/test-ssh-install.py" in run for run in runs))
+        dependencies = next(run for run in runs if "apt-get install" in run)
+        for package in ("openssh-server", "openssh-client", "jq", "util-linux", "sudo"):
+            self.assertIn(package, dependencies)
+        self.assertEqual(self.workflow["jobs"]["checks"]["runs-on"], "ubuntu-latest")
+
+    def test_ci_runtime_guard_rejects_missing_or_skipped_real_ssh_coverage(self):
+        script = next(step["run"] for step in self.workflow["jobs"]["checks"]["steps"]
+                      if step["name"] == "Exercise real two-node SSH runtime and port collision fallback")
+        script = script.replace("sudo python3 -", shlex.quote(sys.executable) + " -")
+        directory = self.workspace / "cluster-run" / "tests"
+        directory.mkdir(parents=True)
+        path = directory / "test-master-runtime.py"
+        complete = ("import unittest\nclass RealSshdTests(unittest.TestCase):\n"
+                    "    def test_real_two_node_public_key(self): pass\n"
+                    "    def test_real_port_collision(self): pass\n")
+        variants = {
+            "complete": (complete, 0),
+            "missing_collision": (complete.replace("    def test_real_port_collision(self): pass\n", ""), 1),
+            "skipped_two_node": (complete.replace("    def test_real_two_node_public_key(self): pass",
+                                                   "    @unittest.skip('locked root')\n"
+                                                   "    def test_real_two_node_public_key(self): pass"), 1),
+            "class_skipped": (complete.replace("class RealSshdTests", "@unittest.skip('unavailable sshd')\nclass RealSshdTests"), 1),
+            "setup_class_skipped": (complete + "    @classmethod\n    def setUpClass(cls):\n"
+                                    "        raise unittest.SkipTest('unavailable sshd')\n", 1),
+            "only_simulated": (complete.replace("RealSshdTests", "SimulatedClusterTests"), 1),
+        }
+        for name, (source, expected) in variants.items():
+            with self.subTest(name=name):
+                path.write_text(source)
+                result = subprocess.run([self.bash, "-e", "-o", "pipefail", "-c", script],
+                                        cwd=self.workspace, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"),
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("SSH", result.stderr)
+
+    def test_ci_shell_validation_includes_untracked_scripts_but_not_python(self):
+        script = next(step["run"] for step in self.workflow["jobs"]["checks"]["steps"]
+                      if step["name"] == "Parse Bash scripts")
+        self.assertNotIn("git ls-files", script)
+        directory = self.workspace / "cluster-run" / "scripts"
+        directory.mkdir(parents=True)
+        (directory / "not shell.py").write_text("def python_only():\n    return {}\n")
+        shell = directory / "untracked script.sh"
+        shell.write_text("#!/bin/bash\ntrue\n")
+
+        def parse():
+            return subprocess.run([self.bash, "-e", "-o", "pipefail", "-c", script],
+                                  cwd=self.workspace, env=self.env, capture_output=True, text=True, timeout=10)
+
+        result = parse()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("untracked script.sh", result.stdout)
+        self.assertNotIn("not shell.py", result.stdout)
+        shell.write_text("if then\n")
+        result = parse()
+        self.assertNotEqual(result.returncode, 0, "An untracked invalid shell script must fail CI")
+
+    def master_job(self):
+        extension = "$" + "/" + ACTION.name
+        jobs = [job for job in self.workflow["jobs"].values()
+                if any(step.get("uses") == extension and step.get("with", {}).get("launch_mode") == "master"
+                       for step in job["steps"])]
+        self.assertEqual(len(jobs), 1)
+        return jobs[0]
+
+    def test_ci_exercises_real_signed_apt_and_networkless_cache_reuse(self):
+        job = self.workflow["jobs"]["ssh-cache-check"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["needs"], "checks")
+        scripts = "\n".join(step.get("run", "") for step in job["steps"])
+        for required in ("docker pull ubuntu:24.04", "docker image inspect", "--network none",
+                         "/action/install-ssh.sh", "authenticated offline cache hit",
+                         "published authenticated dependency cache", "/cache/openssh:ro"):
+            self.assertIn(required, scripts)
+        self.assertNotIn("--fake", scripts)
+
+    def test_ci_master_matrix_and_trusted_runner_gate(self):
+        job = self.master_job()
+        self.assertEqual(job["needs"], ["checks", "ssh-cache-check"])
+        self.assertEqual(job["runs-on"], "k8s-runner-group-cpu-thead")
+        self.assertEqual(job["if"], "github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository")
+        self.assertIs(job["strategy"]["fail-fast"], False)
+        entries = {entry["label"]: entry for entry in job["strategy"]["matrix"]["include"]}
+        self.assertEqual(set(entries), {"master-success", "master-command-fail", "worker-setup-fail", "master-timeout"})
+        for label, expected in (("master-success", "succeeded"), ("master-command-fail", "failed"),
+                                ("worker-setup-fail", "failed"), ("master-timeout", "timeout")):
+            self.assertEqual(entries[label]["expected_status"], expected)
+        launch = next(step for step in job["steps"] if step.get("id") == "master")
+        self.assertIs(launch["continue-on-error"], True)
+        self.assertEqual(launch["with"]["nnodes"], 2)
+        self.assertEqual(launch["with"]["nproc_per_node"], 1)
+        self.assertEqual(str(launch["with"]["ssh_port"]), "2222")
+        self.assertEqual(launch["with"]["namespace"], "${{ env.TEST_NAMESPACE }}")
+        self.assertEqual(launch["with"]["image"], "${{ env.WORKER_IMAGE }}")
+        self.assertNotIn("container_options", launch["with"], "Do not force hostNetwork on shared infrastructure")
+        probe = self.workflow["env"]["MASTER_SMOKE_COMMAND"]
+        for required in ("cluster-exec", "CI_MASTER_SETUP", "WORLD_SIZE", "RANK", "known_hosts",
+                         "authorized_keys", "identity", "master-command-once", ".port", "nodes"):
+            self.assertIn(required, probe)
+
+    def test_ci_master_secret_authorization_denial_fails_instead_of_skipping(self):
+        self.fake("kubectl")
+        self.fake("timeout")
+        script = next(step["run"] for step in self.master_job()["steps"]
+                      if step["name"] == "Require Secret create and delete permissions")
+        # Keep the fixture from accidentally selecting a real runner's /opt/bin/kubectl.
+        script = script.replace("/opt/bin/kubectl", str(self.root / "absent-kubectl"))
+        for denied, expected in ((None, 0), ("create", 1), ("delete", 1), ("get", 1)):
+            with self.subTest(denied=denied):
+                self.fixture(denied_secret_verb=denied)
+                result = self.shell(script, dict(self.env, TEST_NAMESPACE="fixture"))
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if denied:
+                    self.assertIn("::error::Master CI requires", result.stdout)
+                    self.assertIn(denied, result.stdout)
+
+    def test_ci_master_cleanup_rejects_remaining_resources_and_query_failures(self):
+        self.fake("kubectl")
+        self.fake("timeout")
+        script = next(step["run"] for step in self.master_job()["steps"]
+                      if step["name"] == "Require full master resource cleanup")
+        runtime = self.nas / "runtime"
+        runtime.mkdir()
+        script = script.replace("/wl_nas/devops/runtime/master", str(runtime))
+        env = dict(self.env, TEST_NAMESPACE="fixture", ALLOCATION_NAME="fixture-job")
+        for resource in ("svc", "podgroups.scheduling.x-k8s.io", "secret"):
+            with self.subTest(resource=resource):
+                self.fixture(remaining_resource=resource)
+                result = self.shell(script, env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.fixture(resource_query_status=37)
+        result = self.shell(script, env)
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+        self.fixture()
+        result = self.shell(script, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (runtime / "unrelated-job-id").mkdir()
+        result = self.shell(script, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (runtime / "fixture-job-attempt-nonce").mkdir()
+        result = self.shell(script, env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_ci_runs_real_zw_810e_workload(self):
         extension = "$/" + ACTION.name
@@ -418,6 +615,9 @@ class StagingTests(unittest.TestCase):
         scripts = [step["run"] for step in self.action["runs"]["steps"] if "run" in step]
         scripts += [step["run"] for job in self.workflow["jobs"].values()
                     for step in job["steps"] if "run" in step]
+        scripts += [self.workflow["env"][name] for name in ("SMOKE_COMMAND", "MASTER_SMOKE_COMMAND")]
+        scripts += [entry[key] for entry in self.master_job()["strategy"]["matrix"]["include"]
+                    for key in ("setup", "workload")]
         for script in scripts:
             result = subprocess.run([self.bash, "-n"], input=script, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
