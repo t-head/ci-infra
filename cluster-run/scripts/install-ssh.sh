@@ -155,11 +155,22 @@ case "$ARCH" in ''|*[!a-z0-9-]*) fail 'invalid dpkg architecture' ;; esac
 FINGERPRINT=$(sha256sum "$WORK/fingerprint" | awk '{print $1}')
 KEY="$CACHE/$ID/$VERSION_ID/$ARCH/$FINGERPRINT"
 
-apt_run() {
-  local seconds
+apt_run() (
+  local seconds http https
+  local -a proxies
+  proxies=()
   seconds=$(remaining) || return 124
-  bounded apt-get -o "DPkg::Lock::Timeout=$seconds" -o APT::Get::allow-Downgrades=false "$@"
-}
+  http=${http_proxy:-${HTTP_PROXY:-}}
+  https=${https_proxy:-${HTTPS_PROXY:-$http}}
+  if [ -n "$http" ] || [ -n "$https" ]; then
+    # Workload no_proxy entries must not bypass the configured package-download proxy.
+    unset no_proxy NO_PROXY
+    [ -z "$http" ] || proxies+=(-o "Acquire::http::Proxy=$http")
+    [ -z "$https" ] || proxies+=(-o "Acquire::https::Proxy=$https")
+  fi
+  bounded apt-get -o "DPkg::Lock::Timeout=$seconds" -o APT::Get::allow-Downgrades=false \
+    ${proxies[@]+"${proxies[@]}"} "$@"
+)
 safe_name() { case "$1" in ''|.|..|*[!a-zA-Z0-9._%+:~-]*) return 1 ;; esac; }
 safe_relative() {
   case "$1" in ''|/*|*'//'*|*[!a-zA-Z0-9._%+:~/-]*) return 1 ;; esac

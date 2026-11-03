@@ -352,19 +352,19 @@ jobs:
             minutes: 10
           - label: master-command-fail
             setup: 'export CI_MASTER_SETUP="setup-$RANK"'
-            workload: "printf 'master command failed\\n'; exit 7"
+            workload: 'printf 7 > "$CI_MASTER_PROOF_DIR/master-command-fault"; chmod 0644 "$CI_MASTER_PROOF_DIR/master-command-fault"; exit 7'
             expected_status: failed
             expected_outcome: failure
             minutes: 10
           - label: worker-setup-fail
-            setup: 'export CI_MASTER_SETUP="setup-$RANK"; if [ "$RANK" = 1 ]; then printf "worker setup failed\\n"; exit 7; fi'
+            setup: 'export CI_MASTER_SETUP="setup-$RANK"; if [ "$RANK" = 1 ]; then printf 7 > "$CI_MASTER_PROOF_DIR/worker-setup-fault"; chmod 0644 "$CI_MASTER_PROOF_DIR/worker-setup-fault"; exit 7; fi'
             workload: 'printf "A failed worker setup unexpectedly allowed the master command\\n"; exit 0'
             expected_status: failed
             expected_outcome: failure
             minutes: 10
           - label: master-timeout
             setup: 'export CI_MASTER_SETUP="setup-$RANK"'
-            workload: "printf 'master deadline fixture\\n'; sleep 300"
+            workload: 'printf started > "$CI_MASTER_PROOF_DIR/timeout-command-started"; chmod 0644 "$CI_MASTER_PROOF_DIR/timeout-command-started"; sleep 300'
             expected_status: timeout
             expected_outcome: failure
             minutes: 3
@@ -390,6 +390,14 @@ jobs:
             fi
           done
 
+      - name: Prepare master execution evidence
+        id: proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$(mktemp -d "/wl_nas/devops/master-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXXXX")"
+          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+
       - name: Launch two-node master lifecycle fixture
         id: master
         continue-on-error: true
@@ -402,11 +410,17 @@ jobs:
           node_selector: board-type=ZW-M890P
           launch_mode: master
           ssh_port: 2222
-          setup_command: ${{ matrix.setup }}
+          extra_env: CI_MASTER_PROOF_DIR=${{ steps.proof.outputs.directory }}
+          setup_command: |
+            printf 'setup-%s\n' "$RANK" > "$CI_MASTER_PROOF_DIR/setup-$RANK"
+            chmod 0644 "$CI_MASTER_PROOF_DIR/setup-$RANK"
+            ${{ matrix.setup }}
           timeout_minutes: ${{ matrix.minutes }}
           job_suffix: ${{ matrix.label }}
           command: |
             ${{ env.MASTER_SMOKE_COMMAND }}
+            printf reached > "$CI_MASTER_PROOF_DIR/master-command-reached"
+            chmod 0644 "$CI_MASTER_PROOF_DIR/master-command-reached"
             ${{ matrix.workload }}
 
       - name: Assert master terminal state
@@ -418,7 +432,23 @@ jobs:
           REQUIRED_STATUS: ${{ matrix.expected_status }}
           REQUIRED_OUTCOME: ${{ matrix.expected_outcome }}
           EXECUTION_CARD_HOURS: ${{ steps.master.outputs.execution_ppu_card_hours }}
+          REQUIRED_SCENARIO: ${{ matrix.label }}
+          PROOF_DIR: ${{ steps.proof.outputs.directory }}
         run: |
+          if [ "$REQUIRED_SCENARIO" = worker-setup-fail ]; then
+            test -s "$PROOF_DIR/setup-1"
+            test "$(< "$PROOF_DIR/worker-setup-fault")" = 7
+            test ! -e "$PROOF_DIR/master-command-reached"
+          else
+            test -s "$PROOF_DIR/setup-0"
+            test -s "$PROOF_DIR/setup-1"
+            test -s "$PROOF_DIR/master-command-reached"
+          fi
+          if [ "$REQUIRED_SCENARIO" = master-command-fail ]; then
+            test "$(< "$PROOF_DIR/master-command-fault")" = 7
+          elif [ "$REQUIRED_SCENARIO" = master-timeout ]; then
+            test -s "$PROOF_DIR/timeout-command-started"
+          fi
           test "$ALLOCATION_STATUS" = "$REQUIRED_STATUS"
           test "$ALLOCATION_OUTCOME" = "$REQUIRED_OUTCOME"
           if [ "$REQUIRED_STATUS" = timeout ]; then
@@ -445,6 +475,20 @@ jobs:
           shopt -s nullglob
           runtime_dirs=(/wl_nas/devops/runtime/master/"$ALLOCATION_NAME"-*)
           test "${#runtime_dirs[@]}" -eq 0
+
+      - name: Remove master execution evidence
+        if: always() && steps.proof.outputs.directory != ''
+        shell: bash
+        env:
+          PROOF_DIR: ${{ steps.proof.outputs.directory }}
+        run: |
+          set -euo pipefail
+          prefix="/wl_nas/devops/master-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"
+          suffix="${PROOF_DIR#"$prefix"}"
+          [[ "$suffix" =~ ^[a-zA-Z0-9]+$ ]]
+          test "$PROOF_DIR" = "$prefix$suffix"
+          test ! -L "$PROOF_DIR"
+          rm -rf -- "$PROOF_DIR"
 
   default-limit-check:
     name: Inspect ${{ matrix.board_type }} limits

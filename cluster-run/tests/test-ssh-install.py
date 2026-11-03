@@ -46,7 +46,9 @@ def fake_command(tool, args):
     fixture = json.loads((root / "fixture.json").read_text())
     with (root / "calls.jsonl").open("a") as calls:
         calls.write(json.dumps({"tool": tool, "args": args,
-                               "bounded": os.environ.get("SSH_INSTALL_TIMEOUT")}) + "\n")
+                               "bounded": os.environ.get("SSH_INSTALL_TIMEOUT"),
+                               "no_proxy": os.environ.get("no_proxy"),
+                               "NO_PROXY": os.environ.get("NO_PROXY")}) + "\n")
     clock_path = root / "clock"
     if tool == "date":
         if args == ["+%s"]:
@@ -153,6 +155,10 @@ def fake_command(tool, args):
     if tool == "apt-get":
         if not os.environ.get("SSH_INSTALL_TIMEOUT"):
             raise ValueError("APT must be deadline-bounded")
+        expected_proxy = fixture.get("expected_proxy")
+        if expected_proxy and ("Acquire::https::Proxy=" + expected_proxy not in args
+                               or os.environ.get("no_proxy") or os.environ.get("NO_PROXY")):
+            return 100
         paths = config_paths()
         config = Path(os.environ["APT_CONFIG"]).read_text()
         for directive in ('APT::Get::AllowUnauthenticated "false"',
@@ -404,6 +410,34 @@ class SSHInstallTests(unittest.TestCase):
         self.assertTrue(self.calls("apt-helper"))
         self.assertEqual(self.generations(), [generation])
         self.assertEqual(self.generations()[0].parent, key)
+
+    def test_package_proxy_overrides_bypass_only_in_apt_children(self):
+        for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            self.env.pop(name, None)
+        proxy = "http://proxy.fixture:3128"
+        self.env.update(http_proxy=proxy, https_proxy=proxy,
+                        no_proxy=".internal.fixture", NO_PROXY=".internal.fixture")
+        self.fixture(expected_proxy=proxy)
+        self.success(self.run_installer())
+        for call in self.calls("apt-get"):
+            self.assertIn("Acquire::http::Proxy=" + proxy, call["args"])
+            self.assertIn("Acquire::https::Proxy=" + proxy, call["args"])
+            self.assertIsNone(call["no_proxy"])
+            self.assertIsNone(call["NO_PROXY"])
+        self.assertTrue(any(call["no_proxy"] == ".internal.fixture" for call in self.calls("dpkg-query")))
+        self.assertEqual(self.env["no_proxy"], ".internal.fixture")
+
+    def test_uppercase_package_proxy_and_direct_mode(self):
+        for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            self.env.pop(name, None)
+        proxy = "http://proxy.fixture:3128"
+        self.fixture(expected_proxy=proxy)
+        self.success(self.run_installer(HTTPS_PROXY=proxy, no_proxy=".internal.fixture"))
+        self.assertTrue(all("Acquire::https::Proxy=" + proxy in call["args"] for call in self.calls("apt-get")))
+        self.fresh_job(offline=True, expected_proxy=None)
+        self.success(self.run_installer(no_proxy=".direct.fixture"))
+        self.assertTrue(all(call["no_proxy"] == ".direct.fixture" for call in self.calls("apt-get")))
+        self.assertFalse(any("Acquire::https::Proxy=" in argument for call in self.calls("apt-get") for argument in call["args"]))
 
     def test_detached_release_chain(self):
         self.issue_repo(detached=True)

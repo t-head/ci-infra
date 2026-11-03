@@ -544,6 +544,53 @@ class StagingTests(unittest.TestCase):
                          "authorized_keys", "identity", "master-command-once", ".port", "nodes"):
             self.assertIn(required, probe)
 
+    def test_ci_master_expected_failures_require_actual_execution_evidence(self):
+        step = next(step for step in self.master_job()["steps"] if step["name"] == "Assert master terminal state")
+        proof = self.root / "proof"
+        proof.mkdir()
+        env = dict(self.env, PROOF_DIR=str(proof), REQUIRED_SCENARIO="worker-setup-fail",
+                   ALLOCATION_STATUS="failed", ALLOCATION_OUTCOME="failure",
+                   REQUIRED_STATUS="failed", REQUIRED_OUTCOME="failure", EXECUTION_CARD_HOURS="0.0010")
+        result = self.shell(step["run"], env)
+        self.assertNotEqual(result.returncode, 0, "A package-download failure must not pass the worker setup test")
+        (proof / "setup-1").write_text("setup-1")
+        (proof / "worker-setup-fault").write_text("7")
+        result = self.shell(step["run"], env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (proof / "master-command-reached").write_text("reached")
+        result = self.shell(step["run"], env)
+        self.assertNotEqual(result.returncode, 0, "Worker setup failure must prevent the master command")
+        env["REQUIRED_SCENARIO"] = "master-command-fail"
+        (proof / "setup-0").write_text("setup-0")
+        result = self.shell(step["run"], env)
+        self.assertNotEqual(result.returncode, 0, "Master failure must be the intended command failure")
+        (proof / "master-command-fault").write_text("7")
+        result = self.shell(step["run"], env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        env.update(REQUIRED_SCENARIO="master-timeout", ALLOCATION_STATUS="timeout", REQUIRED_STATUS="timeout")
+        result = self.shell(step["run"], env)
+        self.assertNotEqual(result.returncode, 0, "Scheduling or setup timeout must not pass the command timeout test")
+        (proof / "timeout-command-started").write_text("started")
+        result = self.shell(step["run"], env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ci_master_evidence_cleanup_stays_within_its_owned_directory(self):
+        step = next(step for step in self.master_job()["steps"] if step["name"] == "Remove master execution evidence")
+        prefix = str(self.root / "master-ci-")
+        script = step["run"].replace("/wl_nas/devops/master-ci-", prefix)
+        owned = self.root / "master-ci-123-1-ABC123"
+        other = self.root / "other-proof"
+        for path in (owned, other):
+            path.mkdir()
+        env = dict(self.env, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1", PROOF_DIR=str(other))
+        result = self.shell(script, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(other.exists())
+        result = self.shell(script, dict(env, PROOF_DIR=str(owned)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(owned.exists())
+        self.assertTrue(other.exists())
+
     def test_ci_master_secret_authorization_denial_fails_instead_of_skipping(self):
         self.fake("kubectl")
         self.fake("timeout")
