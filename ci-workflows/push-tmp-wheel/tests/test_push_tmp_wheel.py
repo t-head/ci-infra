@@ -56,7 +56,7 @@ def run_publish(publisher, workspace, monkeypatch):
     monkeypatch.setenv("RELEASE_USERNAME", "test-user")
     monkeypatch.setenv("RELEASE_TOKEN", "test-token")
     monkeypatch.setenv("GITHUB_OUTPUT", str(workspace / "outputs"))
-    transport = Mock(return_value=subprocess.CompletedProcess([], 0, "201", ""))
+    transport = Mock(return_value=subprocess.CompletedProcess([], 0, "\n201", ""))
     monkeypatch.setattr(publisher.subprocess, "run", transport)
 
     def run(**environment):
@@ -78,6 +78,10 @@ def test_upload_is_exact_and_https_only(make_wheel, run_publish, workspace):
     assert args[args.index("--user") + 1] == "test-user:test-token"
     assert args[args.index("--proto") + 1] == "=https"
     assert args[args.index("--retry") + 1] == "3"
+    assert "--fail-with-body" in args
+    assert "--fail" not in args
+    assert "--output" not in args
+    assert args[args.index("--write-out") + 1] == "\n%{http_code}"
     assert "--location" not in args
     assert "--insecure" not in args
     assert args[-2:] == ["--", BATCH_URL + WHEEL_NAME]
@@ -227,8 +231,8 @@ def test_partial_failure_stops_batch_without_success_output(make_wheel, run_publ
     for filename in ("a.whl", "b.whl", "c.whl"):
         make_wheel(filename=filename)
     publisher.subprocess.run.side_effect = [
-        subprocess.CompletedProcess([], 0, "201", ""),
-        subprocess.CompletedProcess([], 22, "500", ""),
+        subprocess.CompletedProcess([], 0, "\n201", ""),
+        subprocess.CompletedProcess([], 22, "\n500", ""),
     ]
     code, transport = run_publish()
     assert code == 1
@@ -257,13 +261,63 @@ def test_missing_or_invalid_credentials_never_upload(key, value, make_wheel, run
 def test_http_or_network_failure_fails_without_outputs(status, returncode, make_wheel, run_publish,
                                                      publisher, workspace, capsys):
     make_wheel()
-    publisher.subprocess.run.return_value = subprocess.CompletedProcess([], returncode, status, "test-token")
+    publisher.subprocess.run.return_value = subprocess.CompletedProcess([], returncode, f"\n{status}", "test-token")
     code, transport = run_publish()
     assert code == 1
     transport.assert_called_once()
     assert not (workspace / "outputs").exists()
     captured = capsys.readouterr()
     assert "test-token" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("status,returncode,body,stderr", [
+    ("201", 0, '{\n  "repo": "pypi_tmp",\n  "checksums": {"sha256": "abc123"}\n}\n', ""),
+    ("400", 22, '{"errors": [{"status": 400, "message": "Invalid upload"}]}', "curl: (22) HTTP 400"),
+    ("502", 22, "<html>Bad Gateway</html>", "curl: (22) HTTP 502"),
+    ("302", 0, "Moved temporarily", ""),
+    ("204", 0, "", ""),
+    ("000", 7, "", "curl: (7) Failed to connect"),
+])
+def test_upload_logs_detailed_response(status, returncode, body, stderr, make_wheel, run_publish,
+                                      publisher, workspace, capsys):
+    make_wheel()
+    publisher.subprocess.run.return_value = subprocess.CompletedProcess([], returncode, f"{body}\n{status}", stderr)
+    code, _ = run_publish()
+    succeeded = returncode == 0 and status.startswith("2")
+    assert code == (0 if succeeded else 1)
+    captured = capsys.readouterr()
+    assert f"Artifactory response for {BATCH_URL}{WHEEL_NAME}" in captured.out
+    assert f"curl exit code {returncode}, HTTP {status}" in captured.out
+    assert "Response body:" in captured.out
+    for line in (body or "(empty)").splitlines():
+        assert f"  {line}\n" in captured.out
+    if stderr:
+        assert f"curl stderr:\n  {stderr}" in captured.out
+    else:
+        assert "curl stderr:" not in captured.out
+    if succeeded:
+        assert (workspace / "outputs").exists()
+    else:
+        assert not (workspace / "outputs").exists()
+        assert "Artifactory upload failed" in captured.err
+        assert "Uploaded:" not in captured.out
+
+
+@pytest.mark.parametrize("status,returncode", [("201", 0), ("401", 22)])
+def test_response_body_and_stderr_redact_credentials(status, returncode, make_wheel, run_publish,
+                                                    publisher, capsys):
+    make_wheel()
+    publisher.subprocess.run.return_value = subprocess.CompletedProcess(
+        [], returncode, f'{{"message": "test-user:test-user-token"}}\n{status}',
+        "Authentication for test-user failed with test-user-token",
+    )
+    code, _ = run_publish(RELEASE_TOKEN="test-user-token")
+    assert code == (0 if returncode == 0 else 1)
+    captured = capsys.readouterr()
+    assert "test-user" not in captured.out + captured.err
+    assert '"message": "***:***"' in captured.out
+    assert "Authentication for *** failed with ***" in captured.out
+    assert "--user" not in captured.out + captured.err
 
 
 def test_timeout_does_not_log_credentials(make_wheel, run_publish, publisher, capsys):
