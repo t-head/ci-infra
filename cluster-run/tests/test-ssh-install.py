@@ -41,14 +41,43 @@ def config_paths():
     return {key: Path(value) for key, value in re.findall(r'([\w:.-]+) "([^"]+)";', config)}
 
 
+def selected_sources(paths):
+    etc = paths["Dir::Etc"]
+    files = [etc / "sources.list", *sorted((etc / "sources.list.d").glob("*.list")),
+             *sorted((etc / "sources.list.d").glob("*.sources"))]
+    text = "\n".join(path.read_text() for path in files if path.is_file())
+    entries = re.findall(r"^deb\s+(?:\[([^\]]+)\]\s+)?(https?://\S+)\s+(\S+)\s+(.+)$",
+                         text, re.MULTILINE)
+    from urllib.parse import urlsplit
+    key = Path(os.environ["SSH_INSTALL_FIXTURE"]) / "system/usr/share/keyrings"
+    if not entries:
+        raise ValueError("missing private Aliyun sources")
+    for options, uri, _, _ in entries:
+        parsed = urlsplit(uri)
+        distro = "ubuntu" if parsed.path in ("/ubuntu", "/ubuntu-ports") else "debian"
+        if (parsed.scheme != "https" or parsed.netloc != "mirrors.aliyun.com"
+                or parsed.path not in ("/ubuntu", "/ubuntu-ports", "/debian", "/debian-security")
+                or f"signed-by={key}/{distro}-archive-keyring.gpg" not in options
+                or any(option in options.lower() for option in ("trusted=", "allow-", "allowunauthenticated"))):
+            raise ValueError("private Aliyun sources must retain HTTPS and the distro keyring")
+    targets = []
+    for _, uri, suite, components in entries:
+        parsed = urlsplit(uri)
+        prefix = parsed.netloc + parsed.path.rstrip("/").replace("/", "_") + "_dists_" + suite + "_"
+        targets.extend((prefix, suite, component) for component in components.split())
+    return targets, text
+
+
 def fake_command(tool, args):
     root = Path(os.environ["SSH_INSTALL_FIXTURE"])
     fixture = json.loads((root / "fixture.json").read_text())
+    source_targets, source_text = selected_sources(config_paths()) if tool == "apt-get" else ([], None)
     with (root / "calls.jsonl").open("a") as calls:
         calls.write(json.dumps({"tool": tool, "args": args,
                                "bounded": os.environ.get("SSH_INSTALL_TIMEOUT"),
                                "no_proxy": os.environ.get("no_proxy"),
-                               "NO_PROXY": os.environ.get("NO_PROXY")}) + "\n")
+                               "NO_PROXY": os.environ.get("NO_PROXY"),
+                               "sources": source_text}) + "\n")
     clock_path = root / "clock"
     if tool == "date":
         if args == ["+%s"]:
@@ -164,6 +193,11 @@ def fake_command(tool, args):
         for directive in ('APT::Get::AllowUnauthenticated "false"',
                           'Acquire::AllowInsecureRepositories "false"',
                           'Acquire::AllowWeakRepositories "false"',
+                          'Acquire::AllowDowngradeToInsecureRepositories "false"',
+                          'Acquire::https::Verify-Peer "true"',
+                          'Acquire::https::Verify-Host "true"',
+                          'Acquire::Check-Valid-Until "true"',
+                          'Acquire::Check-Date "true"',
                           'Dir::Etc::main "/dev/null"'):
             if directive not in config:
                 raise ValueError("missing APT trust isolation: " + directive)
@@ -183,11 +217,16 @@ def fake_command(tool, args):
             return 0
         if "indextargets" in args:
             format_string = args[args.index("--format") + 1]
+            arch = fixture.get("arch", "amd64")
             for source in lists.glob("*_Packages*"):
-                fields = {"FILENAME": str(source),
-                          "METAKEY": f"main/binary-{fixture.get('arch', 'amd64')}/Packages",
-                          "RELEASE": fixture.get("suite", "jammy")}
-                print(re.sub(r"\$\((\w+)\)", lambda m: fields[m[1]], format_string))
+                for prefix, suite, component in source_targets:
+                    metakey = f"{component}/binary-{arch}/Packages"
+                    if source.name not in (prefix + metakey.replace("/", "_"),
+                                           prefix + metakey.replace("/", "_") + ".lz4",
+                                           prefix + metakey.replace("/", "_") + ".gz"):
+                        continue
+                    fields = {"FILENAME": str(source), "METAKEY": metakey, "RELEASE": suite}
+                    print(re.sub(r"\$\((\w+)\)", lambda m: fields[m[1]], format_string))
             return 0
         if "install" not in args:
             raise ValueError(args)
@@ -308,15 +347,25 @@ class SSHInstallTests(unittest.TestCase):
         self.options.update(values)
         (self.root / "fixture.json").write_text(json.dumps(self.options))
 
-    def set_os(self, name="ubuntu", version="22.04"):
-        (self.system / "etc/os-release").write_text(f'ID={name}\nVERSION_ID="{version}"\n')
+    def set_os(self, name="ubuntu", version="22.04", codename=None):
+        text = f'ID={name}\nVERSION_ID="{version}"\n'
+        if codename is not None:
+            text += f'VERSION_CODENAME="{codename}"\n'
+        (self.system / "etc/os-release").write_text(text)
 
-    def issue_repo(self, detached=False, suite="jammy", expired=False, future=False, compressed=False):
+    def issue_repo(self, detached=False, suite=None, expired=False, future=False, compressed=False):
         repo = self.root / "repo"
         if repo.exists():
             shutil.rmtree(repo)
         (repo / "metadata").mkdir(parents=True)
         (repo / "debs").mkdir()
+        os_release = (self.system / "etc/os-release").read_text()
+        distro = re.search(r'^ID=(\w+)$', os_release, re.MULTILINE)[1]
+        version = re.search(r'^VERSION_ID="([^"]+)"$', os_release, re.MULTILINE)[1]
+        codename = {("ubuntu", "20.04"): "focal", ("ubuntu", "22.04"): "jammy",
+                    ("ubuntu", "24.04"): "noble", ("debian", "11"): "bullseye",
+                    ("debian", "12"): "bookworm", ("debian", "13"): "trixie"}[(distro, version)]
+        suite = suite or codename
         arch = self.options.get("arch", "amd64")
         stanzas = []
         for name, version in PACKAGES.items():
@@ -327,7 +376,10 @@ class SSHInstallTests(unittest.TestCase):
                            f"Filename: pool/main/{name}/{filename}\nSHA256: {digest(data)}\nSize: {len(data)}\n")
         packages = ("\n".join(stanzas) + "\n").encode()
         metakey = f"main/binary-{arch}/Packages"
-        prefix = f"mirror.example_ubuntu_dists_{self.options.get('suite', 'jammy')}_"
+        archive = distro
+        if distro == "ubuntu" and arch not in ("amd64", "i386"):
+            archive = "ubuntu-ports"
+        prefix = f"mirrors.aliyun.com_{archive}_dists_{suite}_"
         index = prefix + metakey.replace("/", "_") + (".gz" if compressed else ".lz4")
         if compressed:
             import gzip
@@ -336,7 +388,8 @@ class SSHInstallTests(unittest.TestCase):
             (repo / "metadata" / index).write_bytes(packages)
         def rfc(seconds):
             return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S UTC")
-        release = (f"Origin: Ubuntu\nSuite: {suite}\nCodename: {suite}\n"
+        origin = "Debian" if distro == "debian" else "Ubuntu"
+        release = (f"Origin: {origin}\nSuite: {suite}\nCodename: {suite}\n"
                    f"Date: {rfc(EPOCH + 100 if future else EPOCH - 60)}\n"
                    f"Valid-Until: {rfc(EPOCH - 1 if expired else EPOCH + 86400)}\nSHA256:\n"
                    f" {digest(packages)} {len(packages)} {metakey}\n")
@@ -353,8 +406,13 @@ class SSHInstallTests(unittest.TestCase):
         issued_path.write_text(json.dumps(issued))
 
     def run_installer(self, **env):
-        return subprocess.run([shutil.which("bash"), "--noprofile", "--norc", str(self.installer)],
-                              env={**self.env, **env}, text=True, capture_output=True, timeout=120)
+        apt = self.system / "etc/apt"
+        before = {str(p.relative_to(apt)): p.read_bytes() for p in apt.rglob("*") if p.is_file()}
+        result = subprocess.run([shutil.which("bash"), "--noprofile", "--norc", str(self.installer)],
+                                env={**self.env, **env}, text=True, capture_output=True, timeout=120)
+        self.assertEqual(before, {str(p.relative_to(apt)): p.read_bytes() for p in apt.rglob("*") if p.is_file()},
+                         "installer must not modify global APT sources")
+        return result
 
     def calls(self, tool=None):
         path = self.root / "calls.jsonl"
@@ -401,11 +459,20 @@ class SSHInstallTests(unittest.TestCase):
         self.assertEqual(len(list((generation / "debs").iterdir())), len(PACKAGES))
         key = generation.parent
         self.assertFalse(any("installed" in p.name for p in key.iterdir()))
+        updates = [call for call in self.calls("apt-get") if "update" in call["args"]]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["bounded"], "120")
+        self.assertIn("https://mirrors.aliyun.com/ubuntu jammy main", updates[0]["sources"])
+        self.assertTrue(all(p.name.startswith("mirrors.aliyun.com_ubuntu_dists_jammy_")
+                            for p in (generation / "metadata").iterdir()))
+        captures = [call for call in self.calls("dpkg-query") if "${binary:Package}" in " ".join(call["args"])]
+        self.assertEqual(len(captures), 1)
         self.fresh_job(offline=True)
         result = self.run_installer()
         self.success(result)
         self.assertIn("authenticated offline cache hit", result.stdout)
-        self.assertFalse(any("update" in c["args"] for c in self.calls("apt-get")))
+        self.assertFalse(any("update" in c["args"] or ("--download-only" in c["args"] and
+                             "--no-download" not in c["args"]) for c in self.calls("apt-get")))
         self.assertTrue(self.calls("gpgv"))
         self.assertTrue(self.calls("apt-helper"))
         self.assertEqual(self.generations(), [generation])
@@ -455,7 +522,7 @@ class SSHInstallTests(unittest.TestCase):
         (metadata / (prefix + "main_binary-amd64_Packages.lz4")).write_text("vendor index")
         result = self.run_installer()
         self.success(result)
-        self.assertIn("ignoring auxiliary index", result.stderr)
+        self.assertTrue(all("vendor.example" not in call["sources"] for call in self.calls("apt-get")))
         self.assertEqual(len(list((self.generations()[0] / "metadata").glob("*Packages*"))), 1)
         self.fresh_job(offline=True)
         self.success(self.run_installer())
@@ -603,13 +670,17 @@ class SSHInstallTests(unittest.TestCase):
         self.assertNotEqual(self.run_installer().returncode, 0)
         self.assertFalse(self.calls("gpgv"))
 
-    def test_source_and_local_keyring_fingerprint_isolation(self):
-        self.download_once()
-        (self.system / "etc/apt/sources.list").write_text("deb https://another-mirror/ubuntu jammy main\n")
+    def test_global_source_ignored_and_local_keyring_fingerprint_isolation(self):
+        generation = self.download_once()
+        source = self.system / "etc/apt/sources.list"
+        source.write_text("deb https://another-mirror/ubuntu jammy main\n")
         self.fresh_job(offline=True)
-        self.assertNotEqual(self.run_installer().returncode, 0)
-        self.assertFalse(self.calls("gpgv"))
-        (self.system / "etc/apt/sources.list").write_text("deb https://mirror.example/ubuntu jammy main\n")
+        self.success(self.run_installer())
+        self.assertEqual(self.generations(), [generation])
+        self.assertTrue(self.calls("gpgv"))
+        self.assertFalse(any("update" in call["args"] for call in self.calls("apt-get")))
+        self.assertTrue(all("another-mirror" not in call["sources"] for call in self.calls("apt-get")))
+        self.assertEqual(source.read_text(), "deb https://another-mirror/ubuntu jammy main\n")
         (self.system / "usr/share/keyrings/ubuntu-archive-keyring.gpg").write_text("rotated local key\n")
         self.fresh_job(offline=True)
         self.assertNotEqual(self.run_installer().returncode, 0)
@@ -620,7 +691,12 @@ class SSHInstallTests(unittest.TestCase):
         self.issue_repo(suite="noble")
         shutil.rmtree(generation / "metadata")
         shutil.copytree(self.root / "repo/metadata", generation / "metadata")
+        # Keep the selected Aliyun/jammy list names so only the genuinely signed
+        # Suite/Codename (noble) is wrong, not the indextargets URL binding.
+        for path in (generation / "metadata").iterdir():
+            path.rename(path.with_name(path.name.replace("noble", "jammy")))
         self.assert_offline_rejected()
+        self.assertTrue(any("indextargets" in call["args"] for call in self.calls("apt-get")))
 
     def test_expired_or_future_signed_metadata_rejected(self):
         for options in ({"expired": True}, {"future": True}):
@@ -663,20 +739,69 @@ class SSHInstallTests(unittest.TestCase):
 
     def test_debian_download(self):
         self.set_os("debian", "12")
+        self.issue_repo()
         self.download_once()
         self.assertIn("/debian/12/amd64/", str(self.generations()[0]))
 
-    def test_insecure_source_options_fail_closed(self):
+    def test_insecure_global_sources_never_enter_private_aliyun_config(self):
         for source in ("deb [trusted=yes] https://mirror.example/ubuntu jammy main\n",
                        "deb [allow-insecure=yes] https://mirror.example/ubuntu jammy main\n",
                        "Types: deb\nURIs: https://mirror.example/ubuntu\nTrusted:\n yes\n",
                        "deb [allowUnauthenticated=true] https://mirror.example/ubuntu jammy main\n"):
             with self.subTest(source=source):
                 (self.system / "etc/apt/sources.list").write_text(source)
+                (self.system / "etc/apt/sources.list.d/user.sources").write_text(source)
+                self.fresh_job(offline=bool(self.generations()))
+                self.success(self.run_installer())
+                self.assertTrue(self.calls("gpgv"))
+                for call in self.calls("apt-get"):
+                    self.assertNotIn("mirror.example", call["sources"])
+                    self.assertNotRegex(call["sources"].lower(), r"trusted=|allow-insecure|allowunauthenticated")
+        signature = next((self.generations()[0] / "metadata").glob("*InRelease"))
+        signature.write_text("attacker signature despite unsafe global sources")
+        self.assert_offline_rejected()
+
+    def test_aliyun_os_architecture_mapping_and_unknown_rejection(self):
+        for name, version, arch, codename, archive in (
+            ("ubuntu", "20.04", "amd64", "focal", "ubuntu"),
+            ("ubuntu", "22.04", "i386", "jammy", "ubuntu"),
+            ("ubuntu", "24.04", "amd64", "noble", "ubuntu"),
+            ("ubuntu", "24.04", "arm64", "noble", "ubuntu-ports"),
+            ("ubuntu", "22.04", "armhf", "jammy", "ubuntu-ports"),
+            ("debian", "11", "amd64", "bullseye", "debian"),
+            ("debian", "12", "amd64", "bookworm", "debian"),
+            ("debian", "13", "riscv64", "trixie", "debian"),
+        ):
+            with self.subTest(name=name, version=version, arch=arch):
+                self.set_os(name, version, codename)
+                self.fresh_job(arch=arch)
+                self.issue_repo()
+                self.success(self.run_installer())
+                calls = self.calls("apt-get")
+                self.assertEqual(sum("update" in call["args"] for call in calls), 1)
+                sources = calls[-1]["sources"]
+                security = "debian-security" if name == "debian" else archive
+                for repository, suite in ((archive, codename), (archive, codename + "-updates"),
+                                          (security, codename + "-security")):
+                    self.assertIn(f"https://mirrors.aliyun.com/{repository} {suite} ", sources)
+                self.assertIn("arch=" + arch, sources)
+                if name == "debian":
+                    self.assertNotIn("/ubuntu", sources)
+                else:
+                    self.assertNotIn("/debian", sources)
+        for name, version, codename, arch in (
+            ("ubuntu", "99.04", None, "amd64"), ("debian", "14", None, "amd64"),
+            ("ubuntu", "24.04", "jammy", "amd64"), ("debian", "12", "jammy", "amd64"),
+            ("ubuntu", "22.04", "jammy", "unknownarch"), ("debian", "11", "bullseye", "riscv64"),
+        ):
+            with self.subTest(name=name, version=version, arch=arch, codename=codename):
+                self.set_os(name, version, codename)
+                self.fresh_job(arch=arch)
                 result = self.run_installer()
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("insecure APT", result.stderr)
+                self.assertIn("unsupported OS version/codename/architecture", result.stderr)
                 self.assertFalse(self.calls("apt-get"))
+                self.assertFalse(list((self.root / "nas").glob("**/.lock")))
 
     def test_download_fail_and_missing_dependency_never_install_or_publish(self):
         for option in ("update_fail", "download_fail", "missing_dependency"):
@@ -700,6 +825,7 @@ class SSHInstallTests(unittest.TestCase):
         self.assertFalse((self.root / "installed").exists())
         timeouts = self.calls("timeout")
         self.assertTrue(any("3s" in call["args"] and "apt-get" in call["args"] for call in timeouts))
+        self.assertTrue(all(int(call["bounded"]) <= 3 for call in self.calls("apt-get")))
 
     def test_busy_lock_is_bounded_without_deleting_other_lock(self):
         generation = self.download_once()

@@ -513,7 +513,13 @@ class StagingTests(unittest.TestCase):
         job = self.workflow["jobs"]["ssh-cache-check"]
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(job["needs"], "checks")
+        self.assertNotIn("strategy", job)
         scripts = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertIn("mirrors.aliyun.com", scripts)
+        self.assertIn('"$image" /bin/bash /action/install-ssh.sh 2>&1', scripts)
+        self.assertIn("/etc/ssl/certs/ca-certificates.crt:ro", scripts)
+        self.assertNotIn("SOURCE_MODE", scripts)
+        self.assertNotIn("127.0.0.1:1", scripts)
         for required in ("docker pull ubuntu:24.04", "docker image inspect", "--network none",
                          "/action/install-ssh.sh", "authenticated offline cache hit",
                          "published authenticated dependency cache", "/cache/openssh:ro"):

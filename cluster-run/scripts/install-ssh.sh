@@ -94,26 +94,8 @@ KEYRING=/usr/share/keyrings/${ID}-archive-keyring.gpg
 cp "$KEYRING" "$WORK/distro-keyring.gpg"
 mkdir -p "$WORK/etc/sources.list.d" "$WORK/etc/apt.conf.d" "$WORK/lists/partial" \
   "$WORK/archives/partial" "$WORK/gnupg"
-[ ! -f /etc/apt/sources.list ] || cp /etc/apt/sources.list "$WORK/etc/sources.list"
-for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-  [ -f "$source" ] || continue
-  cp "$source" "$WORK/etc/sources.list.d/"
-done
-# Ignore global apt.conf (including hooks/insecure overrides). Conservatively
-# reject trust/expiry overrides, including multiline Deb822 values, rather than
-# trying to interpret every APT spelling. Commented entries are harmless.
-files=( )
-for source in "$WORK/etc/sources.list" "$WORK/etc/sources.list.d/"*.list "$WORK/etc/sources.list.d/"*.sources; do
-  [ ! -f "$source" ] || files[${#files[@]}]="$source"
-done
-[ "${#files[@]}" -gt 0 ] || fail 'no existing APT sources'
-awk '
-  /^[[:space:]]*#/ { next }
-  { s=tolower($0); if (s ~ /(^|[[:space:]\[])trusted[[:space:]:=]/ ||
-       s ~ /allow-(insecure|weak|downgrade-to-insecure|unauthenticated)/ ||
-       s ~ /allowunauthenticated/ || s ~ /check-(valid-until|date)/) bad=1 }
-  END { exit bad }
-' "${files[@]}" || fail 'insecure APT source options are not accepted'
+# Global APT sources and configuration are neither read nor copied. Only the
+# private, signed Aliyun sources below participate in resolution and cache keys.
 cat > "$WORK/apt.conf" <<EOF
 Dir::Etc "$WORK/etc";
 Dir::Etc::main "/dev/null";
@@ -130,6 +112,8 @@ APT::Get::AllowUnauthenticated "false";
 Acquire::AllowInsecureRepositories "false";
 Acquire::AllowWeakRepositories "false";
 Acquire::AllowDowngradeToInsecureRepositories "false";
+Acquire::https::Verify-Peer "true";
+Acquire::https::Verify-Host "true";
 Acquire::Check-Valid-Until "true";
 Acquire::Check-Date "true";
 Acquire::Retries "0";
@@ -140,17 +124,57 @@ EOF
 export APT_CONFIG="$WORK/apt.conf"
 ARCH=$(dpkg --print-architecture)
 case "$ARCH" in ''|*[!a-z0-9-]*) fail 'invalid dpkg architecture' ;; esac
-# Capture the source/keyring AND complete base package state BEFORE installation.
-# The manifest cannot select its cache key, nor introduce another trust root.
+prepare_aliyun_sources() {
+  local codename archive security
+  case "$ID/$VERSION_ID" in
+    ubuntu/20.04) codename=focal ;;
+    ubuntu/22.04) codename=jammy ;;
+    ubuntu/24.04) codename=noble ;;
+    debian/11) codename=bullseye ;;
+    debian/12) codename=bookworm ;;
+    debian/13) codename=trixie ;;
+    *) return 1 ;;
+  esac
+  # An image with contradictory os-release fields must never change release.
+  [ "${VERSION_CODENAME:-$codename}" = "$codename" ] || return 1
+  [ "$ID" != ubuntu ] || [ "${UBUNTU_CODENAME:-$codename}" = "$codename" ] || return 1
+  if [ "$ID" = ubuntu ]; then
+    case "$ARCH" in
+      amd64|i386) archive=https://mirrors.aliyun.com/ubuntu ;;
+      arm64|armhf|ppc64el|riscv64|s390x) archive=https://mirrors.aliyun.com/ubuntu-ports ;;
+      *) return 1 ;;
+    esac
+    security=$archive
+    printf 'deb [arch=%s signed-by=%s] %s %s main restricted universe multiverse\n' \
+      "$ARCH" "$KEYRING" "$archive" "$codename" \
+      "$ARCH" "$KEYRING" "$archive" "$codename-updates" \
+      "$ARCH" "$KEYRING" "$security" "$codename-security" > "$WORK/etc/sources.list"
+  else
+    case "$VERSION_ID/$ARCH" in
+      11/amd64|11/arm64|11/armel|11/armhf|11/i386|11/mips64el|11/mipsel|11/ppc64el|11/s390x|\
+      12/amd64|12/arm64|12/armel|12/armhf|12/i386|12/mips64el|12/mipsel|12/ppc64el|12/s390x|\
+      13/amd64|13/arm64|13/armel|13/armhf|13/i386|13/ppc64el|13/riscv64|13/s390x) ;;
+      *) return 1 ;;
+    esac
+    printf 'deb [arch=%s signed-by=%s] %s %s main\n' \
+      "$ARCH" "$KEYRING" https://mirrors.aliyun.com/debian "$codename" \
+      "$ARCH" "$KEYRING" https://mirrors.aliyun.com/debian "$codename-updates" \
+      "$ARCH" "$KEYRING" https://mirrors.aliyun.com/debian-security "$codename-security" > "$WORK/etc/sources.list"
+  fi
+}
+clear_package_state() {
+  rm -rf "$WORK/lists" "$WORK/archives" "$WORK/verified" "$WORK/snapshot"
+  mkdir -p "$WORK/lists/partial" "$WORK/archives/partial"
+}
+prepare_aliyun_sources || fail "unsupported OS version/codename/architecture: $ID/$VERSION_ID/$ARCH"
+# Capture the selected Aliyun source/keyring and base package state exactly once,
+# before installation. Neither a manifest nor NAS can select another trust root.
+dpkg-query -W -f='${binary:Package}|${Version}|${Architecture}|${Status}\n' | sort > "$WORK/base-packages"
 {
-  printf '%s\n' 'signed-openssh-cache-v1' "$ID" "$VERSION_ID" "$ARCH"
-  for source in "$WORK/etc/sources.list" "$WORK/etc/sources.list.d/"*.list "$WORK/etc/sources.list.d/"*.sources; do
-    [ -f "$source" ] || continue
-    printf '%s\n' "${source#"$WORK/etc/"}"
-    sha256sum "$source" | awk '{print $1}'
-  done
+  printf '%s\n' 'signed-openssh-cache-v1' "$ID" "$VERSION_ID" "$ARCH" 'sources.list'
+  sha256sum "$WORK/etc/sources.list" | awk '{print $1}'
   sha256sum "$WORK/distro-keyring.gpg" | awk '{print $1}'
-  dpkg-query -W -f='${binary:Package}|${Version}|${Architecture}|${Status}\n' | sort
+  cat "$WORK/base-packages"
 } > "$WORK/fingerprint"
 FINGERPRINT=$(sha256sum "$WORK/fingerprint" | awk '{print $1}')
 KEY="$CACHE/$ID/$VERSION_ID/$ARCH/$FINGERPRINT"
@@ -278,7 +302,7 @@ verify_bundle() {
     esac
   done < "$bundle/MANIFEST"
   [ "$count" -gt 0 ] && [ "$deb_count" -gt 0 ] || return 1
-  # Bind list names/MetaKeys and signed Suite/Codename to the EXISTING sources.
+  # Bind list names/MetaKeys and signed Suite/Codename to the SELECTED sources.
   # indextargets reads local state; it does not perform network requests.
   apt_run indextargets --format '$(FILENAME)|$(METAKEY)|$(RELEASE)' > "$WORK/targets" || return 1
   while IFS='|' read -r base metakey ident; do
@@ -358,43 +382,45 @@ make_bundle() {
   printf 'signed-openssh-cache-v1\n' > "$bundle/COMPLETE"
 }
 
-# Bounded NAS lock. A busy/unwritable NAS never prevents a trusted local install.
-if bounded mkdir -p "$KEY" 2>/dev/null; then
-  lock_start=$(date +%s)
-  while :; do
-    if bounded mkdir "$KEY/.lock" 2>/dev/null; then LOCK="$KEY/.lock"; break; fi
-    now=$(date +%s)
-    if [ "$((now - lock_start))" -ge 15 ]; then warn 'cache lock busy; using local APT without backfill'; break; fi
-    remaining >/dev/null || fail 'deadline while waiting for cache lock'
-    bounded sleep 1 || fail 'deadline while waiting for cache lock'
-  done
-else
-  warn 'cache is not writable; trusted local install will not be backfilled'
-fi
-HIT=0
-# Read immutable COMPLETE generations even if NAS is read-only or its lock is busy.
-if ! bounded find "$KEY" -mindepth 1 -maxdepth 1 -type d -name 'generation-*' \
-    -print > "$WORK/generations" 2>/dev/null; then
-  warn 'cache discovery unavailable; using trusted APT'
-fi
-while IFS= read -r generation; do
-  case "$generation" in "$KEY"/generation-*) ;; *) continue ;; esac
-  safe_name "${generation##*/}" || continue
-  rm -rf "$WORK/snapshot" "$WORK/lists" "$WORK/archives" "$WORK/verified"
-  mkdir -p "$WORK/lists/partial" "$WORK/archives/partial"
-  # Copy the directory itself without following a replaced top-level symlink.
-  if bounded cp -R -P "$generation" "$WORK/snapshot" && verify_bundle "$WORK/snapshot"; then
-    HIT=1
-    printf 'install-ssh: authenticated offline cache hit\n'
-    break
+cache_lookup() {
+  local lock_start now generation
+  # Bounded NAS lock. A busy/unwritable NAS never prevents a trusted local install.
+  if bounded mkdir -p "$KEY" 2>/dev/null; then
+    lock_start=$(date +%s)
+    while :; do
+      if bounded mkdir "$KEY/.lock" 2>/dev/null; then LOCK="$KEY/.lock"; break; fi
+      now=$(date +%s)
+      if [ "$((now - lock_start))" -ge 15 ]; then warn 'cache lock busy; using local APT without backfill'; break; fi
+      remaining >/dev/null || fail 'deadline while waiting for cache lock'
+      bounded sleep 1 || fail 'deadline while waiting for cache lock'
+    done
+  else
+    warn 'cache is not writable; trusted local install will not be backfilled'
   fi
-  warn "rejected incomplete, incompatible or unauthenticated cache: ${generation##*/}"
-done < "$WORK/generations"
+  HIT=0
+  # Read immutable COMPLETE generations even if NAS is read-only or its lock is busy.
+  if ! bounded find "$KEY" -mindepth 1 -maxdepth 1 -type d -name 'generation-*' \
+      -print > "$WORK/generations" 2>/dev/null; then
+    warn 'cache discovery unavailable; using trusted APT'
+  fi
+  while IFS= read -r generation; do
+    case "$generation" in "$KEY"/generation-*) ;; *) continue ;; esac
+    safe_name "${generation##*/}" || continue
+    clear_package_state
+    # Copy the directory itself without following a replaced top-level symlink.
+    if bounded cp -R -P "$generation" "$WORK/snapshot" && verify_bundle "$WORK/snapshot"; then
+      HIT=1
+      printf 'install-ssh: authenticated offline cache hit\n'
+      break
+    fi
+    warn "rejected incomplete, incompatible or unauthenticated cache: ${generation##*/}"
+  done < "$WORK/generations"
+}
+cache_lookup
 if [ "$HIT" = 0 ]; then
   remaining >/dev/null || fail 'deadline before trusted APT download'
-  rm -rf "$WORK/lists" "$WORK/archives" "$WORK/verified" "$WORK/snapshot"
-  mkdir -p "$WORK/lists/partial" "$WORK/archives/partial"
-  apt_run -o APT::Update::Error-Mode=any update || fail 'signed APT update failed'
+  clear_package_state
+  apt_run -o APT::Update::Error-Mode=any update || fail 'signed Aliyun APT update failed'
   apt_run --yes --no-remove --download-only install openssh-server openssh-client jq || fail 'APT dependency download failed'
   make_bundle "$WORK/download" || fail 'cannot preserve signed APT metadata/dependency bundle for verification'
   # Apply precisely the same verification chain to downloads and hits.

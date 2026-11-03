@@ -300,7 +300,7 @@ jobs:
           fi
 
   ssh-cache-check:
-    name: Verify real APT download and offline cache reuse
+    name: Verify Aliyun APT download and offline cache reuse
     needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -323,16 +323,19 @@ jobs:
             -e PPU_DEADLINE="$deadline" \
             -v "$PWD/cluster-run/scripts:/action:ro" \
             -v "$cache:/mnt/wl_nas/devops/cache/openssh" \
-            "$image" /bin/bash /action/install-ssh.sh \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+            "$image" /bin/bash /action/install-ssh.sh 2>&1 \
             | tee "$RUNNER_TEMP/openssh-download.log"
           grep -q 'published authenticated dependency cache' "$RUNNER_TEMP/openssh-download.log"
+          test -n "$(sudo find "$cache" -path '*metadata/mirrors.aliyun.com*InRelease' -type f -print -quit)"
           test -n "$(sudo find "$cache" -name COMPLETE -type f -print -quit)"
           deadline="$(( $(date +%s) + 600 ))"
           docker run --rm --network none \
             -e PPU_DEADLINE="$deadline" \
             -v "$PWD/cluster-run/scripts:/action:ro" \
             -v "$cache:/mnt/wl_nas/devops/cache/openssh:ro" \
-            "$image" /bin/bash /action/install-ssh.sh \
+            -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+            "$image" /bin/bash /action/install-ssh.sh 2>&1 \
             | tee "$RUNNER_TEMP/openssh-offline.log"
           grep -q 'authenticated offline cache hit' "$RUNNER_TEMP/openssh-offline.log"
 
