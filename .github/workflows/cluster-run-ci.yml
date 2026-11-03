@@ -423,7 +423,7 @@ jobs:
             -v /etc/ssl/certs/ca-certificates.crt:/etc/pki/tls/certs/ca-bundle.crt:ro \
             "$image" /bin/bash -c "$smoke" 2>&1 \
             | tee "$RUNNER_TEMP/rpm-offline.log"
-          grep -qi 'offline cache hit' "$RUNNER_TEMP/rpm-offline.log"
+          grep -q 'authenticated offline RPM cache hit' "$RUNNER_TEMP/rpm-offline.log"
 
   master-lifecycle-check:
     name: Inspect ${{ matrix.label }} lifecycle

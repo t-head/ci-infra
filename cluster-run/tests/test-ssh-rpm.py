@@ -188,6 +188,8 @@ def fake_command(tool, args):
                 print("\n".join(package["provides"]))
             elif "--requires" in args:
                 print("\n".join(package["requires"]))
+            elif "--list" in args:
+                print("\n".join(package.get("files", [])))
             else:
                 raise AssertionError(args)
             return 0
@@ -222,7 +224,8 @@ def fake_command(tool, args):
             assert "--setopt=tsflags=test" in args and "--setopt=keepcache=1" in args
             if fixture.get("offline") or fixture.get("download_fail"):
                 return 1
-            cache = Path(fields["cachedir"]) / "actual-repo-id/packages"
+            layout = "x86_64/7/actual-repo-id/packages" if fixture.get("yum_cache_layout") else "actual-repo-id/packages"
+            cache = Path(fields["cachedir"]) / layout
             cache.mkdir(parents=True, exist_ok=True)
             for source in (root / "repo").glob("*.rpm"):
                 if fixture.get("missing_dependency") and source.name.startswith("oniguruma-"):
@@ -354,9 +357,10 @@ class SSHRPMTests(unittest.TestCase):
             return "RPM-GPG-KEY-EPEL-7" if package in ("jq", "oniguruma") else "RPM-GPG-KEY-CentOS-7"
         return "RPM-GPG-KEY-CentOS-Official"
 
-    def issue_package(self, name, version="1.0", provides=None, requires=None, destination=None):
+    def issue_package(self, name, version="1.0", provides=None, requires=None, destination=None, files=None):
         package = {"name": name, "version": version, "arch": self.options.get("arch", "x86_64"),
-                   "provides": provides or [name + " = " + version + "-1"], "requires": requires or []}
+                   "provides": provides or [name + " = " + version + "-1"], "requires": requires or [],
+                   "files": files or []}
         data = json.dumps(package, sort_keys=True).encode()
         path = (destination or self.root / "repo") / f"{name}-{version}-1.{package['arch']}.rpm"
         path.write_bytes(data)
@@ -445,6 +449,24 @@ class SSHRPMTests(unittest.TestCase):
         self.assertTrue(all("--cacheonly" in c["args"] for c in self.calls("yum")))
         self.assertEqual(self.generations(), [generation])
         self.assertEqual(len([c for c in self.calls("rpm") if "-qa" in c["args"]]), 1)
+
+    def test_signed_file_dependencies_work_without_find(self):
+        self.fixture(yum_cache_layout=True)
+        tool = self.root / "bin/find"
+        tool.write_text("#!/bin/sh\nexit 99\n")
+        tool.chmod(0o755)
+        self.issue_package("openssh-clients", VERSIONS["openssh-clients"],
+                           requires=["openssh = 7.4p1-1", "fipscheck-lib(x86-64) >= 1.3.0"])
+        self.issue_package("fipscheck-lib", provides=["fipscheck-lib(x86-64) = 1.4.1-1"],
+                           requires=["/usr/bin/fipscheck"])
+        self.issue_package("fipscheck", files=["/usr/bin/fipscheck"])
+        generation = self.download_once()
+        self.assertTrue(list((generation / "rpms").glob("fipscheck-*.rpm")))
+        self.fresh_job(offline=True)
+        result = self.run_installer()
+        self.success(result)
+        self.assertIn("authenticated offline RPM cache hit", result.stdout)
+        self.assertTrue([c for c in self.calls("rpm") if "--list" in c["args"]])
 
     def test_sshd_preparation_preserves_existing_account(self):
         self.download_once()

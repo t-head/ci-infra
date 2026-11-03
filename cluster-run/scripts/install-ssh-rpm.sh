@@ -2,6 +2,7 @@
 set -euo pipefail
 export LC_ALL=C
 umask 077
+shopt -s nullglob dotglob
 CACHE=/mnt/wl_nas/devops/cache/openssh/rpm
 WORK=
 LOCK=
@@ -43,7 +44,7 @@ remaining >/dev/null || fail 'PPU_DEADLINE expired'
 [ -r /etc/os-release ] || fail 'missing /etc/os-release'
 # Only the local system os-release is sourced. NAS manifests are never executable.
 . /etc/os-release
-for tool in rpm rpmkeys timeout sha256sum awk sort find cp mktemp; do
+for tool in rpm rpmkeys timeout sha256sum awk sort cp mktemp; do
   command -v "$tool" >/dev/null || fail "required tool unavailable: $tool"
 done
 if command -v dnf >/dev/null; then PM=dnf
@@ -261,13 +262,9 @@ verify_bundle() {
   [ "$(wc -c < "$bundle/COMPLETE")" -le 64 ] && [ "$(< "$bundle/COMPLETE")" = "$SCHEMA" ] || return 1
   [ "$(wc -c < "$bundle/MANIFEST")" -le 1048576 ] || return 1
   [ -d "$bundle/rpms" ] && [ ! -L "$bundle/rpms" ] || return 1
-  bounded find "$bundle" -mindepth 1 ! -type f ! -type d -print > "$WORK/special" || return 1
-  [ ! -s "$WORK/special" ] || return 1
-  # Flat schema: unknown files/directories cannot smuggle extra installation RPMs.
-  bounded find "$bundle" -mindepth 1 -maxdepth 1 -print > "$WORK/top" || return 1
-  while IFS= read -r file; do
+  for file in "$bundle"/*; do
     case "$file" in "$bundle/COMPLETE"|"$bundle/MANIFEST"|"$bundle/rpms") ;; *) return 1 ;; esac
-  done < "$WORK/top"
+  done
   rm -rf "$WORK/verified"
   mkdir -p "$WORK/verified"
   : > "$WORK/names"; : > "$WORK/provides"; : > "$WORK/requires"
@@ -278,7 +275,7 @@ verify_bundle() {
     [ ! -e "$WORK/verified/$file" ] && [ ! -L "$WORK/verified/$file" ] || return 1
     [ -f "$bundle/rpms/$file" ] && [ ! -L "$bundle/rpms/$file" ] || return 1
     bounded cp -P "$bundle/rpms/$file" "$WORK/verified/$file" || return 1
-    signature_ok "$WORK/verified/$file" || return 1
+    signature_ok "$WORK/verified/$file" || { warn "RPM signature rejected: $file"; return 1; }
     info=$(bounded rpm -qp --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' "$WORK/verified/$file") || return 1
     case "$info" in *$'\n'*) return 1 ;; esac
     IFS='|' read -r name epoch version release architecture extra <<< "$info"
@@ -289,17 +286,20 @@ verify_bundle() {
     printf '%s|%s\n' "$file" "$name" >> "$WORK/names"
     bounded rpm -qp --provides "$WORK/verified/$file" > "$WORK/header-provides" || return 1
     bounded rpm -qp --requires "$WORK/verified/$file" > "$WORK/header-requires" || return 1
-    awk -v f="$file" 'NF {print f "|" $1}' "$WORK/header-provides" >> "$WORK/provides" || return 1
+    bounded rpm -qp --list "$WORK/verified/$file" > "$WORK/header-files" || return 1
+    # File-path dependencies are provided by the signed file list, not --provides.
+    awk -v f="$file" 'NF {print f "|" $1}' "$WORK/header-provides" "$WORK/header-files" >> "$WORK/provides" || return 1
     awk -v f="$file" 'NF {print f "|" $0}' "$WORK/header-requires" >> "$WORK/requires" || return 1
     RPMS+=("$WORK/verified/$file")
     count=$((count + 1)); [ "$count" -le 2048 ] || return 1
   done < "$bundle/MANIFEST"
   [ "$count" -gt 0 ] || return 1
-  bounded find "$bundle/rpms" -mindepth 1 -maxdepth 1 -type f -print > "$WORK/actual-rpms" || return 1
-  actual=$(wc -l < "$WORK/actual-rpms")
+  actual=0
+  for file in "$bundle/rpms"/*; do
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    actual=$((actual + 1))
+  done
   [ "$actual" -eq "$count" ] || return 1
-  bounded find "$bundle/rpms" -mindepth 1 -type d -print > "$WORK/nested" || return 1
-  [ ! -s "$WORK/nested" ] || return 1
   for target in openssh-server openssh-clients jq; do
     if ! awk -F '|' -v t="$target" '$2 == t {found=1} END {exit !found}' "$WORK/names"; then
       installed_target "$target" || return 1
@@ -323,24 +323,31 @@ verify_bundle() {
       changed=1
       while(changed) {changed=0; for(i=1;i<=nr;i++) if(selected[r[i]])
         for(j=1;j<=np;j++) if(!selected[p[j]] && contains(req[i],cap[j])) {selected[p[j]]=1; changed=1}}
-      for(f in names) if(!selected[f]) exit 1
+      for(f in names) if(!selected[f]) {
+        print "install-ssh-rpm: RPM outside requested dependency closure: " f > "/dev/stderr"
+        exit 1
+      }
     }' "$WORK/names" "$WORK/provides" "$WORK/requires" || return 1
   # No install, scripts, service actions, dependency downloads or downgrades.
-  bounded rpm -U --test --noscripts --notriggers "${RPMS[@]}" > "$WORK/transaction-test" 2>&1 || return 1
+  if ! bounded rpm -U --test --noscripts --notriggers "${RPMS[@]}" > "$WORK/transaction-test" 2>&1; then
+    /bin/cat "$WORK/transaction-test" >&2
+    return 1
+  fi
 }
 make_bundle() {
   local bundle=$1 file base count=0
   mkdir -p "$bundle/rpms"
   : > "$bundle/MANIFEST"
-  bounded find "$WORK/pm-cache" -type f -path '*/packages/*.rpm' -print > "$WORK/downloaded" || return 1
-  while IFS= read -r file; do
+  # YUM adds architecture/release directories; DNF uses one repository directory.
+  for file in "$WORK/pm-cache"/packages/*.rpm "$WORK/pm-cache"/*/packages/*.rpm \
+      "$WORK/pm-cache"/*/*/packages/*.rpm "$WORK/pm-cache"/*/*/*/packages/*.rpm; do
     safe_directory "${file%/*}" && [ ! -L "$file" ] || return 1
     base=${file##*/}; safe_name "$base" || return 1
     [ ! -e "$bundle/rpms/$base" ] || return 1
     bounded cp -P "$file" "$bundle/rpms/$base" || return 1
     printf 'rpm|%s\n' "$base" >> "$bundle/MANIFEST"
     count=$((count + 1))
-  done < "$WORK/downloaded"
+  done
   [ "$count" -gt 0 ] || return 1
   printf '%s\n' "$SCHEMA" > "$bundle/COMPLETE"
 }
@@ -359,10 +366,7 @@ cache_lookup() {
     done
   else warn 'cache is not writable; local install will not be backfilled'; fi
   safe_directory "$KEY" || return 0
-  if ! bounded find "$KEY" -mindepth 1 -maxdepth 1 -type d -name 'generation-*' -print > "$WORK/generations" 2>/dev/null; then
-    warn 'cache discovery unavailable; using trusted local download'
-  fi
-  while IFS= read -r generation; do
+  for generation in "$KEY"/generation-*; do
     case "$generation" in "$KEY"/generation-*) ;; *) continue ;; esac
     safe_name "${generation##*/}" && safe_directory "$generation" || continue
     rm -rf "$WORK/snapshot"
@@ -373,7 +377,7 @@ cache_lookup() {
       return 0
     fi
     warn "rejected incomplete, incompatible or unauthenticated RPM cache: ${generation##*/}"
-  done < "$WORK/generations"
+  done
 }
 # Fresh offline images need the pinned vendor keys for package-manager checks.
 for ((i=0; i<${#KEY_NAMES[@]}; i++)); do

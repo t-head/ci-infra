@@ -538,13 +538,18 @@ class StagingTests(unittest.TestCase):
         script = "\n".join(step.get("run", "") for step in job["steps"])
         for expected in ("docker image inspect", "/action/install-ssh.sh", "--network none",
                          "AuthenticationMethods publickey", "ChallengeResponseAuthentication no",
-                         "cluster_ssh_options", "rpm-ssh-ok", "COMPLETE", "offline cache hit"):
+                         "cluster_ssh_options", "rpm-ssh-ok", "COMPLETE", "authenticated offline RPM cache hit"):
             self.assertIn(expected, script)
         self.assertIn("-o StrictHostKeyChecking=yes", (ACTION / "scripts/master-worker.sh").read_text())
         self.assertNotIn("--privileged", script)
         self.assertNotIn("--nogpgcheck", script)
         self.assertEqual(script.count('"$image" /bin/bash -c "$smoke"'), 2,
                          "Cold and fresh offline containers must both authenticate against real sshd")
+        assertion = next(line for line in script.splitlines() if line.startswith("grep -") and "rpm-offline.log" in line)
+        log = self.root / "rpm-offline.log"
+        log.write_text("install-ssh-rpm: authenticated offline RPM cache hit\n")
+        result = self.shell(assertion.replace('$RUNNER_TEMP/rpm-offline.log', str(log)), self.env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_ci_master_matrix_and_trusted_runner_gate(self):
         job = self.master_job()
