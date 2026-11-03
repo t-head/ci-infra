@@ -2,6 +2,7 @@
 
 import ast
 import base64
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
@@ -34,8 +35,14 @@ DEFAULT_INPUTS = {
     "os": "ubuntu24.04", "python": "3.12", "hggcrt": "3",
     "sdk_version": "2.2.0", "torch": "2.13.0", "network": "mellanox/EIC",
 }
-IMAGE = "download.t-head.cn/docker_release/team/demo:1.0.0"
+REVISION = "v1.2.3"
+IMAGE = f"download.t-head.cn/docker_release/team/demo-{REVISION}:1.0.0"
 DIGEST = "sha256:" + "a" * 64
+FREEZE_OUTPUT = "numpy==2.1.0\ntorch==2.5.8\n"
+PACKAGE_LIST = [
+    {"packageName": "numpy", "packageVersion": "2.1.0"},
+    {"packageName": "torch", "packageVersion": "2.5.8"},
+]
 
 
 def load_module(name, path, monkeypatch):
@@ -54,6 +61,10 @@ def validator(monkeypatch):
 @pytest.fixture
 def post_module(validator, monkeypatch):
     module = load_module("docker_release_post_data", POST_SCRIPT, monkeypatch)
+    monkeypatch.setattr(module, "subprocess", SimpleNamespace(
+        run=Mock(return_value=SimpleNamespace(stdout=FREEZE_OUTPUT)),
+        SubprocessError=subprocess.SubprocessError,
+    ))
     monkeypatch.setattr(module, "requests", SimpleNamespace(
         post=Mock(side_effect=AssertionError("Real HTTP requests are prohibited in tests")),
         RequestException=requests.RequestException,
@@ -61,17 +72,41 @@ def post_module(validator, monkeypatch):
     return module
 
 
+def run_git(source, *args, input=""):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
+               GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.invalid",
+               GIT_AUTHOR_DATE="2026-10-28T00:00:00+00:00", GIT_COMMITTER_DATE="2026-10-28T00:00:00+00:00")
+    return subprocess.run(
+        ["git", "-C", str(source), *args], input=input, env=env,
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+
+
 @pytest.fixture
-def source():
+def git_source():
     with tempfile.TemporaryDirectory(prefix=".release-docker-test-", dir=ROOT) as directory:
         root = Path(directory).resolve()
         (root / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        run_git(root, "init", "--quiet")
+        tree = run_git(root, "mktree")
+        commit = run_git(root, "commit-tree", tree, "-m", "Test source")
+        run_git(root, "update-ref", "HEAD", commit)
         yield root
+
+
+@pytest.fixture
+def source(git_source):
+    run_git(git_source, "tag", REVISION)
+    return git_source
 
 
 @pytest.fixture
 def release_env(monkeypatch):
     monkeypatch.setenv("INPUTS_JSON", json.dumps(DEFAULT_INPUTS))
+    monkeypatch.setenv("SOURCE_REVISION", REVISION)
+    monkeypatch.setenv("RESOLVED_DOCKER_TAG", DEFAULT_INPUTS["docker_tag"])
     monkeypatch.setenv("IMAGE", IMAGE)
     monkeypatch.setenv("DIGEST", DIGEST)
     monkeypatch.setenv("SIZE", "123456789")
@@ -84,6 +119,7 @@ def test_allowed_network_values_preserved_without_changing_image(validator, sour
     assert validator.release_metadata(inputs) == {key: inputs[key] for key in FIELDS}
     assert validator.validate_inputs(inputs, source) == {
         "image": IMAGE, "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
+        "source_revision": REVISION, "docker_tag": "1.0.0",
     }
 
 
@@ -148,6 +184,106 @@ def test_invalid_tags(validator, tag):
         validator.image_reference("demo", tag)
 
 
+@pytest.mark.parametrize("tag_kind", [None, "lightweight", "annotated"])
+@pytest.mark.parametrize("docker_tag", [None, "", "custom-1.0"])
+def test_resolved_image_flows_to_release_data(
+    validator, post_module, release_env, git_source, monkeypatch, tag_kind, docker_tag,
+):
+    revision = run_git(git_source, "rev-parse", "HEAD")
+    if tag_kind:
+        args = ("-a", "-m", "Test release") if tag_kind == "annotated" else ()
+        run_git(git_source, "tag", *args, REVISION)
+        revision = REVISION
+    inputs = dict(DEFAULT_INPUTS)
+    inputs.pop("docker_tag")
+    if docker_tag is not None:
+        inputs["docker_tag"] = docker_tag
+    clock = SimpleNamespace(now=Mock(return_value=datetime(2026, 10, 28, 23, 59, tzinfo=timezone.utc)))
+    monkeypatch.setattr(validator, "datetime", clock)
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    monkeypatch.setenv("GITHUB_REF_NAME", "unrelated-branch")
+    outputs = validator.validate_inputs(inputs, git_source)
+    expected_tag = docker_tag or "2026-10-28"
+    expected_image = f"download.t-head.cn/docker_release/team/demo-{revision}:{expected_tag}"
+    assert outputs["image"] == expected_image
+    assert outputs["source_revision"] == revision
+    assert outputs["docker_tag"] == expected_tag
+    if docker_tag:
+        clock.now.assert_not_called()
+    else:
+        clock.now.assert_called_once_with(timezone.utc)
+    clock.now.side_effect = AssertionError("Publishing must reuse the resolved date even across midnight")
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
+    monkeypatch.setenv("SOURCE_REVISION", outputs["source_revision"])
+    monkeypatch.setenv("RESOLVED_DOCKER_TAG", outputs["docker_tag"])
+    monkeypatch.setenv("IMAGE", outputs["image"])
+    record = post_module.read_record()
+    assert record["docker_name"] == "team/demo"
+    assert record["docker_tag"] == expected_tag
+    assert record["image"] == expected_image
+    assert record["idempotentKey"] == hashlib.md5(expected_image.encode(), usedforsecurity=False).hexdigest()
+    assert post_module.build_payload(record)["image"] == expected_image
+
+
+def test_ancestor_tag_does_not_replace_current_commit(validator, source):
+    parent = run_git(source, "rev-parse", "HEAD")
+    tree = run_git(source, "rev-parse", "HEAD^{tree}")
+    commit = run_git(source, "commit-tree", tree, "-p", parent, "-m", "Untagged child")
+    run_git(source, "update-ref", "HEAD", commit)
+    assert validator.validate_inputs(DEFAULT_INPUTS, source)["image"] == (
+        f"download.t-head.cn/docker_release/team/demo-{commit}:1.0.0"
+    )
+
+
+def test_detached_head_tag_is_detected(validator, source):
+    run_git(source, "checkout", "--detach", "HEAD")
+    assert validator.validate_inputs(DEFAULT_INPUTS, source)["image"] == IMAGE
+
+
+def test_multiple_exact_tags_use_name_order(validator, source):
+    run_git(source, "tag", "-a", "-m", "Another release", "v2.0.0")
+    run_git(source, "tag", "v1.0.0")
+    assert validator.source_revision(source) == "v1.0.0"
+
+
+@pytest.mark.parametrize("revision", ["V1.0", "release/v1", "v1+build", "v1-", "v1;echo", "v1_\u00e9"])
+def test_invalid_git_tag_fails_without_renaming(validator, git_source, revision):
+    run_git(git_source, "tag", revision)
+    with pytest.raises(ValueError, match="Git tag or commit"):
+        validator.validate_inputs(DEFAULT_INPUTS, git_source)
+
+
+@pytest.mark.parametrize("revision", [REVISION, "a" * 40])
+def test_version_suffix_counts_toward_name_length(validator, revision):
+    length = 255 - len("download.t-head.cn/docker_release/") - len(revision) - 1
+    assert validator.versioned_image_reference("a" * length, revision, "v1").endswith(f"-{revision}:v1")
+    with pytest.raises(ValueError, match="255"):
+        validator.versioned_image_reference("a" * (length + 1), revision, "v1")
+
+
+@pytest.mark.parametrize("name", ["", "demo-", "team/", "Demo", "docker_release/demo"])
+def test_version_suffix_does_not_mask_invalid_base_name(validator, name):
+    with pytest.raises(ValueError, match="docker_name"):
+        validator.versioned_image_reference(name, REVISION, "v1")
+
+
+@pytest.mark.parametrize("tag", [None, False, 123, " ", "v1\nother", "v1+build", "a" * 129])
+def test_optional_docker_tag_still_rejects_invalid_values(validator, source, tag):
+    with pytest.raises(ValueError, match="docker_tag"):
+        validator.validate_inputs(dict(DEFAULT_INPUTS, docker_tag=tag), source)
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.CalledProcessError(1, "git"), subprocess.TimeoutExpired("git", 30), FileNotFoundError("git"),
+])
+def test_git_lookup_errors_fail_validation(validator, source, monkeypatch, error):
+    monkeypatch.setattr(validator, "subprocess", SimpleNamespace(
+        run=Mock(side_effect=error), SubprocessError=subprocess.SubprocessError,
+    ))
+    with pytest.raises(ValueError, match="Failed to resolve caller Git"):
+        validator.validate_inputs(DEFAULT_INPUTS, source)
+
+
 @pytest.mark.parametrize("key", ["dockerfile", "build_context"])
 @pytest.mark.parametrize("value", ["", "../Dockerfile", "/tmp", "https://example.invalid/context", "a\nb", "a\x00b", "a\\b"])
 def test_unsafe_paths(validator, source, key, value):
@@ -195,19 +331,172 @@ def test_invalid_build_args(validator, source, args):
         validator.validate_inputs(dict(DEFAULT_INPUTS, build_args=args), source)
 
 
-@pytest.mark.parametrize("override", [{}, {"network": "eic"}, {"dockerfile": "missing"}])
+@pytest.mark.parametrize("override", [{}, {"docker_tag": ""}, {"network": "eic"}, {"dockerfile": "missing"}])
 def test_validator_cli_outputs_only_on_success(source, override):
     output_file = source / "outputs"
+    before = datetime.now(timezone.utc).date().isoformat()
     result = subprocess.run(
         [sys.executable, str(SCRIPT)], cwd=source, capture_output=True, text=True, timeout=10,
         env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SOURCE_DIR=str(source),
                  GITHUB_OUTPUT=str(output_file), INPUTS_JSON=json.dumps(dict(DEFAULT_INPUTS, **override))),
     )
-    assert (result.returncode == 0) == (not override), result.stderr
-    if not override:
-        assert f"image={IMAGE}\n" in output_file.read_text()
+    success = not override or "docker_tag" in override
+    assert (result.returncode == 0) == success, result.stderr
+    if success:
+        outputs = dict(line.split("=", 1) for line in output_file.read_text().splitlines())
+        assert outputs["source_revision"] == REVISION
+        if override:
+            after = datetime.now(timezone.utc).date().isoformat()
+            assert outputs["docker_tag"] in {before, after}
+        else:
+            assert outputs["docker_tag"] == "1.0.0"
+        assert outputs["image"] == f"download.t-head.cn/docker_release/team/demo-{REVISION}:{outputs['docker_tag']}"
     else:
         assert not output_file.exists()
+
+
+@pytest.mark.parametrize("output,expected", [
+    (FREEZE_OUTPUT, PACKAGE_LIST),
+    ("\r\n# comment\r\n torch == 2.5.8 \r\nnumpy==2.1.0\r\n", PACKAGE_LIST),
+    ("", []), ("\n# comment only\n", []), (None, []), (b"torch==2.5.8", []), ([], []),
+    ("My_Pkg==1.0\nmy-pkg==1.0\n", [{"packageName": "My_Pkg", "packageVersion": "1.0"}]),
+    ("demo==1.0\nDemo==2.0\n", [{"packageName": "demo", "packageVersion": "1.0"}]),
+    ("torch==2.5.8+cu124\n", [{"packageName": "torch", "packageVersion": "2.5.8+cu124"}]),
+    ("demo===1!2.0rc1.post2.dev3\n", [{"packageName": "demo", "packageVersion": "1!2.0rc1.post2.dev3"}]),
+])
+def test_parse_pip_freeze(post_module, output, expected):
+    assert post_module.parse_pip_freeze(output) == expected
+    post_module.subprocess.run.assert_not_called()
+
+
+@pytest.mark.parametrize("output", [
+    "torch", "torch>=2.5.8", "torch==", "==2.5.8", "torch==2.5.8 extra", "--index-url secret",
+    "torch==2.5.8\x00", "torch==https://secret.example", "torch====2.5.8", "bad/name==1.0",
+    "demo @ https://secret.example\nunparseable",
+])
+def test_bad_freeze_lines_are_skipped_without_blocking_publication(
+    post_module, release_env, monkeypatch, output, capsys,
+):
+    post_module.subprocess.run.return_value.stdout = "numpy==2.1.0\n" + output + "\ntorch==2.5.8\n"
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == PACKAGE_LIST
+    post_module.requests.post.assert_not_called()
+    post_module.subprocess.run.assert_called_once()
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert "secret.example" not in captured.out
+
+
+def test_package_collection_uses_pushed_image_not_runner(post_module, release_env, monkeypatch):
+    monkeypatch.setenv("CLIENT_PRIVATE_KEY_B64", "test-private-key")
+    monkeypatch.setenv("RELEASE_TOKEN", "test-registry-token")
+    packages = post_module.collect_image_packages(IMAGE, DIGEST)
+    assert packages == PACKAGE_LIST
+    post_module.subprocess.run.assert_called_once()
+    command = post_module.subprocess.run.call_args.args[0]
+    container = command[command.index("--name") + 1]
+    assert container.startswith("release-packages-")
+    assert command == [
+        "docker", "run", "--rm", "--name", container, "--platform", "linux/amd64",
+        "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--entrypoint", "pip", IMAGE.rsplit(":", 1)[0] + "@" + DIGEST,
+        "--disable-pip-version-check", "freeze", "--all",
+    ]
+    assert post_module.subprocess.run.call_args.kwargs == {
+        "check": True, "capture_output": True, "text": True, "timeout": 900,
+    }
+    assert "test-private-key" not in repr(command)
+    assert "test-registry-token" not in repr(command)
+
+
+@pytest.mark.parametrize("unversioned", [
+    "torch @ file:///opt/wheels/torch.whl",
+    "torch @ https://user:secret@example.invalid/torch.whl",
+    "-e git+https://example.invalid/repo.git@main#egg=torch",
+    "# Editable install with no version control\n-e /opt/torch",
+    "--editable /opt/torch",
+])
+def test_reference_installs_are_skipped_without_fallback(post_module, release_env, unversioned, capsys):
+    post_module.subprocess.run.return_value.stdout = "numpy==2.1.0\n" + unversioned + "\n"
+    record = post_module.read_record()
+    assert post_module.build_payload(record)["packageList"] == [PACKAGE_LIST[0]]
+    post_module.subprocess.run.assert_called_once()
+    assert post_module.subprocess.run.call_args.args[0][-2:] == ["freeze", "--all"]
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err
+
+
+@pytest.mark.parametrize("output", ["", "unexpected", "torch @ file:///opt/torch.whl", None])
+def test_unparseable_freeze_publishes_empty_list(post_module, release_env, monkeypatch, output, capsys):
+    post_module.subprocess.run.return_value.stdout = output
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    post_module.requests.post.assert_not_called()
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("image,digest", [
+    (None, DIGEST), ("", DIGEST), (IMAGE.replace("docker_release", "docker_tmp"), DIGEST),
+    (IMAGE.replace("download.t-head.cn", "example.invalid"), DIGEST),
+    (IMAGE.rsplit(":", 1)[0], DIGEST), (IMAGE + "\ninjected", DIGEST),
+    (IMAGE, None), (IMAGE, "sha256:abc"), (IMAGE, DIGEST + "\n"),
+])
+def test_package_inspection_skips_unsafe_references(post_module, image, digest):
+    assert post_module.collect_image_packages(image, digest) == []
+    post_module.subprocess.run.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.CalledProcessError(127, "docker", output=FREEZE_OUTPUT, stderr="sensitive-error"),
+    subprocess.TimeoutExpired("docker", 900, output=FREEZE_OUTPUT, stderr="sensitive-error"),
+    FileNotFoundError("sensitive-error"),
+    UnicodeDecodeError("utf-8", b"\xff", 0, 1, "sensitive-error"),
+    RuntimeError("sensitive-error"),
+])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_package_collection_failure_cleans_up_and_publishes_empty_list(
+    post_module, release_env, monkeypatch, capsys, error, cleanup_fails,
+):
+    cleanup = OSError("sensitive-cleanup-error") if cleanup_fails else SimpleNamespace(stdout="")
+    post_module.subprocess.run.side_effect = [error, cleanup]
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    post_module.requests.post.assert_not_called()
+    run_call, cleanup_call = post_module.subprocess.run.call_args_list
+    command = run_call.args[0]
+    container = command[command.index("--name") + 1]
+    assert cleanup_call.args[0] == ["docker", "rm", "--force", container]
+    assert cleanup_call.kwargs == {"check": False, "capture_output": True, "text": True, "timeout": 30}
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert "sensitive" not in captured.out
+
+
+@pytest.mark.parametrize("helper", ["run_image_pip", "parse_pip_freeze"])
+def test_unexpected_package_collection_errors_do_not_block_publication(
+    post_module, release_env, monkeypatch, helper, capsys,
+):
+    monkeypatch.setattr(post_module, helper, Mock(side_effect=RuntimeError("sensitive-error")))
+    client = Mock()
+    monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
+    assert post_module.main() == 0
+    client.save_artifact.assert_called_once()
+    assert client.save_artifact.call_args.args[0]["packageList"] == []
+    assert not capsys.readouterr().err
+
+
+def test_package_list_is_not_taken_from_workflow_inputs(post_module, release_env, monkeypatch):
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(dict(DEFAULT_INPUTS, packageList=[{"packageName": "fake"}])))
+    assert post_module.read_record()["packageList"] == PACKAGE_LIST
 
 
 def test_release_record_contains_only_whitelisted_fields(post_module, release_env, monkeypatch):
@@ -215,7 +504,7 @@ def test_release_record_contains_only_whitelisted_fields(post_module, release_en
     expected = {key: DEFAULT_INPUTS[key] for key in (*FIELDS, "docker_name", "docker_tag")}
     record = post_module.read_record()
     assert record == dict(expected, image=IMAGE, digest="a" * 64, size=123456789,
-                          idempotentKey="f4115805a430e15d115902335153f83f")
+                          idempotentKey="1483ef298defabb255077b71b79a8379", packageList=PACKAGE_LIST)
     assert type(record["size"]) is int
 
 
@@ -245,8 +534,9 @@ def test_idempotent_key_depends_on_image_not_build_result(post_module, release_e
 def test_idempotent_key_changes_with_image(post_module, release_env, monkeypatch, field, value):
     original = post_module.read_record()["idempotentKey"]
     inputs = dict(DEFAULT_INPUTS, **{field: value})
-    image = f"download.t-head.cn/docker_release/{inputs['docker_name']}:{inputs['docker_tag']}"
+    image = f"download.t-head.cn/docker_release/{inputs['docker_name']}-{REVISION}:{inputs['docker_tag']}"
     monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
+    monkeypatch.setenv("RESOLVED_DOCKER_TAG", inputs["docker_tag"])
     monkeypatch.setenv("IMAGE", image)
     key = post_module.read_record()["idempotentKey"]
     assert key == hashlib.md5(image.encode("utf-8"), usedforsecurity=False).hexdigest()
@@ -256,6 +546,9 @@ def test_idempotent_key_changes_with_image(post_module, release_env, monkeypatch
 @pytest.mark.parametrize("environment,value", [
     ("INPUTS_JSON", "{"), ("INPUTS_JSON", "[]"), ("INPUTS_JSON", "{}"),
     ("IMAGE", ""), ("IMAGE", IMAGE.replace("docker_release", "docker_tmp")),
+    ("IMAGE", IMAGE.replace("-" + REVISION, "")), ("IMAGE", IMAGE.replace(REVISION, "v2.0.0")),
+    ("SOURCE_REVISION", ""), ("SOURCE_REVISION", "release/v1"), ("SOURCE_REVISION", "v2.0.0"),
+    ("RESOLVED_DOCKER_TAG", ""), ("RESOLVED_DOCKER_TAG", "different"),
     ("IMAGE", IMAGE + "-other"), ("DIGEST", ""), ("DIGEST", "sha256:abcd"),
     ("DIGEST", "sha256:" + "a" * 64 + "\n"), ("DIGEST", "sha512:" + "a" * 64),
     ("SIZE", ""), ("SIZE", "0"), ("SIZE", "-1"), ("SIZE", "1.5"), ("SIZE", "123 MB"),
@@ -268,6 +561,7 @@ def test_invalid_release_data_never_calls_api(post_module, release_env, monkeypa
     assert post_module.main() == 1
     client.assert_not_called()
     post_module.requests.post.assert_not_called()
+    post_module.subprocess.run.assert_not_called()
 
 
 @pytest.fixture
@@ -276,7 +570,8 @@ def expected_payload():
         "artifactName": "team/demo",
         "artifactType": "docker",
         "businessType": "DOCKER",
-        "idempotentKey": "f4115805a430e15d115902335153f83f",
+        "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "packageList": PACKAGE_LIST,
         "osTypeList": ["ubuntu24.04"],
         "hggcrtVersion": "3",
         "ppuSdk": "2.2.0",
@@ -303,7 +598,8 @@ def test_release_payload_mapping(post_module, release_env, monkeypatch, expected
     assert record == original
     assert type(record["size"]) is int
     assert payload["osTypeList"] == [record["os"]]
-    assert all(isinstance(value, str) for key, value in payload.items() if key != "osTypeList")
+    assert payload["packageList"] == PACKAGE_LIST
+    assert all(isinstance(value, str) for key, value in payload.items() if key not in {"osTypeList", "packageList"})
     assert "attributes" not in payload
     post_module.requests.post.assert_not_called()
 
@@ -453,8 +749,8 @@ def test_workflow_contract_and_execution_order():
     workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
     contract = workflow["on"]["workflow_call"]
     # Validate the release workflow interface directly, without depending on the temporary Docker template absent from this branch.
-    required_inputs = {"dockerfile", "docker_name", "docker_tag", "template_ref", *FIELDS}
-    defaults = {"build_context": ".", "build_args": "", "template_repository": "t-head/ci-infra"}
+    required_inputs = {"dockerfile", "docker_name", "template_ref", *FIELDS}
+    defaults = {"build_context": ".", "build_args": "", "docker_tag": "", "template_repository": "t-head/ci-infra"}
     assert set(workflow["on"]) == {"workflow_call"}
     assert set(contract["inputs"]) == required_inputs | set(defaults)
     for key, definition in contract["inputs"].items():
@@ -497,6 +793,8 @@ def test_workflow_contract_and_execution_order():
     assert inspect["run"] == "python ci-template/ci-workflows/build-and-push-docker/scripts/inspect_image.py"
     assert summary["env"]["SIZE"] == "${{ steps.inspect.outputs.size }}"
     assert post["env"] == {"INPUTS_JSON": "${{ toJSON(inputs) }}", "IMAGE": "${{ steps.validate.outputs.image }}",
+                            "SOURCE_REVISION": "${{ steps.validate.outputs.source_revision }}",
+                            "RESOLVED_DOCKER_TAG": "${{ steps.validate.outputs.docker_tag }}",
                             "DIGEST": "${{ steps.build.outputs.digest }}", "SIZE": "${{ steps.inspect.outputs.size }}",
                             "CLIENT_PRIVATE_KEY_B64": "${{ secrets.data_token }}"}
     assert post["run"] == "python ci-template/ci-workflows/build-and-push-docker/scripts/post_data.py"
@@ -532,13 +830,23 @@ def test_demo_matches_reusable_workflow_contract():
     assert ref == inputs["template_ref"]
     assert "steps" not in publish and "runs-on" not in publish
     manual_inputs = demo["on"]["workflow_dispatch"]["inputs"]
-    for key in manual_inputs:
-        assert inputs[key] == "${{ inputs." + key + " }}"
+    defaults = {
+        "dockerfile": "Dockerfile", "build_context": ".", "build_args": "", "docker_tag": "",
+        "os": "ubuntu24", "python": "py312", "hggcrt": "3", "sdk_version": "2.2.0",
+        "torch": "2.13.0", "network": "mellanox",
+    }
+    assert set(manual_inputs) == set(defaults) | {"docker_name"}
+    for key, definition in manual_inputs.items():
+        assert definition["required"] == ("true" if key == "docker_name" else "false")
+        if key != "docker_name":
+            assert definition["default"] == defaults[key]
+        if key == "docker_tag":
+            assert inputs[key] == "${{ inputs.docker_tag }}"
+        else:
+            fallback = "sglang" if key == "docker_name" else defaults[key]
+            assert inputs[key] == "${{ inputs." + key + " || '" + fallback + "' }}"
     assert manual_inputs["network"]["type"] == "choice"
-    assert manual_inputs["network"]["required"] == "true"
     assert manual_inputs["network"]["options"] == ["mellanox", "EIC", "mellanox/EIC"]
-    for key in ("docker_name", "docker_tag", "dockerfile"):
-        assert manual_inputs[key]["required"] == "true"
     assert publish["secrets"] == {
         "release_username": "${{ secrets.RELEASE_USERNAME }}",
         "release_token": "${{ secrets.RELEASE_TOKEN }}",
@@ -561,10 +869,11 @@ def test_demo_resolved_inputs_pass_validation(validator, source, post_module, re
         inputs[key] = value
     assert validator.validate_inputs(inputs, source) == {
         "image": IMAGE, "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
+        "source_revision": REVISION, "docker_tag": "1.0.0",
     }
     # The example uses its own environment versions; verify metadata is preserved rather than replaced with unit test defaults.
     assert validator.release_metadata(inputs) == {
-        **{key: demo["jobs"]["publish"]["with"][key] for key in FIELDS if key != "network"},
+        "os": "ubuntu24", "python": "py312", "hggcrt": "3", "sdk_version": "2.2.0", "torch": "2.13.0",
         "network": network,
     }
     monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
@@ -573,7 +882,8 @@ def test_demo_resolved_inputs_pass_validation(validator, source, post_module, re
     assert post_module.main() == 0
     client.save_artifact.assert_called_once_with({
         "artifactName": "team/demo", "artifactType": "docker", "businessType": "DOCKER",
-        "idempotentKey": "f4115805a430e15d115902335153f83f",
+        "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "packageList": PACKAGE_LIST,
         "osTypeList": [inputs["os"]], "hggcrtVersion": inputs["hggcrt"],
         "ppuSdk": inputs["sdk_version"], "python": inputs["python"],
         "image": IMAGE, "digest": "a" * 64, "packageSize": "123456789",
@@ -795,6 +1105,11 @@ def test_migrated_workflow_commands_run_from_checkout(source, script_name, overr
     caller = workspace / "caller-source"
     caller.mkdir(parents=True)
     (caller / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    run_git(caller, "init", "--quiet")
+    tree = run_git(caller, "mktree")
+    commit = run_git(caller, "commit-tree", tree, "-m", "Caller source")
+    run_git(caller, "update-ref", "HEAD", commit)
+    run_git(caller, "tag", REVISION)
     scripts = workspace / "ci-template" / SCRIPT.parent.relative_to(REPO)
     scripts.mkdir(parents=True)
     for script in SCRIPT.parent.glob("*.py"):
@@ -805,6 +1120,7 @@ def test_migrated_workflow_commands_run_from_checkout(source, script_name, overr
     output = workspace / "outputs"
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SOURCE_DIR=str(caller),
                INPUTS_JSON=json.dumps(dict(DEFAULT_INPUTS, **override)), GITHUB_OUTPUT=str(output),
+               SOURCE_REVISION=REVISION, RESOLVED_DOCKER_TAG=DEFAULT_INPUTS["docker_tag"],
                IMAGE="", DIGEST=DIGEST, SIZE="3172", CLIENT_PRIVATE_KEY_B64="", TEST_PYTHON=sys.executable)
     # An empty IMAGE makes inspection and publishing exit before accessing Docker/API, while still validating paths and local imports.
     result = subprocess.run(["bash"], cwd=workspace,
@@ -815,6 +1131,7 @@ def test_migrated_workflow_commands_run_from_checkout(source, script_name, overr
     if success:
         assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {
             "image": IMAGE, "build_context": str(caller), "dockerfile": str(caller / "Dockerfile"),
+            "source_revision": REVISION, "docker_tag": "1.0.0",
         }
     else:
         expected = "does not exist" if script_name == "validate_inputs.py" else "IMAGE must"

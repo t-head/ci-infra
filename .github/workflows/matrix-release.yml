@@ -31,15 +31,20 @@ on:
         type: string
         default: '["3"]'
       torch_versions:
-        description: 'JSON 数组，候选值：2.8.0、2.10.0、2.13.0；[""] 表示不包含 Torch 版本'
+        description: 'JSON 数组，候选值：2.10.0、2.13.0；[""] 表示不包含 Torch 版本'
         required: true
         type: string
         default: '["2.10.0"]'
       sdk_versions:
-        description: 'JSON 数组，候选值：2.1.0、2.2.0'
+        description: 'JSON 数组，候选值：2.1.1、2.2.0'
         required: true
         type: string
         default: '["2.2.0"]'
+      pccl_version:
+        description: '候选值：2.1.1,2.2.0、2.2.1'
+        required: false
+        type: string
+        default: '2.2.1'
       template_repository:
         description: '保存本工作流及 prepare_matrix.py 的仓库，格式为 owner/repo'
         type: string
@@ -287,6 +292,7 @@ jobs:
       CONTAINER_IMAGE: ${{ matrix.image }}
       TORCH_URL: ${{ matrix.torch_url }}
       SDK_URL: ${{ matrix.sdk_url }}
+      PCCL_URL: ${{ matrix.pccl_url }}
     defaults:
       run:
         shell: sh
@@ -303,42 +309,61 @@ jobs:
             "WHL_NAME=$WHL_NAME" \
             "TORCH_URL=$TORCH_URL" \
             "SDK_URL=$SDK_URL" \
+            "PCCL_URL=$PCCL_URL" \
             "CONTAINER_IMAGE=$CONTAINER_IMAGE"
-      # - name: 安装 SDK 和 Torch
-      #   shell: bash
-      #   run: |
-      #     set -euo pipefail
-      #     : "${SDK_URL:?SDK_URL 为空，请先实现 SDK 下载地址查询}"
-      #     : "${TORCH_URL:?TORCH_URL 为空，请先实现 Torch 下载地址查询}"
-
-      #     # 保留 wheel 的版本和兼容性标签，并处理 URL 查询参数及百分号编码。
-      #     torch_wheel="$(python3 -c 'import os, posixpath; from urllib.parse import unquote, urlsplit; print(posixpath.basename(unquote(urlsplit(os.environ["TORCH_URL"]).path)))')"
-      #     if [[ ! "$torch_wheel" =~ ^torch-[a-zA-Z0-9_.+-]+\.whl$ ]]; then
-      #       printf '%s\n' '::error::TORCH_URL 路径必须包含有效的 torch-*.whl 文件名' >&2
-      #       exit 1
-      #     fi
-
-      #     download_dir="$(mktemp -d)"
-      #     curl --fail --show-error --location --retry 3 --connect-timeout 30 \
-      #       --proto '=http,https' --proto-redir '=http,https' \
-      #       --output "$download_dir/ppu-sdk.run" -- "$SDK_URL"
-      #     curl --fail --show-error --location --retry 3 --connect-timeout 30 \
-      #       --proto '=http,https' --proto-redir '=http,https' \
-      #       --output "$download_dir/$torch_wheel" -- "$TORCH_URL"
-
-      #     bash "$download_dir/ppu-sdk.run" --prefix=/usr/local/ --silent
-      #     ln -sf /usr/local/PPU_SDK/CUDA_SDK /usr/local/cuda
-      #     source /usr/local/PPU_SDK/envsetup.sh
-      #     echo "NCCL_INCLUDE_DIR=${CUDA_PATH}/include" >> "$GITHUB_ENV"
-      #     echo "NCCL_LIB_DIR=${CUDA_PATH}/lib64" >> "$GITHUB_ENV"
-      #     python3 -m pip install --no-input "$download_dir/$torch_wheel"
-      # 默认检出调用方仓库及其触发版本，不是模板仓库。
       - name: 检出待编译仓库
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
+
+      - name: 下载并安装 SDK run 包
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SDK_URL:?SDK_URL 不能为空}"
+          download_dir="$(mktemp -d "$RUNNER_TEMP/ppu-sdk.XXXXXX")"
+          wget --https-only --tries=3 --timeout=30 \
+            -O "$download_dir/ppu-sdk.run" -- "$SDK_URL"
+          if [[ ! -s "$download_dir/ppu-sdk.run" ]]; then
+            printf '%s\n' '::error::下载的 SDK run 包为空' >&2
+            exit 1
+          fi
+          bash "$download_dir/ppu-sdk.run" --prefix=/usr/local --silent
+          echo "/usr/local/PPU_SDK/lib" >> /etc/ld.so.conf.d/ppu.conf
+          ldconfig
+
+      - name: 下载并安装 PCCL
+        shell: bash
+        env:
+          PCCL_PATH: /usr/local/pccl
+        run: |
+          set -euo pipefail
+          : "${PCCL_URL:?PCCL_URL 不能为空}"
+          : "${PCCL_PATH:?PCCL_PATH 不能为空}"
+          if [[ -e "$PCCL_PATH" || -L "$PCCL_PATH" ]]; then
+            printf '%s\n' '::error::PCCL 安装目录已存在，拒绝覆盖' >&2
+            exit 1
+          fi
+          download_dir="$(mktemp -d "$RUNNER_TEMP/pccl.XXXXXX")"
+          trap 'rm -rf -- "$download_dir"' EXIT
+          wget --https-only --tries=3 --timeout=30 \
+            -O "$download_dir/pccl.tar.gz" -- "$PCCL_URL"
+          if [[ ! -s "$download_dir/pccl.tar.gz" ]]; then
+            printf '%s\n' '::error::下载的 PCCL 包为空' >&2
+            exit 1
+          fi
+          mkdir "$download_dir/extracted"
+          tar --extract --file="$download_dir/pccl.tar.gz" --directory="$download_dir/extracted"
+          if [[ ! -d "$download_dir/extracted/pccl" || -L "$download_dir/extracted/pccl" ]]; then
+            printf '%s\n' '::error::PCCL 包缺少 pccl 目录或目录为符号链接' >&2
+            exit 1
+          fi
+          mv -- "$download_dir/extracted/pccl" "$PCCL_PATH"
+          printf '%s\n' "$PCCL_PATH/lib" >> /etc/ld.so.conf.d/pccl.conf
+          ldconfig
+          printf 'PCCL_PATH=%s\n' "$PCCL_PATH" >> "$GITHUB_ENV"
 
       - name: 编译
         shell: bash
@@ -347,7 +372,13 @@ jobs:
         run: |
           set -eo pipefail
           : "${BUILD_COMMAND:?build_command 不能为空}"
+          ldconfig
           source /usr/local/PPU_SDK/envsetup.sh
+          export PATH="$PCCL_PATH/bin:$PATH"
+          export LD_LIBRARY_PATH="$PCCL_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [[ -n "${TORCH_VERSION:-}" ]]; then
+            pip install "torch==$TORCH_VERSION" -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple
+          fi
           bash -e -o pipefail -c "$BUILD_COMMAND"
 
       - name: 收集 wheel 到 dist

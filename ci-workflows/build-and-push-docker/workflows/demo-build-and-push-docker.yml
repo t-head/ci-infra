@@ -7,7 +7,7 @@ on:
     inputs:
       dockerfile:
         description: 'Dockerfile path relative to the caller repository root'
-        required: true
+        required: false
         type: string
         default: Dockerfile
       build_context:
@@ -21,17 +21,44 @@ on:
         type: string
         default: ''
       docker_name:
-        description: 'Lowercase image name, such as team/demo, without registry, repository prefix, or tag'
+        description: 'Lowercase base image name, such as team/demo; the exact Git tag or full commit SHA is appended automatically'
         required: true
         type: string
       docker_tag:
-        description: 'Release image tag, such as 1.0.0; use a distinct tag for each release'
-        required: true
+        description: 'Optional release image tag; leave empty to use the current UTC date (YYYY-MM-DD)'
+        required: false
         type: string
+        default: ''
+      os:
+        description: 'Image operating system metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: 'ubuntu24'
+      python:
+        description: 'Image Python version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: 'py312'
+      hggcrt:
+        description: 'Image HGGCRT version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '3'
+      sdk_version:
+        description: 'Image SDK version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '2.2.0'
+      torch:
+        description: 'Image PyTorch version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '2.13.0'
       network:
         description: 'Release network metadata; does not configure the build network'
-        required: true
+        required: false
         type: choice
+        default: 'mellanox'
         options:
           - mellanox
           - EIC
@@ -46,18 +73,18 @@ jobs:
     # For production, pin both @main and template_ref to the same full commit SHA in the template repository.
     uses: t-head/ci-infra/.github/workflows/build-and-push-docker.yml@main
     with:
-      dockerfile: ${{ inputs.dockerfile }}
-      build_context: ${{ inputs.build_context }}
-      build_args: ${{ inputs.build_args }}
-      docker_name: ${{ inputs.docker_name }}
+      dockerfile: ${{ inputs.dockerfile || 'Dockerfile' }}
+      build_context: ${{ inputs.build_context || '.' }}
+      build_args: ${{ inputs.build_args || '' }}
+      docker_name: ${{ inputs.docker_name || 'sglang' }}
       docker_tag: ${{ inputs.docker_tag }}
       # Update the release metadata below to match the actual image environment; these fields do not automatically change the Docker build.
-      os: ubuntu24
-      python: 'py312'
-      hggcrt: '3'
-      sdk_version: '2.2.0'
-      torch: '2.10.0'
-      network: ${{ inputs.network }}
+      os: ${{ inputs.os || 'ubuntu24' }}
+      python: ${{ inputs.python || 'py312' }}
+      hggcrt: ${{ inputs.hggcrt || '3' }}
+      sdk_version: ${{ inputs.sdk_version || '2.2.0' }}
+      torch: ${{ inputs.torch || '2.13.0' }}
+      network: ${{ inputs.network || 'mellanox' }}
       template_repository: t-head/ci-infra
       template_ref: main
     secrets:

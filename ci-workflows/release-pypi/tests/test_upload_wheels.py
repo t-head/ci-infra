@@ -19,6 +19,45 @@ RELEASE_VERSION = "1.2.3+v0.3.0.sail2.2.0"
 WHEEL_NAME = "demo_package-1.2.3+dev5-cp310-cp310-linux_x86_64.whl"
 RENAMED_WHEEL = "demo_package-1.2.3+hggcrt3torch2.10.0ubuntu2404oe-cp310-cp310-linux_x86_64.whl"
 
+BUILD_SHIM = r'''
+ldconfig() {
+  printf 'ldconfig:%s\n' "$TEST_PHASE" >> "$RUNNER_TEMP/events"
+  if [[ "${TEST_FAIL_LDCONFIG_PHASE:-}" == "$TEST_PHASE" ]]; then
+    return 19
+  fi
+}
+source() {
+  [[ "$1" == "/usr/local/PPU_SDK/envsetup.sh" ]] || return 1
+  printf 'source\n' >> "$RUNNER_TEMP/events"
+  if [[ "${TEST_SOURCE_EXIT:-0}" != 0 ]]; then
+    return "$TEST_SOURCE_EXIT"
+  fi
+  export SDK_READY=yes
+}
+pip() {
+  "$TEST_PYTHON" -c '
+import json
+import os
+from pathlib import Path
+import sys
+from packaging.requirements import InvalidRequirement, Requirement
+
+root = Path(os.environ["RUNNER_TEMP"])
+with (root / "events").open("a") as output:
+    output.write("pip\n")
+with (root / "pip-calls.jsonl").open("a") as output:
+    output.write(json.dumps(sys.argv[1:]) + "\n")
+try:
+    Requirement(sys.argv[2])
+except InvalidRequirement as error:
+    print(error, file=sys.stderr)
+    sys.exit(1)
+sys.exit(int(os.environ.get("TEST_PIP_EXIT", "0")))
+' "$@"
+}
+'''
+
+
 CURL_SHIM = r'''
 python3() {
   "$TEST_PYTHON" "$@"
@@ -101,18 +140,154 @@ def build_step(workflow):
 
 
 @pytest.fixture
-def run_build(build_step, workspace):
+def install_sdk_step(workflow):
+    return next(step for step in workflow["jobs"]["matrix-job"]["steps"]
+                if step.get("name") == "下载并安装 SDK run 包")
+
+
+@pytest.fixture
+def install_pccl_step(workflow):
+    return next(step for step in workflow["jobs"]["matrix-job"]["steps"]
+                if step.get("name") == "下载并安装 PCCL")
+
+
+@pytest.fixture
+def build_env(workspace, install_pccl_step):
+    env = dict(os.environ, RUNNER_TEMP=str(workspace), TEST_PYTHON=sys.executable,
+               PCCL_PATH=install_pccl_step["env"]["PCCL_PATH"],
+               TORCH_VERSION="2.10.0", TEST_PHASE="build", TEST_PIP_EXIT="0",
+               TEST_SOURCE_EXIT="0", TEST_FAIL_LDCONFIG_PHASE="")
+    env.pop("SDK_READY", None)
+    return env
+
+
+@pytest.fixture
+def run_sdk_install(install_sdk_step, build_step, workspace, build_env):
+    def run(**overrides):
+        env = dict(build_env, SDK_URL="https://test.invalid/ppu-sdk.run", TEST_PHASE="install",
+                   TEST_WGET_EXIT="0", TEST_INSTALL_EXIT="0", TEST_EMPTY_DOWNLOAD="0",
+                   BUILD_COMMAND='test "$SDK_READY" = yes\nprintf "build\\n" >> "$RUNNER_TEMP/events"')
+        env.update(overrides)
+        env = {key: value for key, value in env.items() if value is not None}
+        shim = r'''
+        wget() {
+          "$TEST_PYTHON" -c '
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["RUNNER_TEMP"])
+args = sys.argv[1:]
+(root / "wget-args.json").write_text(json.dumps(args))
+with (root / "events").open("a") as output:
+    output.write("download\n")
+if os.environ["TEST_WGET_EXIT"] != "0":
+    sys.exit(int(os.environ["TEST_WGET_EXIT"]))
+installer = """printf "%s\\n" "$@" > "$RUNNER_TEMP/install-args"
+printf "install\\n" >> "$RUNNER_TEMP/events"
+exit "$TEST_INSTALL_EXIT"
+"""
+Path(args[args.index("-O") + 1]).write_text(
+    "" if os.environ["TEST_EMPTY_DOWNLOAD"] == "1" else installer
+)
+' "$@"
+        }
+        '''
+        script = install_sdk_step["run"].replace(
+            "/etc/ld.so.conf.d/ppu.conf", shlex.quote(str(workspace / "ppu.conf"))
+        )
+        result = subprocess.run(["bash"], input=BUILD_SHIM + shim + script,
+                                cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        if result.returncode == 0:
+            env["TEST_PHASE"] = "build"
+            result = subprocess.run(["bash"], input=BUILD_SHIM + build_step["run"],
+                                    cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        events = workspace / "events"
+        return result, events.read_text().splitlines() if events.exists() else []
+
+    return run
+
+
+@pytest.fixture
+def run_pccl_install(install_pccl_step, build_step, workspace, build_env):
+    def run(**overrides):
+        env = dict(build_env, PCCL_URL="https://test.invalid/pccl.tar.gz", TEST_PHASE="pccl",
+                   PCCL_PATH=str(workspace / "installed-pccl"), GITHUB_ENV=str(workspace / "github-env"),
+                   TEST_PCCL_MODE="valid", TEST_WGET_EXIT="0",
+                   BUILD_COMMAND='pccl-probe\nprintf "build\\n" >> "$RUNNER_TEMP/events"')
+        env.update(overrides)
+        env = {key: value for key, value in env.items() if value is not None}
+        shim = r'''
+        wget() {
+          "$TEST_PYTHON" -c '
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+
+root = Path(os.environ["RUNNER_TEMP"])
+args = sys.argv[1:]
+(root / "pccl-wget-args.json").write_text(json.dumps(args))
+with (root / "events").open("a") as output:
+    output.write("pccl-download\n")
+if os.environ["TEST_WGET_EXIT"] != "0":
+    sys.exit(int(os.environ["TEST_WGET_EXIT"]))
+target = Path(args[args.index("-O") + 1])
+mode = os.environ["TEST_PCCL_MODE"]
+if mode in ("empty", "corrupt"):
+    target.write_bytes(b"" if mode == "empty" else b"not a tar archive")
+else:
+    with tarfile.open(target, "w:gz") as archive:
+        if mode == "symlink":
+            info = tarfile.TarInfo("pccl")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "missing-target"
+            archive.addfile(info)
+        else:
+            files = {"pccl/bin/pccl-probe": b"#!/bin/sh\nexit 0\n", "pccl/lib/libpccl.so": b"test library"}
+            if mode == "missing":
+                files = {"other/marker": b"missing pccl directory"}
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o755
+                archive.addfile(info, io.BytesIO(data))
+' "$@"
+        }
+        '''
+        script = install_pccl_step["run"].replace(
+            "/etc/ld.so.conf.d/pccl.conf", shlex.quote(str(workspace / "pccl.conf"))
+        )
+        result = subprocess.run(["bash"], input=BUILD_SHIM + shim + script,
+                                cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        if result.returncode == 0:
+            env.pop("PCCL_PATH", None)
+            env.update(line.split("=", 1) for line in (workspace / "github-env").read_text().splitlines())
+            env["TEST_PHASE"] = "build"
+            result = subprocess.run(["bash"], input=BUILD_SHIM + build_step["run"],
+                                    cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+        events = workspace / "events"
+        return result, events.read_text().splitlines() if events.exists() else []
+
+    return run
+
+
+@pytest.fixture
+def run_build(build_step, workspace, build_env):
     def run(filenames=(WHEEL_NAME,), build_command=None, **overrides):
         if build_command is None:
             build_command = "\n".join(
                 f"printf 'test wheel data' > {shlex.quote('dist/' + name)}" for name in filenames
             ) or ":"
-        env = dict(os.environ, BUILD_COMMAND=build_command)
+        env = dict(build_env, BUILD_COMMAND=build_command)
         env.update(overrides)
         env.pop("WHL_NAME", None)
+        env = {key: value for key, value in env.items() if value is not None}
         # 只模拟 SDK 初始化，编译步骤保留构建命令生成的原始文件名。
-        shim = 'source() { [[ "$1" == "/usr/local/PPU_SDK/envsetup.sh" ]]; }\n'
-        return subprocess.run(["bash"], input=shim + build_step["run"], cwd=workspace,
+        return subprocess.run(["bash"], input=BUILD_SHIM + build_step["run"], cwd=workspace,
                               env=env, text=True, capture_output=True, timeout=30)
 
     return run
@@ -461,6 +636,196 @@ def test_curl_failure_propagates(run_upload, exit_code):
     assert "已上传" not in result.stdout
 
 
+def test_sdk_install_precedes_build_for_all_matrix_jobs(workflow, install_sdk_step, install_pccl_step, build_step):
+    job = workflow["jobs"]["matrix-job"]
+    steps = job["steps"]
+    assert steps.index(install_sdk_step) + 1 == steps.index(install_pccl_step)
+    assert steps.index(install_pccl_step) + 1 == steps.index(build_step)
+    assert install_pccl_step["shell"] == "bash"
+    assert "if" not in install_pccl_step
+    assert "continue-on-error" not in install_pccl_step
+    assert job["env"]["PCCL_URL"] == "${{ matrix.pccl_url }}"
+    assert "PCCL_PATH" not in job["env"]
+    assert install_pccl_step["env"]["PCCL_PATH"] == "/usr/local/pccl"
+    assert "PCCL_URL=$PCCL_URL" in steps[0]["run"]
+    assert "PCCL_PATH" not in steps[0]["run"]
+    assert "${{" not in install_pccl_step["run"]
+    assert build_step["run"].index("source /usr/local/PPU_SDK/envsetup.sh") < build_step["run"].index("export PATH=")
+    assert install_sdk_step["shell"] == "bash"
+    assert "if" not in install_sdk_step
+    assert "continue-on-error" not in install_sdk_step
+    assert "if" not in build_step
+    assert "continue-on-error" not in build_step
+    assert job["env"]["SDK_URL"] == "${{ matrix.sdk_url }}"
+    assert build_step["env"]["BUILD_COMMAND"] == "${{ inputs.build_command }}"
+    assert "${{" not in install_sdk_step["run"]
+
+
+@pytest.mark.parametrize("library_path", [None, "", "/sdk/lib:/existing/lib"])
+def test_pccl_install_persists_path_and_configures_build_environment(run_pccl_install, workspace, library_path):
+    url = "https://test.invalid/pccl.tar.gz?key=a&other=b"
+    marker = workspace / "unrelated-file"
+    marker.write_text("keep")
+    result, events = run_pccl_install(PCCL_URL=url, LD_LIBRARY_PATH=library_path, BUILD_COMMAND=(
+        'test "$SDK_READY" = yes\npccl-probe\n'
+        'printf "%s\\n" "$PCCL_PATH" "$PATH" "$LD_LIBRARY_PATH" "$PCCL_URL"\n'
+        'printf "build\\n" >> "$RUNNER_TEMP/events"'
+    ))
+    assert result.returncode == 0, result.stderr
+    assert events == ["pccl-download", "ldconfig:pccl", "ldconfig:build", "source", "pip", "build"]
+    pccl_path = str(workspace / "installed-pccl")
+    lines = result.stdout.splitlines()
+    assert lines[0] == pccl_path
+    assert lines[1].startswith(pccl_path + "/bin:")
+    assert lines[2] == pccl_path + "/lib" + (":" + library_path if library_path else "")
+    assert lines[3] == url
+    assert (workspace / "github-env").read_text() == f"PCCL_PATH={pccl_path}\n"
+    assert (workspace / "pccl.conf").read_text() == pccl_path + "/lib\n"
+    assert (workspace / "installed-pccl/lib/libpccl.so").read_bytes() == b"test library"
+    args = json.loads((workspace / "pccl-wget-args.json").read_text())
+    assert args[-2:] == ["--", url]
+    assert {"--https-only", "--tries=3", "--timeout=30"}.issubset(args)
+    assert "--no-check-certificate" not in args
+    assert not Path(args[args.index("-O") + 1]).parent.exists()
+    assert marker.read_text() == "keep"
+
+
+@pytest.mark.parametrize("url", [None, ""])
+def test_missing_pccl_url_prevents_download_and_build(run_pccl_install, url):
+    result, events = run_pccl_install(PCCL_URL=url)
+    assert result.returncode != 0
+    assert "PCCL_URL" in result.stderr
+    assert events == []
+
+
+@pytest.mark.parametrize("mode", ["empty", "corrupt", "missing", "symlink"])
+def test_invalid_pccl_archive_prevents_build_and_cleans_download(run_pccl_install, workspace, mode):
+    result, events = run_pccl_install(TEST_PCCL_MODE=mode)
+    assert result.returncode != 0
+    assert events == ["pccl-download"]
+    assert not (workspace / "github-env").exists()
+    assert not (workspace / "installed-pccl").exists()
+    assert not list(workspace.glob("pccl.*"))
+
+
+@pytest.mark.parametrize("exit_code", ["4", "8"])
+def test_pccl_download_failure_prevents_build_and_cleans_download(run_pccl_install, workspace, exit_code):
+    result, events = run_pccl_install(TEST_WGET_EXIT=exit_code)
+    assert result.returncode == int(exit_code)
+    assert events == ["pccl-download"]
+    assert not (workspace / "github-env").exists()
+    assert not list(workspace.glob("pccl.*"))
+
+
+def test_pccl_ldconfig_failure_prevents_build_and_environment_export(run_pccl_install, workspace):
+    result, events = run_pccl_install(TEST_FAIL_LDCONFIG_PHASE="pccl")
+    assert result.returncode == 19
+    assert events == ["pccl-download", "ldconfig:pccl"]
+    assert not (workspace / "github-env").exists()
+    args = json.loads((workspace / "pccl-wget-args.json").read_text())
+    assert not Path(args[args.index("-O") + 1]).parent.exists()
+
+
+def test_existing_pccl_directory_is_not_overwritten(run_pccl_install, workspace):
+    target = workspace / "installed-pccl"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_text("keep")
+    result, events = run_pccl_install()
+    assert result.returncode != 0
+    assert events == []
+    assert marker.read_text() == "keep"
+
+
+def test_sdk_download_install_and_environment_precede_build(run_sdk_install, workspace):
+    url = "https://test.invalid/ppu-sdk.run?key=a&other=b"
+    result, events = run_sdk_install(SDK_URL=url)
+    assert result.returncode == 0, result.stderr
+    assert events == ["download", "install", "ldconfig:install", "ldconfig:build", "source", "pip", "build"]
+    assert (workspace / "ppu.conf").read_text() == "/usr/local/PPU_SDK/lib\n"
+    assert json.loads((workspace / "pip-calls.jsonl").read_text()) == [
+        "install", "torch==2.10.0", "-i",
+        "https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple",
+    ]
+    args = json.loads((workspace / "wget-args.json").read_text())
+    assert args[-2:] == ["--", url]
+    assert {"--https-only", "--tries=3", "--timeout=30"}.issubset(args)
+    assert "--no-check-certificate" not in args
+    installer = Path(args[args.index("-O") + 1])
+    assert installer.name == "ppu-sdk.run"
+    assert installer.parent.parent == workspace
+    assert (workspace / "install-args").read_text().splitlines() == ["--prefix=/usr/local", "--silent"]
+
+
+@pytest.mark.parametrize("url", [None, ""])
+def test_missing_sdk_url_stops_before_download(run_sdk_install, url):
+    result, events = run_sdk_install(SDK_URL=url)
+    assert result.returncode != 0
+    assert "SDK_URL" in result.stderr
+    assert events == []
+
+
+@pytest.mark.parametrize("exit_code", ["4", "8"])
+def test_sdk_download_failure_prevents_install_and_build(run_sdk_install, exit_code):
+    result, events = run_sdk_install(TEST_WGET_EXIT=exit_code)
+    assert result.returncode == int(exit_code)
+    assert events == ["download"]
+
+
+def test_empty_sdk_download_prevents_install_and_build(run_sdk_install):
+    result, events = run_sdk_install(TEST_EMPTY_DOWNLOAD="1")
+    assert result.returncode != 0
+    assert "下载的 SDK run 包为空" in result.stderr
+    assert events == ["download"]
+
+
+def test_sdk_installer_failure_prevents_environment_and_build(run_sdk_install):
+    result, events = run_sdk_install(TEST_INSTALL_EXIT="23")
+    assert result.returncode == 23
+    assert events == ["download", "install"]
+
+
+@pytest.mark.parametrize("phase", ["install", "build"])
+def test_ldconfig_failure_stops_before_torch_and_build(run_sdk_install, phase):
+    result, events = run_sdk_install(TEST_FAIL_LDCONFIG_PHASE=phase)
+    assert result.returncode == 19
+    expected = ["download", "install", "ldconfig:install"]
+    assert events == (expected if phase == "install" else expected + ["ldconfig:build"])
+
+
+def test_sdk_environment_failure_prevents_torch_and_build(run_sdk_install):
+    result, events = run_sdk_install(TEST_SOURCE_EXIT="17")
+    assert result.returncode == 17
+    assert events == ["download", "install", "ldconfig:install", "ldconfig:build", "source"]
+
+
+@pytest.mark.parametrize("torch_version", [None, ""])
+def test_empty_torch_skips_install_but_runs_build(run_sdk_install, workspace, torch_version):
+    result, events = run_sdk_install(TORCH_VERSION=torch_version)
+    assert result.returncode == 0, result.stderr
+    assert events == ["download", "install", "ldconfig:install", "ldconfig:build", "source", "build"]
+    assert not (workspace / "pip-calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("torch_version", ["2.10.0", "2.13.0"])
+def test_build_installs_selected_torch_before_command(run_build, workspace, torch_version):
+    result = run_build(TORCH_VERSION=torch_version, build_command=(
+        'test "$SDK_READY" = yes\nprintf "build\\n" >> "$RUNNER_TEMP/events"'
+    ))
+    assert result.returncode == 0, result.stderr
+    assert (workspace / "events").read_text().splitlines() == ["ldconfig:build", "source", "pip", "build"]
+    assert json.loads((workspace / "pip-calls.jsonl").read_text()) == [
+        "install", f"torch=={torch_version}", "-i",
+        "https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple",
+    ]
+
+
+def test_torch_install_failure_prevents_build(run_sdk_install):
+    result, events = run_sdk_install(TEST_PIP_EXIT="23")
+    assert result.returncode == 23
+    assert events == ["download", "install", "ldconfig:install", "ldconfig:build", "source", "pip"]
+
+
 @pytest.mark.parametrize("runtime_version", ["2", "3"])
 def test_runtime_environment_reaches_build_command(workflow, run_build, runtime_version):
     runtime_env = workflow["jobs"]["matrix-job"]["env"]["RUNTIME_VERSION"].replace(
@@ -586,7 +951,8 @@ def test_nonrelease_matrix_build_stops_after_original_wheel_artifact(
             continue
         executed.append(step["name"])
         if step["name"] == "编译":
-            result = run_build(build_command=command, RELEASE_VERSION=entry["release_version"])
+            result = run_build(build_command=command, RELEASE_VERSION=entry["release_version"],
+                               TORCH_VERSION=entry["torch_version"])
             successful = result.returncode == 0
         elif step["name"] == "收集 wheel 到 dist":
             result = run_collect()
@@ -659,7 +1025,7 @@ def test_real_matrix_output_drives_repack_and_upload(
     result = run_build(build_command=(
         f"printf 'test wheel data' > {shlex.quote('component/build output/' + original_name)}\n"
         "printf 'dependency wheel' > dist/dependency-1.0.0-py3-none-any.whl"
-    ))
+    ), TORCH_VERSION=entry["torch_version"])
     assert result.returncode == 0, result.stderr
     result = run_collect(package_name=values["package_name"])
     assert result.returncode == 0, result.stderr

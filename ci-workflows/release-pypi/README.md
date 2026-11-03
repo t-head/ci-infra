@@ -117,7 +117,7 @@ Arrays are passed as **JSON strings**, not YAML arrays. All version arrays must 
 | `python_versions` | No | `'["312"]'` | 支持 `"38"`、`"310"`、`"312"`，也接受 JSON 整数，如 `[38,310]` |
 | `os_versions` | No | `'["ubuntu2404"]'` | 支持 `ubuntu2004`、`ubuntu2204`、`ubuntu2404`、`alios7u2` |
 | `runtime_versions` | No | `'["3"]'` | 支持 `"2"`、`"3"`，元素必须是字符串 |
-| `torch_versions` | No | `'["2.10.0"]'` | 支持 `"2.8.0"`、`"2.10.0"`、`"2.13.0"`；`'[""]'` 表示不包含 Torch 版本 |
+| `torch_versions` | No | `'["2.10.0"]'` | 支持 `"2.10.0"`、`"2.13.0"`；`'[""]'` 表示不包含 Torch 版本 |
 | `sdk_versions` | No | `'["2.2.0"]'` | 支持 `"2.1.0"`、`"2.2.0"` |
 | `template_repository` | No | `t-head/ci-infra` | 保存模板工具脚本的仓库 |
 | `template_ref` | Yes | None | Template repository version; must match the version referenced in `uses` |
@@ -229,7 +229,7 @@ Relevant environment variables:
 | --- | --- |
 | `HGGCRT_VERSION` | Explicit Runtime version, such as `hggcrt3`; if unset or incorrectly formatted, detection falls back to `hgcc --version` |
 | `SAIL_SDK_MATCH_STRATEGY` | Set to `off` to construct the wheel URL directly using local naming rules |
-| `SAIL_PYPI_SDK_VESION` | SDK version lookup entry provided by the template; `VESION` is the existing spelling, and its use depends on the matching strategy |
+| `SAIL_PYPI_SDK_VERSION` | SDK version lookup entry provided by the template; `VESION` is the existing spelling, and its use depends on the matching strategy |
 
 ## Repository Structure
 
