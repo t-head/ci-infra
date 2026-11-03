@@ -18,6 +18,16 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 FILES = ("master-worker.sh", "master-session.sh", "cluster-ssh.sh", "cluster-exec.sh")
 THIS = Path(__file__).resolve()
 BASH = "/bin/bash"
+SCRATCH_NAMES = ("entry", "name", "value", "temp", "rank", "rc", "task", "command_pid", "child",
+                 "now", "file", "limit", "size", "path", "create", "part", "current", "oldifs",
+                 "root", "listing", "mode", "links", "uid", "gid", "rest", "chown", "host",
+                 "preferred", "master", "low", "high", "seed", "offset", "port", "emitted",
+                 "phase", "target", "reply", "budget", "type", "key", "comment", "listener",
+                 "i", "bind", "next", "pid", "children", "session", "health_now", "health_last")
+
+
+def environment_file(path):
+    return dict(entry.split(b"=", 1) for entry in path.read_bytes().split(b"\0") if entry)
 
 
 def event(root, **values):
@@ -157,6 +167,8 @@ class Fixture(unittest.TestCase):
             "/run/cluster-config": str(config),
             "/run/cluster": str(runtime),
             "/mnt/wl_nas/devops/runtime/master": str(self.registry_root),
+            # Also applied to real Linux tests: never write the host's /dev.
+            "/dev/termination-log": str(node / "termination-log"),
         }
         if not real:
             replacements["/run/sshd"] = str(node / "privsep")
@@ -230,6 +242,11 @@ class Fixture(unittest.TestCase):
         states = [str(path) + ": " + path.read_text() for path in self.root.glob("node-*/runtime/status.json")]
         self.fail("condition not reached: " + output + "\n" + "\n".join(states))
 
+    def assert_termination(self, node, env, outcome):
+        self.assertEqual(json.loads((node / "termination-log").read_text()),
+                         dict(source="cluster-master-runtime", outcome=outcome,
+                              deadline=int(env["PPU_DEADLINE"]), rank=int(env["NODE_RANK"])))
+
     def wait_cluster(self, procs, expected=(0, 143), timeout=30):
         try:
             codes = []
@@ -255,6 +272,14 @@ class RuntimeUnitTests(Fixture):
     def test_bash32_syntax(self):
         for name in FILES:
             subprocess.run([BASH, "-n", str(SCRIPTS / name)], check=True)
+
+    def test_runtime_scratch_locals_use_reserved_namespace(self):
+        for name in ("master-worker.sh", "master-session.sh"):
+            for line in (SCRIPTS / name).read_text().splitlines():
+                if line.lstrip().startswith("local "):
+                    for declaration in line.split()[1:]:
+                        if not declaration.startswith("-"):
+                            self.assertTrue(declaration.startswith("CLUSTER_"), name + ": " + line)
 
     def test_candidates_bound_exclusions_and_fallback(self):
         result = self.library("cluster_port_candidates 2222 20003 20005 20007 0")
@@ -474,6 +499,51 @@ class RuntimeUnitTests(Fixture):
         self.assertEqual(result.stdout, b'{"phase":"online"}\n')
         self.assertEqual(result.stderr, b"")
 
+    def test_helpers_preserve_business_names_and_active_reserved_locals(self):
+        _, runtime, _, _, _, env = self.stage()
+        expected = {name: ("" if index % 2 else "current\n'$(touch BAD)'\n")
+                    for index, name in enumerate(SCRATCH_NAMES)}
+        (runtime / "metadata.env").write_bytes(b"")
+        (runtime / "input.env").write_bytes(b"".join(
+            name.encode() + b"=" + value.encode() + b"\0" for name, value in expected.items()))
+        env.update({name: "old-pod-value" for name in expected})
+        env.update(CLUSTER_ACTIVE="old-export", CLUSTER_LOAD_NAME="old-export",
+                   CLUSTER_SAVE_ENTRY="old-export", CLUSTER_SAVE_TEMP="old-export")
+        code = ("outer() { local CLUSTER_ACTIVE=still-live; cluster_env_clean; "
+                '[[ $CLUSTER_ACTIVE == still-live ]] || return 91; '
+                "cluster_env_load_file " + shlex.quote(str(runtime / "input.env")) + "; "
+                "cluster_env_save; }; outer")
+        result = self.registry(runtime, code, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = environment_file(runtime / "environment.env")
+        for name, value in expected.items():
+            self.assertEqual(snapshot[name.encode()], value.encode(), name)
+        self.assertFalse(any(name.startswith(b"CLUSTER_") for name in snapshot))
+        self.assertFalse((runtime / "BAD").exists())
+
+    def test_session_business_names_and_reserved_export_attributes(self):
+        node, runtime, _, env = self.session_fixture()
+        expected = {name: ("" if index % 2 else "session\n'quoted'\n")
+                    for index, name in enumerate(SCRATCH_NAMES)}
+        with (runtime / "environment.env").open("ab") as handle:
+            for name, value in expected.items():
+                handle.write(name.encode() + b"=" + value.encode() + b"\0")
+        env.update({name: "old-pod-value" for name in expected})
+        env.update(CLUSTER_SESSION_INTENT="exported-wrong-command", CLUSTER_SESSION_CHILD="123",
+                   CLUSTER_SESSION_RC="99", CLUSTER_CLEAN_ENTRY="exported-old-entry")
+        for intent, stdin in (("/usr/bin/env -0", None), ("", b"/usr/bin/env -0\n")):
+            with self.subTest(intent=intent):
+                result = subprocess.run([BASH, str(runtime / "master-session.sh")],
+                                        env=dict(env, SSH_ORIGINAL_COMMAND=intent), input=stdin,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                values = dict(entry.split(b"=", 1) for entry in result.stdout.split(b"\0") if entry)
+                for name, value in expected.items():
+                    self.assertEqual(values[name.encode()], value.encode(), name)
+                self.assertEqual({name for name in values if name.startswith(b"CLUSTER_")}, set())
+                self.assertEqual(list((runtime / "sessions").iterdir()), [])
+        self.assertFalse((node / "termination-log").exists())
+
     def capture_fixture(self):
         _, runtime, config, _, tools, env = self.stage()
         executable(tools / "capture", wrapper("capture", self.root, 0))
@@ -542,7 +612,7 @@ class RuntimeUnitTests(Fixture):
 
     def test_deadline_and_term_bound_blocked_startup(self):
         for terminate in (False, True):
-            node, _, config, _, _, env = self.stage(rank=int(terminate))
+            node, runtime, config, _, _, env = self.stage(rank=int(terminate))
             (config / "install-ssh.sh").write_text("/bin/sleep 60\n")
             if not terminate:
                 env["PPU_DEADLINE"] = str(int(time.time()) + 2)
@@ -553,8 +623,94 @@ class RuntimeUnitTests(Fixture):
                 proc.terminate()
             self.assertEqual(proc.wait(timeout=6), 143 if terminate else 124)
             self.assertLess(time.monotonic() - start, 5)
-        env = dict(self.env, PPU_DEADLINE=str(int(time.time()) - 1))
-        self.assertEqual(self.library("cluster_check_deadline", env).returncode, 124)
+            self.assert_termination(node, env, "runtime" if terminate else "timeout")
+            self.assertEqual((runtime / "deadline-exceeded").exists(), not terminate)
+
+    def test_expired_startup_and_child_deadline_marker(self):
+        node, runtime, _, _, _, env = self.stage()
+        env["PPU_DEADLINE"] = str(int(time.time()) - 1)
+        proc = self.start(node, env)
+        self.assertEqual(proc.wait(timeout=5), 124)
+        self.assert_termination(node, env, "timeout")
+        self.assertTrue((runtime / "deadline-exceeded").is_file())
+        self.assertFalse((runtime / "listener.pid").exists())
+        (runtime / "deadline-exceeded").unlink()
+        message = (node / "termination-log").read_bytes()
+        result = self.registry(runtime, "cluster_check_deadline", env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertTrue((runtime / "deadline-exceeded").is_file())
+        self.assertEqual((node / "termination-log").read_bytes(), message)
+        self.assertEqual(list(self.registry_root.rglob("deadline-exceeded")), [])
+
+    def test_installer_exit124_before_deadline_is_runtime_failure(self):
+        node, runtime, config, _, _, env = self.stage()
+        (config / "install-ssh.sh").write_text("exit 124\n")
+        proc = self.start(node, env)
+        self.assertEqual(proc.wait(timeout=5), 124)
+        self.assert_termination(node, env, "runtime")
+        self.assertFalse((runtime / "deadline-exceeded").exists())
+        self.assertFalse((runtime / "command.exit").exists())
+
+    def test_marker_and_termination_write_failures_are_reported(self):
+        node, runtime, _, _, _, env = self.stage()
+        env["PPU_DEADLINE"] = str(int(time.time()) - 1)
+        # A directory reliably fails even under Linux root, without chmod grants.
+        (runtime / "deadline-exceeded").mkdir()
+        result = self.registry(runtime, "cluster_check_deadline", env)
+        self.assertEqual(result.returncode, 73)
+        self.assertIn("cannot write local deadline marker", result.stderr)
+        (runtime / "deadline-exceeded").rmdir()
+        (node / "termination-log").mkdir()
+        proc = self.start(node, env)
+        self.assertEqual(proc.wait(timeout=5), 73)
+        self.assertIn("cannot write", (node / "output").read_text())
+        self.assertIn("termination-log", (node / "output").read_text())
+
+    def test_completed_task_wins_over_final_deadline_poll(self):
+        # Exercise the real parent loop while delaying only the task's exit
+        # status publication; no dependency on which side of a second we start.
+        for code in (0, 124):
+            with self.subTest(code=code):
+                node, runtime, _, _, _, env = self.stage(rank=code // 124)
+                env["PPU_DEADLINE"] = str(int(time.time()) + 20)
+                script = ("source " + shlex.quote(str(runtime / "master-worker.sh")) + "\n"
+                          "CLUSTER_OUTCOME=runtime\n"
+                          "cluster_task() { printf '%s\\n' " + str(code) + " > "
+                          + shlex.quote(str(runtime / "command.exit")) + "; "
+                          "printf '{\"phase\":\"done\"}' > " + shlex.quote(str(runtime / "status.json"))
+                          + "; /bin/sleep 0.3; return " + str(code) + "; }\n"
+                          "cluster_remaining() { [[ ! -f " + shlex.quote(str(runtime / "command.exit")) + " ]]; }\n"
+                          "cluster_main; CLUSTER_RESULT=$?; cluster_termination; exit \"$CLUSTER_RESULT\"\n")
+                result = self.bash(script, env=env)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assert_termination(node, env, "command")
+                self.assertFalse((runtime / "deadline-exceeded").exists())
+
+    def test_command_completion_wins_over_stalled_health_probe_at_deadline(self):
+        for code in (0, 124):
+            with self.subTest(code=code):
+                node, runtime, _, _, _, env = self.stage(rank=code // 124)
+                # This test exercises master-only health checks for both codes.
+                env.update(NODE_RANK="0", RANK="0")
+                trigger = shlex.quote(str(runtime / "probe-started"))
+                result_path = shlex.quote(str(runtime / "command.exit"))
+                status = shlex.quote(str(runtime / "status.json"))
+                job = shlex.quote(str(runtime / "job-id"))
+                script = ("source " + shlex.quote(str(runtime / "master-worker.sh")) + "\n"
+                          "CLUSTER_OUTCOME=runtime\n"
+                          "cluster_task() { printf job-independent-123 > " + job + "; "
+                          "printf '{\"phase\":\"running\"}' > " + status + "; "
+                          "while [[ ! -f " + trigger + " ]]; do /bin/sleep 0.01; done; "
+                          "printf '%s\\n' " + str(code) + " > " + result_path + "; "
+                          "printf '{\"phase\":\"done\"}' > " + status + "; "
+                          "/bin/sleep 0.3; return " + str(code) + "; }\n"
+                          "cluster_peer() { : > " + trigger + "; /bin/sleep 0.5; return 1; }\n"
+                          "cluster_remaining() { [[ ! -f " + result_path + " ]]; }\n"
+                          "cluster_main; CLUSTER_RESULT=$?; cluster_termination; exit \"$CLUSTER_RESULT\"\n")
+                result = self.bash(script, env=env)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assert_termination(node, env, "command")
+                self.assertFalse((runtime / "deadline-exceeded").exists())
 
 
 class SimulatedClusterTests(Fixture):
@@ -619,6 +775,72 @@ class SimulatedClusterTests(Fixture):
             self.assertNotIn(name, values)
         self.assertEqual(json.loads((nodes[0][1] / "status.json").read_text())["rank"], 0)
 
+    def check_business_scratch_exports(self, real=False):
+        nodes = [self.stage(i, real=real) for i in range(2)]
+        expected = []
+        initial = {name: f"pod-old-{name}\n'quoted'\n" for name in SCRATCH_NAMES}
+        for rank, (node, runtime, _, _, _, env) in enumerate(nodes):
+            current = {name: ("" if index % 2 == rank else f"setup-{rank}-{name}\n'$(touch BAD)'\n")
+                       for index, name in enumerate(SCRATCH_NAMES)}
+            expected.append(current)
+            env.update(initial)
+            # Reserved input must neither unset dynamically active locals nor
+            # inherit export attributes into snapshots or independent Bash.
+            env.update({name: "reserved-old-export" for name in
+                        ("CLUSTER_MAIN_NAME", "CLUSTER_MAIN_TASK", "CLUSTER_MAIN_RC",
+                         "CLUSTER_INIT_NAME", "CLUSTER_LOAD_NAME", "CLUSTER_SAVE_TEMP",
+                         "CLUSTER_COMMAND_PID", "CLUSTER_SESSION_CHILD", "CLUSTER_SESSION_RC")})
+            if real:
+                env["PPU_SSH_PORT"] = str(23000 + rank)
+            (node / "env.json").write_text(json.dumps(env))
+            setup = "/usr/bin/env -0 > initial.env\n" + "".join(
+                "export " + name + "=" + shlex.quote(value) + "\n" for name, value in current.items())
+            setup += "export CLUSTER_COMMAND_PID=reserved-setup-export CLUSTER_PRIVATE=must-not-leak\n"
+            (runtime / "setup.sh").write_text(setup)
+            (runtime / "command.sh").write_text(
+                "/usr/bin/env -0 > local.env\n"
+                "/bin/bash --noprofile --norc -c '/usr/bin/env -0' > local-child.env\n"
+                "ssh 127.0.0.3 '/usr/bin/env -0' > direct-remote.env\n"
+                "cluster-exec 127.0.0.3 /usr/bin/env -0 > exec-remote.env\n")
+        procs = [self.start(n[0], n[5]) for n in nodes]
+        self.wait_cluster(procs)
+        for rank, (node, runtime, _, source, _, env) in enumerate(nodes):
+            for path, wanted in ((source / "initial.env", initial),
+                                 (runtime / "environment.env", expected[rank])):
+                values = environment_file(path)
+                for name, value in wanted.items():
+                    self.assertEqual(values[name.encode()], value.encode(), str(path) + ": " + name)
+                self.assertEqual({name for name in values if name.startswith(b"CLUSTER_")},
+                                 {b"CLUSTER_HOSTS_FILE", b"CLUSTER_NODES_FILE"})
+            self.assertFalse((source / "BAD").exists())
+            self.assert_termination(node, env, "command" if rank == 0 else "runtime")
+        for filename, rank in (("local.env", 0), ("local-child.env", 0),
+                               ("direct-remote.env", 1), ("exec-remote.env", 1)):
+            values = environment_file(nodes[0][3] / filename)
+            for name, value in expected[rank].items():
+                self.assertEqual(values[name.encode()], value.encode(), filename + ": " + name)
+            self.assertEqual({name for name in values if name.startswith(b"CLUSTER_")},
+                             {b"CLUSTER_HOSTS_FILE", b"CLUSTER_NODES_FILE"})
+
+    def test_business_scratch_names_survive_full_local_and_remote_paths(self):
+        self.check_business_scratch_exports()
+
+    def test_user_exit124_is_command_failure_not_framework_timeout(self):
+        nodes, procs = self.launch_pair(command="exit 124\n")
+        self.wait_cluster(procs, (124, 143))
+        self.assert_termination(nodes[0][0], nodes[0][5], "command")
+        self.assertFalse((nodes[0][1] / "deadline-exceeded").exists())
+        self.assertLess(int(time.time()), int(nodes[0][5]["PPU_DEADLINE"]))
+        self.assertEqual(json.loads((nodes[0][1] / "status.json").read_text())["exit_code"], 124)
+
+    def test_setup_exit124_remains_runtime_failure(self):
+        nodes, procs = self.launch_pair(setup=["exit 124\n", ":\n"],
+                                       command="printf BAD > command-result\n")
+        self.assertEqual(procs[0].wait(timeout=15), 124)
+        self.assert_termination(nodes[0][0], nodes[0][5], "runtime")
+        self.assertFalse((nodes[0][1] / "deadline-exceeded").exists())
+        self.assertFalse((nodes[0][3] / "command-result").exists())
+
     def test_command_exec_preserves_setup_shell_state_and_exit_code(self):
         nodes, procs = self.launch_pair(setup=["LOCAL_VALUE=from-setup\n"] * 2,
                                        command='printf %s "$LOCAL_VALUE" > inherited\nexec /bin/sh -c \'exit 13\'\n')
@@ -681,7 +903,10 @@ class SimulatedClusterTests(Fixture):
         self.env["PPU_DEADLINE"] = str(int(time.time()) + 8)
         nodes, procs = self.launch_pair(command="/bin/sleep 60\n")
         self.wait_cluster(procs, (124, 124), timeout=15)
-        for _, runtime, _, _, _, _ in nodes:
+        for node, runtime, _, _, _, env in nodes:
+            self.assert_termination(node, env, "timeout")
+            self.assertTrue((runtime / "deadline-exceeded").is_file())
+            self.assertEqual(list(self.registry_root.rglob("deadline-exceeded")), [])
             if (runtime / "listener.pid").exists():
                 pid = int((runtime / "listener.pid").read_text())
                 with self.assertRaises(ProcessLookupError):
@@ -715,6 +940,23 @@ class RealSshdTests(SimulatedClusterTests):
         self.assertFalse((nodes[1][3] / "command-result").exists())
         self.assertNotEqual(json.loads((nodes[0][1] / "status.json").read_text())["port"],
                             json.loads((nodes[1][1] / "status.json").read_text())["port"])
+
+    def test_real_business_scratch_names_survive_local_and_session_paths(self):
+        self.check_business_scratch_exports(real=True)
+
+    def test_real_user_exit124_is_command_failure(self):
+        nodes, procs = self.launch_pair(real=True, command="exit 124\n")
+        self.wait_cluster(procs, (124, 143))
+        self.assert_termination(nodes[0][0], nodes[0][5], "command")
+        self.assertFalse((nodes[0][1] / "deadline-exceeded").exists())
+
+    def test_real_actual_framework_deadline(self):
+        self.env["PPU_DEADLINE"] = str(int(time.time()) + 10)
+        nodes, procs = self.launch_pair(real=True, command="/bin/sleep 60\n")
+        self.wait_cluster(procs, (124, 124), timeout=20)
+        for node, runtime, _, _, _, env in nodes:
+            self.assert_termination(node, env, "timeout")
+            self.assertTrue((runtime / "deadline-exceeded").is_file())
 
     def test_real_runner_uid1001_reads_renames_and_cleans_registry_without_acl(self):
         # An independent NAS fixture avoids exposing the 0700 SSH fixture under

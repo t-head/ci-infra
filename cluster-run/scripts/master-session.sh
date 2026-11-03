@@ -21,20 +21,22 @@ if [[ -n $CLUSTER_SESSION_INTENT ]]; then
 else
     /bin/bash --noprofile --norc <&0 &
 fi
-child=$!
+# Do not inherit an export attribute from a same-named Pod variable.
+unset CLUSTER_SESSION_CHILD
+CLUSTER_SESSION_CHILD=$!
 set +m
-printf '%s\n' "$child" > /run/cluster/sessions/$$
+printf '%s\n' "$CLUSTER_SESSION_CHILD" > /run/cluster/sessions/$$
 finish_session() {
-    local rc=$1
+    local CLUSTER_SESSION_RC=$1
     trap - EXIT TERM INT HUP
-    kill -TERM -- "-$child" 2>/dev/null || :
+    kill -TERM -- "-$CLUSTER_SESSION_CHILD" 2>/dev/null || :
     /bin/sleep 0.2
-    kill -KILL -- "-$child" 2>/dev/null || :
+    kill -KILL -- "-$CLUSTER_SESSION_CHILD" 2>/dev/null || :
     /bin/rm -f /run/cluster/sessions/$$
-    exit "$rc"
+    exit "$CLUSTER_SESSION_RC"
 }
 trap 'finish_session 143' TERM
 trap 'finish_session 130' INT
 trap 'finish_session 129' HUP
-wait "$child"
+wait "$CLUSTER_SESSION_CHILD"
 finish_session "$?"

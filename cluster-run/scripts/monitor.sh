@@ -105,8 +105,18 @@ while true; do
     [ "$(date +%s)" -lt "$DEADLINE" ] || FINAL_STATUS="timeout"
     exit "$rc"
   fi
+  if [ "$MASTER_MULTI" = true ]; then
+    POD_SNAPSHOT=$(printf '%s' "$POD_SNAPSHOT" | jq --argjson deadline "$DEADLINE" --arg prefix "${JOB_NAME}-worker-" '
+      .items |= map(. as $pod |
+        ((.status.containerStatuses[0].state.terminated.message // "" | fromjson?) // {}) as $message |
+        . + {_cluster_timeout: (.status.reason == "DeadlineExceeded" or
+          (($message | type) == "object" and $message.source == "cluster-master-runtime" and
+           $message.outcome == "timeout" and $message.deadline == $deadline and
+           $message.rank == (($pod.metadata.name | ltrimstr($prefix) | tonumber?) // -1)))})')
+  fi
   SUCCEEDED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Succeeded")] | length')
-  FAILED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Failed")] | length')
+  FAILED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Failed" and ._cluster_timeout != true)] | length')
+  TIMED_OUT=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Failed" and ._cluster_timeout == true)] | length')
   RUNNING=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Running")] | length')
   STARTING=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Pending")] | length')
 
@@ -129,7 +139,7 @@ while true; do
       echo "::error::Master allocation lost a worker (expected=$NNODES actual=$POD_COUNT)"
       exit 0
     fi
-    ABNORMAL=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.metadata.deletionTimestamp != null or .status.phase == "Unknown" or (.status.phase != "Failed" and (any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0))))] | length')
+    ABNORMAL=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(._cluster_timeout != true and (.metadata.deletionTimestamp != null or .status.phase == "Unknown" or (.status.phase != "Failed" and (any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0)))))] | length')
     if [ "$ABNORMAL" -gt 0 ]; then
       echo "::error::Master allocation contains a deleting, unknown or initialization-failed pod"
       FINAL_STATUS="failed"
@@ -160,10 +170,15 @@ while true; do
     FAILED=0
     MASTER_COMPLETED=0
     WORKER_COMPLETED=0
-    while IFS='|' read -r pod_name phase finished_at; do
+    while IFS='|' read -r pod_name phase finished_at deadline_exit; do
+      [ "$deadline_exit" != true ] || continue
       [ -n "$finished_at" ] || continue
       finished_epoch=$(date -d "$finished_at" +%s)
       [ "$finished_epoch" -le "$DEADLINE" ] || continue
+      if [ "$finished_epoch" -eq "$DEADLINE" ] && [[ "$finished_at" =~ \.([0-9]+) ]] \
+        && [[ "${BASH_REMATCH[1]}" == *[1-9]* ]]; then
+        continue
+      fi
       case "$phase" in
         Succeeded)
           SUCCEEDED=$(( SUCCEEDED + 1 ))
@@ -175,7 +190,7 @@ while true; do
           ;;
         Failed) FAILED=$(( FAILED + 1 )) ;;
       esac
-    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.metadata.name, .status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // "")] | join("|")')
+    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.metadata.name, .status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // ""), (._cluster_timeout // false)] | join("|")')
   fi
 
   if [ "$MASTER_MULTI" = true ] && [ "$WORKER_COMPLETED" -gt 0 ]; then
@@ -203,6 +218,12 @@ while true; do
     else
       echo "All worker pods succeeded"
     fi
+    exit 0
+  fi
+
+  if [ "$TIMED_OUT" -gt 0 ]; then
+    FINAL_STATUS="timeout"
+    echo "::error::Master allocation reached its framework deadline"
     exit 0
   fi
 

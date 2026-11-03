@@ -62,5 +62,5 @@ port=$(/usr/bin/jq -r .port <<< "$record")
 trusted=$(/usr/bin/jq -er --argjson rank "$rank" '.[$rank].host' /run/cluster/trusted-nodes.json) || fail 'invalid trusted mapping'
 [[ $target == "$trusted" ]] || fail 'host differs from trusted mapping'
 cluster_ssh_options
-exec /usr/bin/ssh "${CLUSTER_SSH_ARGS[@]}" "${options[@]}" \
+exec /usr/bin/ssh "${options[@]}" "${CLUSTER_SSH_ARGS[@]}" \
     -o "HostKeyAlias=cluster-rank-$rank" -p "$port" -- "root@$target" "$@"

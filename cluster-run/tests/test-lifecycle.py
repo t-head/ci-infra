@@ -655,6 +655,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(any(self.env["JOB_NAME"] + "-ssh" in args for args in deletes))
         self.assertTrue(all("--wait=false" in args for args in deletes))
 
+    def test_validated_ssh_options_take_precedence_in_real_openssh_configuration(self):
+        runtime = self.root / "ssh-options"
+        runtime.mkdir()
+        nodes = [{"rank": 0, "host": "node-0.example", "cards": 1, "port": 2222}]
+        (runtime / "nodes.json").write_text(json.dumps(nodes))
+        (runtime / "trusted-nodes.json").write_text(json.dumps(nodes))
+        shutil.copyfile(self.scripts / "master-worker.sh", runtime / "master-worker.sh")
+        wrapper = runtime / "cluster-ssh.sh"
+        wrapper.write_text((self.scripts / "cluster-ssh.sh").read_text()
+                           .replace("/run/cluster", str(runtime))
+                           .replace("exec /usr/bin/ssh ", "exec /usr/bin/ssh -G "))
+        for options, expected in (([], {"connecttimeout": "2", "loglevel": "ERROR"}),
+                                  (["-o", "ConnectTimeout=9", "-o", "ServerAliveInterval=7", "-o",
+                                    "ServerAliveCountMax=4", "-o", "LogLevel=DEBUG3"],
+                                   {"connecttimeout": "9", "serveraliveinterval": "7",
+                                    "serveralivecountmax": "4", "loglevel": "DEBUG3"})):
+            with self.subTest(options=options):
+                result = subprocess.run(["/bin/bash", str(wrapper), *options, "node-0.example"],
+                                        env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                config = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+                for key, value in expected.items():
+                    self.assertEqual(config[key], value)
+                self.assertEqual(config["port"], "2222")
+                self.assertIn(config["stricthostkeychecking"], ("yes", "true"))
+
     def test_submit_rejects_invalid_launch_mode_before_creation(self):
         for mode in ("MASTER", "worker", "master; touch unsafe", "each_node"):
             with self.subTest(mode=mode):
@@ -940,7 +966,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(int((self.root / "clock").read_text()), EPOCH)
 
     def test_master_monitor_uses_master_finished_at_at_shared_deadline(self):
-        for finished, expected in ((55, "succeeded"), (60, "succeeded"), (61, "timeout"), (None, "timeout")):
+        for finished, expected in ((55, "succeeded"), (60, "succeeded"), (60.9, "timeout"), (61, "timeout"), (None, "timeout")):
             with self.subTest(finished=finished):
                 master = pod(0, "Succeeded", EPOCH, started=EPOCH,
                              finished=EPOCH + finished if finished is not None else None)
@@ -980,13 +1006,66 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(int((self.root / "clock").read_text()), EPOCH + finished_at)
 
     def test_master_monitor_failed_master_obeys_finished_at_deadline(self):
-        for finished, expected in ((55, "failed"), (61, "timeout")):
+        for finished, expected in ((55, "failed"), (60, "failed"), (60.9, "timeout"), (61, "timeout")):
             with self.subTest(finished=finished):
                 self.configure([pod(0, "Failed", EPOCH, started=EPOCH, finished=EPOCH + finished),
                                 pod(1, "Running", EPOCH, started=EPOCH)], now=EPOCH + 65)
                 rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
                 self.assertEqual(rc, 0, text)
                 self.assert_reported(outputs, expected, 2)
+
+    def test_master_framework_deadline_message_is_timeout_at_exact_or_fractional_deadline(self):
+        for finished in (60, 60.9):
+            with self.subTest(finished=finished):
+                master = pod(0, "Failed", EPOCH, started=EPOCH, finished=EPOCH + finished)
+                terminal = master["status"]["containerStatuses"][0]["state"]["terminated"]
+                terminal.update(exitCode=124, message=json.dumps({"source": "cluster-master-runtime",
+                                "outcome": "timeout", "deadline": EPOCH + 60, "rank": 0}))
+                self.configure([master, pod(1, "Running", EPOCH, started=EPOCH)], now=EPOCH + 65)
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, "timeout", 2)
+
+    def test_idle_worker_deadline_cannot_override_on_time_master_success(self):
+        for kind in ("runtime", "kubernetes"):
+            with self.subTest(kind=kind):
+                master = pod(0, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 55)
+                worker = pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 60)
+                terminal = worker["status"]["containerStatuses"][0]["state"]["terminated"]
+                if kind == "runtime":
+                    terminal.update(exitCode=124, message=json.dumps({"source": "cluster-master-runtime",
+                                    "outcome": "timeout", "deadline": EPOCH + 60, "rank": 1}))
+                else:
+                    terminal["exitCode"] = 137
+                    worker["status"]["reason"] = "DeadlineExceeded"
+                self.configure([master, worker], now=EPOCH + 65)
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, "succeeded", 2)
+
+    def test_user_exit_124_and_unrelated_termination_messages_remain_failures(self):
+        messages = ["", "[]", "not json",
+                    json.dumps({"source": "cluster-master-runtime", "outcome": "command", "deadline": EPOCH + 60, "rank": 0}),
+                    json.dumps({"source": "cluster-master-runtime", "outcome": "timeout", "deadline": EPOCH + 61, "rank": 0}),
+                    json.dumps({"source": "cluster-master-runtime", "outcome": "timeout", "deadline": EPOCH + 60, "rank": 1})]
+        for message in messages:
+            with self.subTest(message=message):
+                master = pod(0, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 55)
+                master["status"]["containerStatuses"][0]["state"]["terminated"].update(exitCode=124, message=message)
+                self.configure([master, pod(1, "Running", EPOCH, started=EPOCH)], now=EPOCH + 65)
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, "failed", 2)
+
+    def test_genuine_worker_failure_wins_over_master_framework_timeout(self):
+        master = pod(0, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 60)
+        master["status"]["containerStatuses"][0]["state"]["terminated"].update(
+            exitCode=124, message=json.dumps({"source": "cluster-master-runtime", "outcome": "timeout",
+                                             "deadline": EPOCH + 60, "rank": 0}))
+        self.configure([master, pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 55)], now=EPOCH + 65)
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "failed", 2)
 
     def test_master_monitor_cancellation_reaps_logs_and_preserves_terminal_record(self):
         self.configure([pod(i, "Running", EPOCH, started=EPOCH) for i in range(2)],
