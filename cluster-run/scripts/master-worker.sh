@@ -248,12 +248,18 @@ cluster_check_deadline() {
 }
 cluster_termination() {
     # Only the executable parent calls this, never a task or an SSH session.
-    local CLUSTER_MESSAGE_DEADLINE=0 CLUSTER_MESSAGE_RANK=0
+    local CLUSTER_MESSAGE_DEADLINE=0 CLUSTER_MESSAGE_RANK=0 CLUSTER_MESSAGE_FINISHED= CLUSTER_MESSAGE_CODE=0
+    if [[ $CLUSTER_OUTCOME == command && -f /run/cluster/command.finished && -f /run/cluster/command.exit ]]; then
+        CLUSTER_MESSAGE_FINISHED=$(< /run/cluster/command.finished)
+        CLUSTER_MESSAGE_CODE=$(< /run/cluster/command.exit)
+    fi
     if cluster_number "${PPU_DEADLINE:-}"; then CLUSTER_MESSAGE_DEADLINE=$((10#$PPU_DEADLINE)); fi
     if cluster_number "${NODE_RANK:-}"; then CLUSTER_MESSAGE_RANK=$((10#$NODE_RANK)); fi
     if ! /usr/bin/jq -cn --arg outcome "$CLUSTER_OUTCOME" \
         --argjson deadline "$CLUSTER_MESSAGE_DEADLINE" --argjson rank "$CLUSTER_MESSAGE_RANK" \
-        '{source:"cluster-master-runtime",outcome:$outcome,deadline:$deadline,rank:$rank}' > /dev/termination-log; then
+        --arg finished "$CLUSTER_MESSAGE_FINISHED" --argjson code "$CLUSTER_MESSAGE_CODE" \
+        '{source:"cluster-master-runtime",outcome:$outcome,deadline:$deadline,rank:$rank} +
+         (if $finished == "" then {} else {command_finished_at:$finished,exit_code:$code} end)' > /dev/termination-log; then
         cluster_error 'cannot write /dev/termination-log'
         return 73
     fi
@@ -469,6 +475,7 @@ cluster_task() {
         ( trap - EXIT; set +e; source /run/cluster/command.sh ) <&0 &
         local CLUSTER_COMMAND_PID=$! CLUSTER_COMMAND_RC
         if wait "$CLUSTER_COMMAND_PID"; then CLUSTER_COMMAND_RC=0; else CLUSTER_COMMAND_RC=$?; fi
+        /bin/date +%s.%N > /run/cluster/command.finished
         printf '%s\n' "$CLUSTER_COMMAND_RC" > /run/cluster/command.exit
         return "$CLUSTER_COMMAND_RC"
     else
@@ -532,7 +539,7 @@ cluster_main() {
        ${POD_UID:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ &&
        -n ${MASTER_ADDR:-} && -d ${SOURCE_DIR:-} ]] || return 65
     # Markers are local to this runtime attempt, never stored on NAS.
-    /bin/rm -f /run/cluster/deadline-exceeded /run/cluster/command.exit || return 73
+    /bin/rm -f /run/cluster/deadline-exceeded /run/cluster/command.exit /run/cluster/command.finished || return 73
     cluster_check_deadline || {
         CLUSTER_MAIN_RC=$?
         [[ ! -f /run/cluster/deadline-exceeded ]] || CLUSTER_OUTCOME=timeout

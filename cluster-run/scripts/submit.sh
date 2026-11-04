@@ -663,8 +663,9 @@ if [ "$MASTER_MULTI" = true ]; then
   kube_request delete secret "${JOB_NAME}-ssh" -n "$NAMESPACE" --ignore-not-found=true --wait=false
   prepare_master_secret
   MASTER_SERVICE_OPTIONS="  publishNotReadyAddresses: true"
+  # Runtime enforces DEADLINE; Kubernetes allows ten seconds to publish its result.
   MASTER_POD_OPTIONS="  automountServiceAccountToken: false
-  activeDeadlineSeconds: $((DEADLINE - $(date +%s)))"
+  activeDeadlineSeconds: $((DEADLINE - $(date +%s) + 10))"
   MASTER_CONTAINER_OPTIONS="      readinessProbe:
         exec:
           command: [\"/bin/bash\", \"-c\", \"test -f /run/cluster/ready\"]

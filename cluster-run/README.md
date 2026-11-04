@@ -167,7 +167,9 @@ Master mode provides `cluster-ssh` and `cluster-exec` to select each destination
 actual port and enforce host-key verification. Remote commands restore the
 destination node's exported environment; node-level RANK/WORLD_SIZE are not MPI
 process ranks. The orchestrator must wait for all remote tasks and propagate
-their failures before exiting.
+their failures before exiting. Command completion is recorded independently of
+container shutdown; up to ten seconds after the deadline are reserved only for
+reporting that result and stopping SSH services, not for extending the command budget.
 
 Variables declared in the workflow or job `env` context are forwarded automatically.
 

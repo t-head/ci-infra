@@ -983,7 +983,7 @@ class LifecycleTests(unittest.TestCase):
         rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
         self.assertEqual(rc, 0, text)
         self.assertIn(outputs["job_status"], ("failed", "timeout"))
-        self.assertLessEqual(int((self.root / "clock").read_text()), EPOCH + 60)
+        self.assertLessEqual(int((self.root / "clock").read_text()), EPOCH + 70)
 
     def test_master_monitor_ready_worker_loss_has_bounded_grace_and_can_recover(self):
         for recover, expected, finished_at in ((False, "failed", 60), (True, "succeeded", 90)):
@@ -1005,6 +1005,48 @@ class LifecycleTests(unittest.TestCase):
                 self.assert_reported(outputs, expected, 2)
                 self.assertEqual(int((self.root / "clock").read_text()), EPOCH + finished_at)
 
+    def test_master_monitor_alternating_ready_worker_loss_has_independent_grace(self):
+        master = pod(0, "Running", EPOCH, started=EPOCH)
+        workers = [pod(rank, "Running", EPOCH, started=EPOCH) for rank in (1, 2)]
+        for worker in workers:
+            worker["status"]["conditions"][0]["status"] = "True"
+        lost = json.loads(json.dumps(workers))
+        for worker in lost:
+            worker["status"]["conditions"][0].update(status="False", reason="NodeNotReady")
+        self.configure([master, *workers], later=[
+            (EPOCH + 30, [master, lost[0], workers[1]]),
+            (EPOCH + 60, [master, workers[0], lost[1]]),
+            (EPOCH + 90, [pod(0, "Succeeded", EPOCH, started=EPOCH,
+                              finished=EPOCH + 90), *workers]),
+        ])
+        rc, outputs, text = self.run_script(
+            "monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="3", JOB_DEADLINE=str(EPOCH + 300))
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "succeeded", 3)
+        self.assertEqual(int((self.root / "clock").read_text()), EPOCH + 90)
+        self.assertNotIn("remained unavailable for 30 seconds", text)
+
+    def test_master_monitor_continuous_ready_worker_loss_fails_despite_peer_recovery(self):
+        master = pod(0, "Running", EPOCH, started=EPOCH)
+        workers = [pod(rank, "Running", EPOCH, started=EPOCH) for rank in (1, 2)]
+        for worker in workers:
+            worker["status"]["conditions"][0]["status"] = "True"
+        lost = json.loads(json.dumps(workers))
+        for worker in lost:
+            worker["status"]["conditions"][0].update(status="False", reason="NodeNotReady")
+        self.configure([master, *workers], later=[
+            (EPOCH + 30, [master, *lost]),
+            (EPOCH + 60, [master, workers[0], lost[1]]),
+            (EPOCH + 90, [pod(0, "Succeeded", EPOCH, started=EPOCH,
+                              finished=EPOCH + 90), *workers]),
+        ])
+        rc, outputs, text = self.run_script(
+            "monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="3", JOB_DEADLINE=str(EPOCH + 300))
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "failed", 3)
+        self.assertEqual(int((self.root / "clock").read_text()), EPOCH + 60)
+        self.assertIn("A previously ready worker remained unavailable for 30 seconds", text)
+
     def test_master_monitor_failed_master_obeys_finished_at_deadline(self):
         for finished, expected in ((55, "failed"), (60, "failed"), (60.9, "timeout"), (61, "timeout")):
             with self.subTest(finished=finished):
@@ -1013,6 +1055,58 @@ class LifecycleTests(unittest.TestCase):
                 rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
                 self.assertEqual(rc, 0, text)
                 self.assert_reported(outputs, expected, 2)
+
+    def test_command_completion_time_is_independent_of_container_shutdown(self):
+        cases = [("Succeeded", 0, "59.999999999", 63, "succeeded"),
+                 ("Failed", 7, "59.999999999", 63, "failed"),
+                 ("Failed", 124, "59.999999999", 63, "failed"),
+                 ("Succeeded", 0, "60.000000000", 70, "succeeded"),
+                 ("Succeeded", 0, "60.000000001", 63, "timeout"),
+                 ("Succeeded", 0, "59.999999999", 70.1, "timeout")]
+        for phase, code, completion, finished, expected in cases:
+            with self.subTest(phase=phase, completion=completion, finished=finished):
+                master = pod(0, phase, EPOCH, started=EPOCH, finished=EPOCH + finished)
+                seconds, fraction = completion.split(".")
+                message = {"source": "cluster-master-runtime", "outcome": "command", "rank": 0,
+                           "deadline": EPOCH + 60, "exit_code": code,
+                           "command_finished_at": f"{EPOCH + int(seconds)}.{fraction}"}
+                master["status"]["containerStatuses"][0]["state"]["terminated"].update(
+                    exitCode=code, message=json.dumps(message))
+                self.configure([master, pod(1, "Running", EPOCH, started=EPOCH)], now=EPOCH + 75)
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, expected, 2)
+
+    def test_master_shutdown_grace_waits_for_result_without_extending_command_budget(self):
+        for code, phase, expected in ((0, "Succeeded", "succeeded"), (124, "Failed", "failed")):
+            with self.subTest(code=code):
+                master = pod(0, phase, EPOCH, started=EPOCH, finished=EPOCH + 63)
+                master["status"]["containerStatuses"][0]["state"]["terminated"].update(
+                    exitCode=code, message=json.dumps({"source": "cluster-master-runtime", "outcome": "command",
+                    "deadline": EPOCH + 60, "rank": 0, "exit_code": code,
+                    "command_finished_at": f"{EPOCH + 59}.999999999"}))
+                worker = pod(1, "Running", EPOCH, started=EPOCH)
+                self.configure([pod(0, "Running", EPOCH, started=EPOCH), worker], now=EPOCH + 60,
+                               later=[(EPOCH + 63, [master, worker])])
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, expected, 2)
+                self.assertEqual(int((self.root / "clock").read_text()), EPOCH + 63)
+
+    def test_invalid_command_completion_results_do_not_extend_deadline(self):
+        valid = {"source": "cluster-master-runtime", "outcome": "command", "deadline": EPOCH + 60,
+                 "rank": 0, "exit_code": 0, "command_finished_at": f"{EPOCH + 59}.999999999"}
+        for override in ({"source": "user"}, {"outcome": "runtime"}, {"deadline": EPOCH + 61},
+                         {"rank": 1}, {"exit_code": 7}, {"command_finished_at": "invalid"},
+                         {"command_finished_at": 123}, {"command_finished_at": None}):
+            with self.subTest(override=override):
+                master = pod(0, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 63)
+                master["status"]["containerStatuses"][0]["state"]["terminated"].update(
+                    exitCode=0, message=json.dumps({**valid, **override}))
+                self.configure([master, pod(1, "Running", EPOCH, started=EPOCH)], now=EPOCH + 65)
+                rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+                self.assertEqual(rc, 0, text)
+                self.assert_reported(outputs, "timeout", 2)
 
     def test_master_framework_deadline_message_is_timeout_at_exact_or_fractional_deadline(self):
         for finished in (60, 60.9):

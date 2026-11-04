@@ -17,8 +17,10 @@ DRAIN_LOGS=false
 LAUNCH_MODE="${INPUT_LAUNCH_MODE:-each-node}"
 MASTER_MULTI=false
 [ "$LAUNCH_MODE" != master ] || [ "$NNODES" -le 1 ] || MASTER_MULTI=true
+SHUTDOWN_DEADLINE=$DEADLINE
+[ "$MASTER_MULTI" != true ] || SHUTDOWN_DEADLINE=$((DEADLINE + 10))
 READY_WORKERS=" "
-NOT_READY_SINCE=0
+NOT_READY_SINCE=()
 
 set_output() {
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -94,7 +96,8 @@ while true; do
   REQUEST_SECONDS=$(( DEADLINE - NOW ))
   if [ "$REQUEST_SECONDS" -le 0 ]; then
     FINAL_STATUS="timeout"
-    REQUEST_SECONDS=10
+    REQUEST_SECONDS=$((SHUTDOWN_DEADLINE - NOW))
+    [ "$REQUEST_SECONDS" -gt 0 ] || REQUEST_SECONDS=10
   fi
   [ "$REQUEST_SECONDS" -gt 10 ] && REQUEST_SECONDS=10
   if POD_SNAPSHOT=$(timeout --signal=KILL "${REQUEST_SECONDS}s" \
@@ -112,7 +115,17 @@ while true; do
         . + {_cluster_timeout: (.status.reason == "DeadlineExceeded" or
           (($message | type) == "object" and $message.source == "cluster-master-runtime" and
            $message.outcome == "timeout" and $message.deadline == $deadline and
-           $message.rank == (($pod.metadata.name | ltrimstr($prefix) | tonumber?) // -1)))})')
+           $message.rank == (($pod.metadata.name | ltrimstr($prefix) | tonumber?) // -1))),
+          _cluster_command_finished_at:
+            (if ($message | type) == "object" and $message.source == "cluster-master-runtime" and
+                $message.outcome == "command" and $message.deadline == $deadline and $message.rank == 0 and
+                $pod.metadata.name == ($prefix + "0") and
+                ($message.command_finished_at | type) == "string" and
+                ($message.command_finished_at | test("^[0-9]{1,10}\\.[0-9]{9}$")) and
+                $message.exit_code == $pod.status.containerStatuses[0].state.terminated.exitCode and
+                ($message.exit_code | type) == "number" and $message.exit_code >= 0 and $message.exit_code <= 255 and
+                $message.exit_code == ($message.exit_code | floor)
+             then $message.command_finished_at else "" end)})')
   fi
   SUCCEEDED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Succeeded")] | length')
   FAILED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(.status.phase == "Failed" and ._cluster_timeout != true)] | length')
@@ -145,23 +158,23 @@ while true; do
       FINAL_STATUS="failed"
       exit 0
     fi
-    LOST_READY=false
     while IFS='|' read -r name ready; do
+      rank=${name##*-}
       if [ "$ready" = True ]; then
         case "$READY_WORKERS" in *" $name "*) ;; *) READY_WORKERS+="$name " ;; esac
+        unset 'NOT_READY_SINCE[rank]'
       else
-        case "$READY_WORKERS" in *" $name "*) LOST_READY=true ;; esac
+        case "$READY_WORKERS" in
+          *" $name "*)
+            [ -n "${NOT_READY_SINCE[$rank]:-}" ] || NOT_READY_SINCE[$rank]=$NOW
+            if [ $((NOW - NOT_READY_SINCE[rank])) -ge 30 ]; then
+              echo "::error::A previously ready worker remained unavailable for 30 seconds"
+              exit 0
+            fi
+            ;;
+        esac
       fi
     done < <(printf '%s' "$POD_SNAPSHOT" | jq -r --arg master "$POD_W0" '.items[] | select(.metadata.name != $master and .status.phase == "Running") | [.metadata.name, ([.status.conditions[]? | select(.type == "Ready") | .status] | first // "False")] | join("|")')
-    if [ "$LOST_READY" = true ]; then
-      [ "$NOT_READY_SINCE" -ne 0 ] || NOT_READY_SINCE=$NOW
-      if [ $((NOW - NOT_READY_SINCE)) -ge 30 ]; then
-        echo "::error::A previously ready worker remained unavailable for 30 seconds"
-        exit 0
-      fi
-    else
-      NOT_READY_SINCE=0
-    fi
   fi
 
   if [ "$NOW" -ge "$DEADLINE" ]; then
@@ -170,14 +183,22 @@ while true; do
     FAILED=0
     MASTER_COMPLETED=0
     WORKER_COMPLETED=0
-    while IFS='|' read -r pod_name phase finished_at deadline_exit; do
+    while IFS='|' read -r pod_name phase finished_at deadline_exit command_finished_at; do
       [ "$deadline_exit" != true ] || continue
       [ -n "$finished_at" ] || continue
       finished_epoch=$(date -d "$finished_at" +%s)
-      [ "$finished_epoch" -le "$DEADLINE" ] || continue
-      if [ "$finished_epoch" -eq "$DEADLINE" ] && [[ "$finished_at" =~ \.([0-9]+) ]] \
-        && [[ "${BASH_REMATCH[1]}" == *[1-9]* ]]; then
-        continue
+      if [ -n "$command_finished_at" ]; then
+        command_seconds=${command_finished_at%%.*}
+        command_fraction=${command_finished_at#*.}
+        [ "$command_seconds" -le "$DEADLINE" ] && [ "$command_seconds" -le "$finished_epoch" ] || continue
+        [ "$finished_epoch" -le "$SHUTDOWN_DEADLINE" ] || continue
+        if [ "$finished_epoch" -eq "$SHUTDOWN_DEADLINE" ] && [[ "$finished_at" =~ \.([0-9]+) ]] \
+          && [[ "${BASH_REMATCH[1]}" == *[1-9]* ]]; then continue; fi
+        if [ "$command_seconds" -eq "$DEADLINE" ] && [[ "$command_fraction" == *[1-9]* ]]; then continue; fi
+      else
+        [ "$finished_epoch" -le "$DEADLINE" ] || continue
+        if [ "$finished_epoch" -eq "$DEADLINE" ] && [[ "$finished_at" =~ \.([0-9]+) ]] \
+          && [[ "${BASH_REMATCH[1]}" == *[1-9]* ]]; then continue; fi
       fi
       case "$phase" in
         Succeeded)
@@ -190,7 +211,7 @@ while true; do
           ;;
         Failed) FAILED=$(( FAILED + 1 )) ;;
       esac
-    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.metadata.name, .status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // ""), (._cluster_timeout // false)] | join("|")')
+    done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | [.metadata.name, .status.phase, (.status.containerStatuses[0].state.terminated.finishedAt // ""), (._cluster_timeout // false), (._cluster_command_finished_at // "")] | join("|")')
   fi
 
   if [ "$MASTER_MULTI" = true ] && [ "$WORKER_COMPLETED" -gt 0 ]; then
@@ -219,6 +240,17 @@ while true; do
       echo "All worker pods succeeded"
     fi
     exit 0
+  fi
+
+  if [ "$MASTER_MULTI" = true ] && [ "$NOW" -ge "$DEADLINE" ] && [ "$NOW" -lt "$SHUTDOWN_DEADLINE" ] \
+    && printf '%s' "$POD_SNAPSHOT" | jq -e --arg master "$POD_W0" 'any(.items[]; .metadata.name == $master and .status.phase == "Running")' >/dev/null; then
+    WAIT_SECONDS=$((SHUTDOWN_DEADLINE - NOW))
+    [ "$WAIT_SECONDS" -le 1 ] || WAIT_SECONDS=1
+    sleep "$WAIT_SECONDS" &
+    WAIT_PID=$!
+    wait "$WAIT_PID"
+    WAIT_PID=""
+    continue
   fi
 
   if [ "$TIMED_OUT" -gt 0 ]; then

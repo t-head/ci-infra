@@ -45,6 +45,11 @@ def fake(tool, root, rank, args):
             return subprocess.run(args[3:], timeout=limit).returncode
         except subprocess.TimeoutExpired:
             return 124
+    if tool == "date":
+        assert args == ["+%s.%N"]
+        now = time.time_ns()
+        print(f"{now // 1000000000}.{now % 1000000000:09d}")
+        return 0
     if tool == "sshd":
         if "-t" in args:
             return 0
@@ -172,9 +177,10 @@ class Fixture(unittest.TestCase):
         }
         if not real:
             replacements["/run/sshd"] = str(node / "privsep")
-            for command in ("ssh", "sshd", "timeout"):
+            for command in ("ssh", "sshd", "timeout", "date"):
                 executable(tools / command, wrapper(command, self.root, rank))
-            replacements.update({"/usr/bin/ssh ": str(tools / "ssh") + " ",
+            replacements.update({"/bin/date +%s.%N": str(tools / "date") + " +%s.%N",
+                                 "/usr/bin/ssh ": str(tools / "ssh") + " ",
                                  "/usr/sbin/sshd ": str(tools / "sshd") + " ",
                                  "/usr/bin/timeout ": str(tools / "timeout") + " ",
                                  "command -v timeout": "command -v " + str(tools / "timeout")})
@@ -243,9 +249,15 @@ class Fixture(unittest.TestCase):
         self.fail("condition not reached: " + output + "\n" + "\n".join(states))
 
     def assert_termination(self, node, env, outcome):
-        self.assertEqual(json.loads((node / "termination-log").read_text()),
-                         dict(source="cluster-master-runtime", outcome=outcome,
-                              deadline=int(env["PPU_DEADLINE"]), rank=int(env["NODE_RANK"])))
+        expected = dict(source="cluster-master-runtime", outcome=outcome,
+                        deadline=int(env["PPU_DEADLINE"]), rank=int(env["NODE_RANK"]))
+        finished = node / "runtime/command.finished"
+        if outcome == "command" and finished.exists():
+            value = finished.read_text().strip()
+            self.assertRegex(value, r"^[0-9]+\.[0-9]{9}$")
+            expected.update(command_finished_at=value,
+                            exit_code=int((node / "runtime/command.exit").read_text()))
+        self.assertEqual(json.loads((node / "termination-log").read_text()), expected)
 
     def wait_cluster(self, procs, expected=(0, 143), timeout=30):
         try:
@@ -685,6 +697,21 @@ class RuntimeUnitTests(Fixture):
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assert_termination(node, env, "command")
                 self.assertFalse((runtime / "deadline-exceeded").exists())
+
+    def test_command_finished_time_survives_shutdown_delay(self):
+        node, runtime, _, _, _, env = self.stage()
+        script = ("source " + shlex.quote(str(runtime / "master-worker.sh")) + "\n"
+                  "CLUSTER_OUTCOME=runtime\n"
+                  "cluster_task() { " + shlex.quote(str(node / "tools/date")) + " +%s.%N > "
+                  + shlex.quote(str(runtime / "command.finished")) + "; printf 0 > "
+                  + shlex.quote(str(runtime / "command.exit")) + "; }\n"
+                  "cluster_cleanup() { /bin/sleep 0.3; }\n"
+                  "cluster_main; CLUSTER_RESULT=$?; cluster_termination; exit \"$CLUSTER_RESULT\"\n")
+        result = self.bash(script, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_termination(node, env, "command")
+        completed = json.loads((node / "termination-log").read_text())["command_finished_at"]
+        self.assertGreater(time.time() - float(completed), 0.3)
 
     def test_command_completion_wins_over_stalled_health_probe_at_deadline(self):
         for code in (0, 124):
