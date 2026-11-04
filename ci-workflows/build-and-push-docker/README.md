@@ -48,18 +48,18 @@ All combinations build and push the image and inspect its size. The data key is 
 GHCR addresses use the lowercase form of the caller's `github.repository`, not the template repository. The image is linked to the caller repository through the `org.opencontainers.image.source` label:
 
 ```text
-ghcr.io/<owner>/<repo>/<docker_name>-<git_tag_or_commit>:<docker_tag>
+ghcr.io/<owner>/<repo>/<docker_name>:<docker_tag>-<git_tag_or_commit>
 ```
 
 The T-Head address is determined by `release_type`: `release` maps to `docker_release`, and `tmp` maps to `docker_tmp`:
 
 ```text
-download.t-head.cn/<docker_release_or_docker_tmp>/<docker_name>-<git_tag_or_commit>:<docker_tag>
+download.t-head.cn/<docker_release_or_docker_tmp>/<docker_name>:<docker_tag>-<git_tag_or_commit>
 ```
 
 Dual-target mode builds once and tags the same build result with both destination addresses. Size inspection and metadata publishing use the T-Head address. A failure to push to either destination fails the job and prevents metadata publishing; images already pushed are not automatically rolled back. GHCR addresses do not distinguish `release_type`, so the same revision and Docker tag use the same address.
 
-The suffix comes from the caller source's checked-out `HEAD`, not the template repository: use a Git tag pointing exactly at that commit, or the full commit SHA when no exact tag exists. Both lightweight and annotated tags are supported. If multiple tags point at the commit, the first in lexicographic name order is used; tags on ancestor commits are ignored. The Git tag must be a valid lowercase Docker name component; unsupported characters (such as uppercase letters, `/`, or `+`) fail validation rather than being silently rewritten.
+The suffix comes from the caller source's checked-out `HEAD`, not the template repository: use a Git tag pointing exactly at that commit, or the full commit SHA when no exact tag exists. Both lightweight and annotated tags are supported. If multiple tags point at the commit, the first in lexicographic name order is used; tags on ancestor commits are ignored. The suffix is appended to the Docker tag after a hyphen and must be a valid lowercase Docker tag suffix; unsupported characters (such as uppercase letters, `/`, or `+`) fail validation rather than being silently rewritten.
 
 `docker_tag` is independent of the Git tag. If omitted or set to an empty string, it defaults to the UTC date at input validation time in `YYYY-MM-DD` format. The resolved suffix and Docker tag are reused for building, inspection, and metadata publishing, even if the build crosses midnight.
 
@@ -67,10 +67,10 @@ Examples with `docker_name: team/demo` (all use the prefix `download.t-head.cn/d
 
 | Checked-out commit | `docker_tag` input | Image name and tag |
 | --- | --- | --- |
-| Tagged `v1.2.3` | `1.0.0` | `team/demo-v1.2.3:1.0.0` |
-| Untagged | `1.0.0` | `team/demo-<full_commit_sha>:1.0.0` |
-| Tagged `v1.2.3` | Omitted, on UTC 2026-10-28 | `team/demo-v1.2.3:2026-10-28` |
-| Untagged | Omitted, on UTC 2026-10-28 | `team/demo-<full_commit_sha>:2026-10-28` |
+| Tagged `v1.2.3` | `1.0.0` | `team/demo:1.0.0-v1.2.3` |
+| Untagged | `1.0.0` | `team/demo:1.0.0-<full_commit_sha>` |
+| Tagged `v1.2.3` | Omitted, on UTC 2026-10-28 | `team/demo:2026-10-28-v1.2.3` |
+| Untagged | Omitted, on UTC 2026-10-28 | `team/demo:2026-10-28-<full_commit_sha>` |
 
 Repeated builds of the same revision on the same UTC day target the same image address unless a distinct `docker_tag` is supplied.
 
@@ -88,8 +88,8 @@ The T-Head Artifactory URL is `https://download.t-head.cn/artifactory/docker_rel
 | `dockerfile` | Yes | None | Dockerfile path relative to the caller repository root, such as `docker/Dockerfile`. |
 | `build_context` | No | `.` | Local build context directory relative to the caller repository root. |
 | `build_args` | No | Empty string | One `KEY=VALUE` per line, passed as Docker ARG values, not shell or Buildx command-line options. |
-| `docker_name` | Yes | None | Lowercase base image name, optionally namespaced, such as `team/demo`; without a registry, `docker_release/` or `docker_tmp/` prefix, or tag. The Git tag or full commit SHA is appended automatically. |
-| `docker_tag` | No | Current UTC date (`YYYY-MM-DD`) | Omitted or empty uses the date. Otherwise, a single tag of up to 128 characters, such as `1.0.0`; `+`, spaces, `/`, and `:` are not supported. |
+| `docker_name` | Yes | None | Lowercase base image name, optionally namespaced, such as `team/demo`; without a registry, `docker_release/` or `docker_tmp/` prefix, or tag. The Git tag or full commit SHA is appended to the image tag automatically. |
+| `docker_tag` | No | Current UTC date (`YYYY-MM-DD`) | Omitted or empty uses the date. Otherwise, a base tag such as `1.0.0`; the Git tag or full commit SHA is appended after a hyphen, and the combined tag must stay within 128 characters. `+`, spaces, `/`, and `:` are not supported. |
 | `os` | Yes | None | Operating system release metadata, such as `ubuntu24.04`; does not select the runner. |
 | `python` | Yes | None | Python version, such as `3.12`. |
 | `hggcrt` | Yes | None | HGGCRT version, such as `'3'`, reported as the original string. |
@@ -101,7 +101,7 @@ The T-Head Artifactory URL is `https://download.t-head.cn/artifactory/docker_rel
 
 The six release fields must be non-empty printable strings without leading or trailing whitespace. Apart from the `network` enum, no additional version format restrictions apply. These fields do not automatically form the tag, become Docker ARG values, set image labels, change the runner, or configure the build network.
 
-Both the Dockerfile and build context are relative to the caller repository root, not to each other. The Dockerfile must be a non-empty regular file, and the context must be a directory. Absolute paths, `..`, remote URLs, and symlinks pointing outside the repository are not supported. The full image repository name, including the registry, repository namespace, and Git tag or commit suffix, must not exceed 255 characters.
+Both the Dockerfile and build context are relative to the caller repository root, not to each other. The Dockerfile must be a non-empty regular file, and the context must be a directory. Absolute paths, `..`, remote URLs, and symlinks pointing outside the repository are not supported. The full image repository name, including the registry, repository namespace, and `docker_name`, must not exceed 255 characters, while the combined Docker tag, including the Git tag or commit suffix, must not exceed 128 characters.
 
 Variable names in `build_args` must match `[A-Za-z_][A-Za-z0-9_]*` and must not be duplicated; empty values and blank lines are allowed. Do not pass passwords or tokens, as build arguments may appear in image history or provenance. The template does not expose BuildKit secret mount inputs. The Dockerfile must declare and use the corresponding ARG values itself; `docker_tag` does not automatically become a build argument.
 
