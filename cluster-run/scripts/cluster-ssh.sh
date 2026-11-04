@@ -47,10 +47,17 @@ done
 case $host in root@*) host=${host#root@} ;; *@*) fail 'only root is supported' ;; esac
 [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || fail 'invalid host'
 cluster_regular /run/cluster/nodes.json 1048576 || fail 'missing trusted local nodes mapping'
-# Host-IP aliases must be unambiguous; all dialing still uses the trusted host.
+# Every alias must resolve uniquely; all dialing still uses the trusted FQDN.
 record=$(/usr/bin/jq -ce --arg host "$host" '
-    . as $nodes | [.[] | select(.host == $host)] |
-    if length == 0 then [$nodes[] | select(.pod_ip == $host or .host_ip == $host)] else . end |
+    . as $nodes |
+    ([$nodes[] | select(.host == $host)]) as $exact |
+    if ($exact | length) > 0 then $exact else
+      ([$nodes[] | select(.pod_ip == $host or .host_ip == $host)]) as $address |
+      if ($address | length) > 0 then $address
+      elif ($host | test("^[A-Za-z0-9][A-Za-z0-9-]*$")) then
+        [$nodes[] | select((.host | split(".")[0]) == $host)]
+      else [] end
+    end |
     if length == 1 then .[0] else error("unknown or ambiguous host") end |
     select((.rank | type) == "number" and .rank >= 0 and .rank == (.rank | floor) and
            (.host | type) == "string" and (.host | test("^[A-Za-z0-9][A-Za-z0-9.-]*$")) and

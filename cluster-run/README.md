@@ -164,7 +164,9 @@ Each worker pod receives:
 | `CLUSTER_NODES_FILE` | Multi-node master: local node metadata with actual SSH ports |
 
 Master mode provides `cluster-ssh` and `cluster-exec` to select each destination's
-actual port and enforce host-key verification. Remote commands restore the
+actual port and enforce host-key verification. They accept the trusted FQDN, an
+unambiguous pod/host IP, or a unique first-label short hostname; dialing still uses
+the mapped FQDN and rank host key. Remote commands restore the
 destination node's exported environment; node-level RANK/WORLD_SIZE are not MPI
 process ranks. The orchestrator must wait for all remote tasks and propagate
 their failures before exiting. Command completion is recorded independently of

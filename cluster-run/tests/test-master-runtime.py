@@ -577,6 +577,13 @@ class RuntimeUnitTests(Fixture):
         self.assertEqual(args[-3:], ["--", "root@node-1.example", "echo hello"])
         self.assertEqual(args[args.index("-p") + 1], "21001")
         self.assertIn("HostKeyAlias=cluster-rank-1", args)
+        result = subprocess.run(command + ["node-1", "/usr/bin/orted", "--daemonize"],
+                                env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(result.stdout)
+        self.assertEqual(args[-4:], ["--", "root@node-1.example", "/usr/bin/orted", "--daemonize"])
+        self.assertEqual(args[args.index("-p") + 1], "21001")
+        self.assertIn("HostKeyAlias=cluster-rank-1", args)
         for options in (["-p", "22"], ["-p22"], ["-i", "/evil"], ["-F", "/evil"],
                         ["-oProxyCommand=touch evil"], ["-o", "StrictHostKeyChecking=no"],
                         ["-oHostName=evil"], ["-oUserKnownHostsFile=/dev/null"], ["-oIdentityAgent=evil"],
@@ -589,6 +596,15 @@ class RuntimeUnitTests(Fixture):
         mapping[0]["host_ip"] = mapping[1]["host_ip"]
         (runtime / "nodes.json").write_text(json.dumps(mapping))
         result = subprocess.run(command + [mapping[1]["host_ip"]], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 64)
+        mapping = json.loads((runtime / "trusted-nodes.json").read_text())
+        mapping[0]["host"] = "shared.zone-a.example"
+        mapping[1]["host"] = "shared.zone-b.example"
+        (runtime / "nodes.json").write_text(json.dumps(mapping))
+        result = subprocess.run(command + ["shared", "/usr/bin/orted"], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn(b"unknown, ambiguous or invalid cluster host", result.stderr)
+        result = subprocess.run(command + ["unknown", "/usr/bin/orted"], env=env, capture_output=True)
         self.assertEqual(result.returncode, 64)
 
     def test_exec_posix_quoting_empty_newlines_and_stdin(self):
