@@ -43,7 +43,7 @@ on:
         type: string
         default: ''
       docker_name:
-        description: 'Lowercase base image name, such as team/demo; the exact Git tag or full commit SHA is appended automatically'
+        description: 'Lowercase base image name, such as team/demo; the exact Git tag or full commit SHA is appended to the image tag automatically'
         required: true
         type: string
       docker_tag:

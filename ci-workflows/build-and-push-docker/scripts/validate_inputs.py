@@ -70,8 +70,8 @@ def image_reference(name, tag, repository=REPOSITORY, *, github_repository=None)
 def versioned_image_reference(name, revision, tag, repository=REPOSITORY, *, github_repository=None):
     image_reference(name, tag, repository, github_repository=github_repository)
     if not re.fullmatch(NAME_COMPONENT, revision):
-        raise ValueError("Git tag or commit must be a valid lowercase Docker name suffix; uppercase letters, paths, and + are not supported")
-    return image_reference(f"{name}-{revision}", tag, repository, github_repository=github_repository)
+        raise ValueError("Git tag or commit must be a valid lowercase Docker tag suffix; uppercase letters, paths, and + are not supported")
+    return image_reference(name, f"{tag}-{revision}", repository, github_repository=github_repository)
 
 
 def source_revision(source):

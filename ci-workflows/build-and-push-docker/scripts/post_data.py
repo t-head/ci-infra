@@ -245,7 +245,7 @@ def read_record():
         docker_name (str): Image name, optionally namespaced, without the registry address or tag.
         docker_tag (str): Image tag.
         image (str): Full image address in the format
-            download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>.
+            download.t-head.cn/docker_release/<docker_name>:<docker_tag>-<git_tag_or_commit>.
         digest (str): Pushed digest as 64 lowercase hexadecimal characters, without the sha256: prefix.
         size (int): Total size in bytes of the linux/amd64 image config and stored layers,
             excluding manifest JSON and attestations; not the locally unpacked size.

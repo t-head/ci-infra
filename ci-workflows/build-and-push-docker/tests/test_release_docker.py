@@ -37,9 +37,9 @@ DEFAULT_INPUTS = {
     "sdk_version": "2.2.0", "torch": "2.13.0", "network": "mellanox/EIC",
 }
 REVISION = "v1.2.3"
-IMAGE = f"download.t-head.cn/docker_release/team/demo-{REVISION}:1.0.0"
+IMAGE = f"download.t-head.cn/docker_release/team/demo:1.0.0-{REVISION}"
 CALLER_REPOSITORY = "Example-Org/Caller-Repo"
-GITHUB_IMAGE = f"ghcr.io/example-org/caller-repo/team/demo-{REVISION}:1.0.0"
+GITHUB_IMAGE = f"ghcr.io/example-org/caller-repo/team/demo:1.0.0-{REVISION}"
 DIGEST = "sha256:" + "a" * 64
 FREEZE_OUTPUT = "numpy==2.1.0\ntorch==2.5.8\n"
 PACKAGE_LIST = [
@@ -152,7 +152,7 @@ def test_github_repository_rejects_invalid_namespace(validator, source, reposito
 
 def test_github_image_length_includes_caller_namespace(validator):
     prefix = "ghcr.io/example-org/caller-repo/"
-    length = 255 - len(prefix) - len(REVISION) - 1
+    length = 255 - len(prefix)
     assert validator.versioned_image_reference("a" * length, REVISION, "v1", github_repository=CALLER_REPOSITORY).startswith(prefix)
     with pytest.raises(ValueError, match="255"):
         validator.versioned_image_reference("a" * (length + 1), REVISION, "v1", github_repository=CALLER_REPOSITORY)
@@ -186,8 +186,8 @@ def test_publish_data_requires_boolean(validator, source, release_type, value):
 
 @pytest.mark.parametrize("repository", ["docker_release", "docker_tmp"])
 def test_image_name_length_uses_selected_repository(validator, repository):
-    length = 255 - len(f"download.t-head.cn/{repository}/") - len(REVISION) - 1
-    assert validator.versioned_image_reference("a" * length, REVISION, "v1", repository).endswith(":v1")
+    length = 255 - len(f"download.t-head.cn/{repository}/")
+    assert validator.versioned_image_reference("a" * length, REVISION, "v1", repository).endswith(f":v1-{REVISION}")
     with pytest.raises(ValueError, match="255"):
         validator.versioned_image_reference("a" * (length + 1), REVISION, "v1", repository)
 
@@ -290,7 +290,7 @@ def test_resolved_image_flows_to_release_data(
     monkeypatch.setenv("GITHUB_REF_NAME", "unrelated-branch")
     outputs = validator.validate_inputs(inputs, git_source)
     expected_tag = docker_tag or "2026-10-28"
-    expected_image = f"download.t-head.cn/docker_release/team/demo-{revision}:{expected_tag}"
+    expected_image = f"download.t-head.cn/docker_release/team/demo:{expected_tag}-{revision}"
     assert outputs["image"] == expected_image
     assert outputs["source_revision"] == revision
     assert outputs["docker_tag"] == expected_tag
@@ -317,7 +317,7 @@ def test_ancestor_tag_does_not_replace_current_commit(validator, source):
     commit = run_git(source, "commit-tree", tree, "-p", parent, "-m", "Untagged child")
     run_git(source, "update-ref", "HEAD", commit)
     assert validator.validate_inputs(DEFAULT_INPUTS, source)["image"] == (
-        f"download.t-head.cn/docker_release/team/demo-{commit}:1.0.0"
+        f"download.t-head.cn/docker_release/team/demo:1.0.0-{commit}"
     )
 
 
@@ -340,11 +340,18 @@ def test_invalid_git_tag_fails_without_renaming(validator, git_source, revision)
 
 
 @pytest.mark.parametrize("revision", [REVISION, "a" * 40])
-def test_version_suffix_counts_toward_name_length(validator, revision):
-    length = 255 - len("download.t-head.cn/docker_release/") - len(revision) - 1
-    assert validator.versioned_image_reference("a" * length, revision, "v1").endswith(f"-{revision}:v1")
+def test_version_suffix_counts_toward_tag_length(validator, revision):
+    assert validator.versioned_image_reference("demo", revision, "v1").endswith(f":v1-{revision}")
+    length = 255 - len("download.t-head.cn/docker_release/")
+    assert validator.versioned_image_reference("a" * length, revision, "v1").endswith(f":v1-{revision}")
     with pytest.raises(ValueError, match="255"):
         validator.versioned_image_reference("a" * (length + 1), revision, "v1")
+
+
+def test_combined_tag_length_includes_version_suffix(validator):
+    assert validator.versioned_image_reference("demo", "a" * 40, "b" * 87).endswith(":" + "b" * 87 + "-" + "a" * 40)
+    with pytest.raises(ValueError, match="docker_tag"):
+        validator.versioned_image_reference("demo", "a" * 40, "b" * 88)
 
 
 @pytest.mark.parametrize("name", ["", "demo-", "team/", "Demo", "docker_release/demo"])
@@ -436,7 +443,7 @@ def test_validator_cli_outputs_only_on_success(source, override):
             assert outputs["docker_tag"] in {before, after}
         else:
             assert outputs["docker_tag"] == "1.0.0"
-        assert outputs["image"] == f"download.t-head.cn/docker_release/team/demo-{REVISION}:{outputs['docker_tag']}"
+        assert outputs["image"] == f"download.t-head.cn/docker_release/team/demo:{outputs['docker_tag']}-{REVISION}"
     else:
         assert not output_file.exists()
 
@@ -590,7 +597,7 @@ def test_release_record_contains_only_whitelisted_fields(post_module, release_en
     expected = {key: DEFAULT_INPUTS[key] for key in (*FIELDS, "docker_name", "docker_tag")}
     record = post_module.read_record()
     assert record == dict(expected, image=IMAGE, digest="a" * 64, size=123456789,
-                          idempotentKey="1483ef298defabb255077b71b79a8379", packageList=PACKAGE_LIST)
+                          idempotentKey="88f9aca0608a774f9e2e92b9a8fd7d71", packageList=PACKAGE_LIST)
     assert type(record["size"]) is int
 
 
@@ -620,7 +627,7 @@ def test_idempotent_key_depends_on_image_not_build_result(post_module, release_e
 def test_idempotent_key_changes_with_image(post_module, release_env, monkeypatch, field, value):
     original = post_module.read_record()["idempotentKey"]
     inputs = dict(DEFAULT_INPUTS, **{field: value})
-    image = f"download.t-head.cn/docker_release/{inputs['docker_name']}-{REVISION}:{inputs['docker_tag']}"
+    image = f"download.t-head.cn/docker_release/{inputs['docker_name']}:{inputs['docker_tag']}-{REVISION}"
     monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
     monkeypatch.setenv("RESOLVED_DOCKER_TAG", inputs["docker_tag"])
     monkeypatch.setenv("IMAGE", image)
@@ -656,7 +663,7 @@ def expected_payload():
         "artifactName": "team/demo",
         "artifactType": "docker",
         "businessType": "DOCKER",
-        "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "idempotentKey": "88f9aca0608a774f9e2e92b9a8fd7d71",
         "packageList": PACKAGE_LIST,
         "osTypeList": ["ubuntu24.04"],
         "hggcrtVersion": "3",
@@ -999,7 +1006,7 @@ def test_demo_resolved_inputs_pass_validation(validator, source, post_module, re
     assert post_module.main() == 0
     client.save_artifact.assert_called_once_with({
         "artifactName": "team/demo", "artifactType": "docker", "businessType": "DOCKER",
-        "idempotentKey": "1483ef298defabb255077b71b79a8379",
+        "idempotentKey": "88f9aca0608a774f9e2e92b9a8fd7d71",
         "packageList": PACKAGE_LIST,
         "osTypeList": [inputs["os"]], "hggcrtVersion": inputs["hggcrt"],
         "ppuSdk": inputs["sdk_version"], "python": inputs["python"],

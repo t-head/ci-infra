@@ -36,11 +36,11 @@ on:
         type: string
         default: ''
       docker_name:
-        description: 'Lowercase base image name, such as demo or team/demo; the exact Git tag or full commit SHA is appended automatically'
+        description: 'Lowercase base image name, such as demo or team/demo;'
         required: true
         type: string
       docker_tag:
-        description: 'Optional image tag, such as 1.0.0; defaults to the current UTC date (YYYY-MM-DD); up to 128 characters, without colons or paths'
+        description: 'Optional image tag, such as 1.0.0; defaults to the current UTC date (YYYY-MM-DD); the Git tag or full commit SHA is appended after a hyphen, and the combined tag must stay within 128 characters, without colons or paths'
         required: false
         type: string
         default: ''
