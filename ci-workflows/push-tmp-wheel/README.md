@@ -6,7 +6,7 @@ Download and extract the specified artifact from the current GitHub Actions run,
 https://download.t-head.cn/artifactory/pypi_tmp/{timestamp}/{filename}
 ```
 
-The timestamp is generated once before the first upload, using UTC in `YYYY-MM-DD-HHmm` format, for example `2026-11-02-1211`. Every file in the batch uses that same directory, even if uploading spans multiple minutes. Original filenames are preserved; artifact subdirectories are not included in the destination path.
+The timestamp is generated once before the first upload, using UTC+8 (Asia/Shanghai) in `YYYY-MM-DD-HHmm` format, for example `2026-11-02-1211`. Every file in the batch uses that same directory, even if uploading spans multiple minutes. Original filenames are preserved; artifact subdirectories are not included in the destination path.
 
 - Workflow entry point: [`.github/workflows/push-tmp-wheel.yml`](../../.github/workflows/push-tmp-wheel.yml)
 - Upload script: [`scripts/push_tmp_wheel.py`](scripts/push_tmp_wheel.py)
@@ -22,7 +22,7 @@ Caller builds wheels
   → Call the upload template with needs on the build job
   → actions/download-artifact@v4 downloads and extracts the named artifact
   → Recursively find all regular files ending in .whl
-  → Generate one UTC timestamp for the entire batch
+  → Generate one UTC+8 (Asia/Shanghai) timestamp for the entire batch
   → Upload every selected file unchanged to the timestamped directory
   → Return the batch directory as upload_url after all uploads succeed
 ```
@@ -114,7 +114,7 @@ Other suffixes, directories, and symlinks are skipped. Directory symlinks are no
 - Network or HTTP errors fail the job; only HTTP 2xx is accepted. curl is configured for three retries, but not every error is retried.
 - Files are uploaded sequentially in sorted local-path order. On the first upload failure, the job stops and emits no successful `upload_url`; files already uploaded are not rolled back. Empty or malformed publishing credentials also fail the job.
 - The template does not check for duplicate filenames or existing server files. Files with the same basename in different artifact subdirectories target the same URL and are all uploaded; later uploads may overwrite earlier ones depending on Artifactory permissions. Use distinct filenames to preserve every file.
-- Separate batches whose timestamps are captured in the same UTC minute share the same destination directory. Reruns capture the current timestamp again but may still use the same directory. Minute-level timestamps do not guarantee unique directories or overwrite prevention.
+- Separate batches whose timestamps are captured in the same UTC+8 (Asia/Shanghai) minute share the same destination directory. Reruns capture the current timestamp again but may still use the same directory. Minute-level timestamps do not guarantee unique directories or overwrite prevention.
 
 ## Local Tests
 
