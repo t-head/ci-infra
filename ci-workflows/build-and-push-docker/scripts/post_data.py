@@ -228,14 +228,14 @@ def collect_image_packages(image, digest):
         frozen = run_image_pip(reference, "freeze", "--all")
         return parse_pip_freeze(frozen)
     except Exception:
-        # 包清单仅作补充信息，采集或解析异常不得阻断发布。
+        # The package list is supplementary information; collection or parsing errors must not block the release.
         return []
 
 
 def read_record():
     """Collect only release fields and pushed image details, excluding build arguments and credentials from payload assembly.
 
-    返回包含以下 13 个字段的字典：
+    Returns a dict containing the following 13 fields:
         os (str): Operating system, preserving the original input.
         python (str): Python version, preserving the original input.
         hggcrt (str): HGGCRT version, preserving the original input.
@@ -251,7 +251,7 @@ def read_record():
             excluding manifest JSON and attestations; not the locally unpacked size.
         idempotentKey (str): MD5 of the full image string encoded as UTF-8,
             represented as 32 lowercase hexadecimal characters, unaffected by digest or size changes.
-        packageList (list[dict[str, str]]): 镜像中安装的包，包含 packageName 和 packageVersion。
+        packageList (list[dict[str, str]]): Packages installed in the image, each with packageName and packageVersion.
     """
     inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
     record = release_metadata(inputs)

@@ -45,7 +45,7 @@ def parse_json(raw, label):
     try:
         return json.loads(raw)
     except (TypeError, ValueError):
-        fail(f"{label} 必须是合法 JSON")
+        fail(f"{label} must be valid JSON")
 
 
 def get_torch_url(
@@ -55,22 +55,22 @@ def get_torch_url(
     torch_version: str,
     sdk_version: str,
 ) -> str:
-    """根据五个版本获取 Torch 下载地址，暂返回空字符串作为占位。"""
-    # TODO: 实现 Torch 下载地址查询逻辑。
+    """Resolve the Torch download URL from the five versions; currently returns an empty string as a placeholder."""
+    # TODO: implement the Torch download URL lookup logic.
     return ""
 
 
 def get_build_tag(tag_version=""):
-    """优先使用指定版本；所有来源均过滤 rc，并统一去除开头的 v/V。"""
+    """Prefer the specified version; filter rc from all sources and strip the leading v/V uniformly."""
     version_pattern = r"[vV]?[0-9][A-Za-z0-9.!_]*(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
     if tag_version != "":
-        # 同时校验发布路径安全性与 PEP 440，非法覆盖值不回退到仓库版本。
+        # Validate release-path safety and PEP 440 together; an invalid override never falls back to the repository tag.
         if not isinstance(tag_version, str) or not re.fullmatch(version_pattern, tag_version):
-            fail("tag_version 必须是合法版本号且符合 tag 格式，例如 1.0.0 或 1.0.0+v0.3.0")
+            fail("tag_version must be a valid version number matching the tag format, for example 1.0.0 or 1.0.0+v0.3.0")
         try:
             Version(tag_version)
         except InvalidVersion:
-            fail("tag_version 必须是合法的 PEP 440 版本号，例如 1.0.0 或 1.0.0+v0.3.0")
+            fail("tag_version must be a valid PEP 440 version, for example 1.0.0 or 1.0.0+v0.3.0")
         if "rc" in tag_version.lower():
             return None
         tag = tag_version
@@ -81,45 +81,45 @@ def get_build_tag(tag_version=""):
     else:
         source_dir = os.environ.get("SOURCE_DIR")
         if not source_dir:
-            fail("分支构建必须通过 SOURCE_DIR 指定调用方仓库目录")
+            fail("branch builds must specify the caller repository directory via SOURCE_DIR")
         try:
             result = subprocess.run(
                 ["git", "-C", source_dir, "tag", "--points-at", "HEAD", "--sort=-version:refname"],
                 check=True, capture_output=True, text=True,
             )
         except (OSError, subprocess.CalledProcessError):
-            fail("无法读取调用方仓库当前提交的 tag")
-        # 多个 tag 按 Git 版本降序选择首个合格版本，不回退到历史提交。
+            fail("unable to read the tags of the caller repository current commit")
+        # With multiple tags pick the first qualifying version in descending Git order; never fall back to older commits.
         tag = next((tag for tag in result.stdout.splitlines()
                     if re.fullmatch(version_pattern, tag) and "rc" not in tag.lower()), None)
         if tag is None:
             return None
     if not re.fullmatch(version_pattern, tag):
-        fail("tag 必须是版本号，例如 1.0.0+v0.3.0")
-    # 仅去除整个版本开头的一个前缀，保留 +v0.3.0 等内部内容。
+        fail("tag must be a version number, for example 1.0.0+v0.3.0")
+    # Strip only one leading prefix from the whole version; keep inner content such as +v0.3.0.
     return re.sub(r"^[vV]", "", tag)
 
 
 def main():
-    # 必须先读取覆盖参数，再按最终选定版本应用发布门禁。
-    inputs = parse_json(os.environ["INPUTS_JSON"], "触发参数")
+    # Read the override first, then apply the release gate based on the finally selected version.
+    inputs = parse_json(os.environ["INPUTS_JSON"], "trigger inputs")
     if not isinstance(inputs, dict):
-        fail("触发参数 必须是 JSON 对象")
+        fail("trigger inputs must be a JSON object")
     tag = get_build_tag(inputs.get("tag_version", ""))
     should_release = tag is not None
     if not should_release:
-        print("tag 包含 rc（忽略大小写），或当前提交没有合格版本 tag，仅构建 wheel 并保存 Actions artifact，不发布")
+        print("tag contains rc (case-insensitive), or the current commit has no qualifying version tag; only build wheels and save Actions artifacts, no publish")
 
     package_name = inputs.get("package_name", "")
     if not isinstance(package_name, str) or not re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name
     ):
-        fail("package_name 必须是合法的 Python 包名")
-    # wheel 分发名称中的分隔符统一为下划线。
+        fail("package_name must be a valid Python package name")
+    # Unify separators in the wheel distribution name as underscores.
     wheel_package_name = re.sub(r"[-_.]+", "_", package_name)
     pccl_version = inputs.get("pccl_version", "2.2.1")
     if not isinstance(pccl_version, str) or pccl_version not in {"2.1.1", "2.2.0", "2.2.1"}:
-        fail("pccl_version 必须是 2.1.1、2.2.0 或 2.2.1")
+        fail("pccl_version must be 2.1.1, 2.2.0 or 2.2.1")
     candidates = {
         "python_versions": {"38", "310", "312"},
         "os_versions": {"ubuntu2004", "ubuntu2204", "ubuntu2404", "alios7u2"},
@@ -131,33 +131,33 @@ def main():
     for name, allowed in candidates.items():
         values = parse_json(inputs.get(name, ""), name)
         if not isinstance(values, list) or not values:
-            fail(f"{name} 必须是非空 JSON 数组")
+            fail(f"{name} must be a non-empty JSON array")
         normalized = []
         for value in values:
-            # Python 版本同时支持 [38,310] 和 ["38","310"]。
+            # Python versions accept both [38,310] and ["38","310"].
             if name == "python_versions" and type(value) is int:
                 value = str(value)
-            # 空 Torch 版本用 [""] 表示，其他轴仍要求非空版本。
+            # An empty Torch version is expressed as [""]; other axes still require non-empty versions.
             empty_torch = name == "torch_versions" and value == ""
             if not empty_torch and (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+\-]*", value)):
-                fail(f"{name} 的元素必须是非空版本字符串，仅允许字母、数字及 . _ + -；torch_versions 可使用空字符串")
+                fail(f"{name} elements must be non-empty version strings allowing letters, digits and . _ + -; torch_versions may use an empty string")
             if allowed is not None and value not in allowed:
-                fail(f"{name} 包含不支持的值 {value}；候选值：{', '.join(sorted(allowed))}")
+                fail(f"{name} contains unsupported value {value}; allowed values: {', '.join(sorted(allowed))}")
             if value not in normalized:
                 normalized.append(value)
         axes[name.removesuffix("s")] = normalized
 
     count = math.prod(len(values) for values in axes.values())
     if count > 256:
-        fail(f"矩阵包含 {count} 个任务，超过 GitHub Actions 的 256 个任务限制，请缩小版本范围")
+        fail(f"matrix contains {count} jobs, exceeding the GitHub Actions limit of 256 jobs; please narrow the version range")
 
     for os_version, python_version in itertools.product(axes["os_version"], axes["python_version"]):
         key = f"{os_version}-py{python_version}"
         image = IMAGES_MAP.get(key)
         if not isinstance(image, str) or not image or re.search(r"\s", image):
-            fail(f"BUILD_CONTAINER_IMAGES 缺少 {key} 或镜像地址为空/包含空白字符")
+            fail(f"BUILD_CONTAINER_IMAGES is missing {key} or the image address is empty/contains whitespace")
 
-    # tag 已统一去除 v/V 前缀；release 保留本地版本，wheel 只取 + 前的版本。
+    # Tags already have the v/V prefix stripped; release keeps the local version, the wheel only takes the part before +.
     wheel_version = tag.split("+", 1)[0] if should_release else ""
     combinations = []
     for values in itertools.product(*axes.values()):
@@ -174,10 +174,10 @@ def main():
             runtime_version=entry["runtime_version"],
             os_version=entry["os_version"],
         )
-        # 非发布构建不生成发布版本和目标文件名，保留构建命令产出的原始 wheel。
+        # Non-release builds produce no release version or target file name, keeping the original wheel from the build command.
         entry.update(tag="", release_version="", whl_name="")
         if should_release:
-            # 记录最终版本（指定的 tag_version 或仓库 tag），供发布数据汇总使用。
+            # Record the final version (the specified tag_version or the repository tag) for release data aggregation.
             entry["tag"] = tag
             entry["release_version"] = f"{tag}.sail{entry['sdk_version']}"
             if "+" not in tag:
@@ -194,7 +194,7 @@ def main():
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write(f"matrix={matrix}\n")
         output.write(f"should_release={str(should_release).lower()}\n")
-    print(f"已生成 {count} 个矩阵任务")
+    print(f"Generated {count} matrix jobs")
 
 
 if __name__ == "__main__":

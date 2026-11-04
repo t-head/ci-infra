@@ -1,4 +1,4 @@
-"""源码包及安装模板的离线测试：验证打包、版本读取和运行时匹配，不编译或下载。"""
+"""Offline tests for sdist and install template: validates packaging, version reading and runtime matching; no compilation or downloads."""
 
 import ast
 from email.parser import Parser
@@ -24,7 +24,7 @@ CI_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = CI_ROOT.parents[1] / ".github/workflows/matrix-release.yml"
 SETUP_TEMPLATE = CI_ROOT / "scripts/setup.py"
 
-# tag 读取及源码包构建均使用真实代码；执行 setup.py 前断言 FAKE_WHEEL，防止下载。
+# Tag reading and sdist building both use real code; assert FAKE_WHEEL before executing setup.py to prevent downloads.
 PYTHON_SHIM = r'''
 python() {
   if [[ "${1:-}" == "setup.py" ]]; then
@@ -39,24 +39,24 @@ python() {
 
 @pytest.fixture
 def workflow():
-    # BaseLoader 保留 GitHub Actions 的 on 键，不按 YAML 1.1 转换为布尔值。
+    # BaseLoader preserves GitHub Actions' on key without converting it to a boolean per YAML 1.1.
     return yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
 @pytest.fixture
 def build_step(workflow):
     return next(step for step in workflow["jobs"]["build-sdist"]["steps"]
-                if step.get("name") == "填充模板并构建源码包")
+                if step.get("name") == "Fill template and build sdist")
 
 
 @pytest.fixture
 def workspace():
-    # 临时构建只写入工作区，测试结束后自动清理。
+    # Temporary builds write only to the workspace; automatically cleaned up after the test.
     with tempfile.TemporaryDirectory(prefix=".sdist-test-", dir=CI_ROOT) as directory:
         root = Path(directory)
         source = root / "source"
         source.mkdir()
-        (source / "setup.py").write_text("# 调用方原始构建脚本\n", encoding="utf-8")
+        (source / "setup.py").write_text("# caller original build script\n", encoding="utf-8")
         template = root / "ci-template/ci-workflows/release-pypi/scripts/setup.py"
         template.parent.mkdir(parents=True)
         template.write_bytes(SETUP_TEMPLATE.read_bytes())
@@ -89,7 +89,7 @@ def run_build(build_step, workspace):
     ("missing-torch", "Import torch failed"),
 ])
 def test_pip_installs_bootstrap_offline(workspace, run_build, mode, error):
-    """执行真实 pip/PEP 517 链路，仅替换远端下载和宿主 Torch，不使用发布凭据。"""
+    """Execute the real pip/PEP 517 pipeline; only replace remote downloads and host Torch; no publishing credentials used."""
     from packaging.tags import sys_tags
 
     version = "1.0.0+sail2.2.0"
@@ -117,7 +117,7 @@ def test_pip_installs_bootstrap_offline(workspace, run_build, mode, error):
         for name, content in members.items():
             archive.writestr(name, content)
     (fixtures / "torch.py").write_text(
-        'raise ImportError("测试中模拟未安装 Torch")\n' if mode == "missing-torch"
+        'raise ImportError("mock torch not installed in test")\n' if mode == "missing-torch"
         else '__version__ = "2.10.0+hggcrt3"\n', encoding="utf-8")
     (fixtures / "strategy.py").write_text('''
 import os
@@ -130,7 +130,7 @@ def run(data, context):
     filename = "demo_package-1.0.0+environment-cp312-cp312-linux_x86_64.whl"
     return "https://fixture.invalid/" + filename, filename, data["build_version"]
 ''', encoding="utf-8")
-    # 所有 wget 请求只读取本地 fixture；未匹配的请求直接失败，不回退到网络。
+    # All wget requests read only local fixtures; unmatched requests fail immediately with no network fallback.
     downloader = fixtures / "wget"
     downloader.write_text(f"#!{sys.executable}\n" + '''
 import os
@@ -146,7 +146,7 @@ if url.endswith("/strategy_hggc_sail.py"):
 elif url.endswith(".whl"):
     source = root / "download.whl"
 else:
-    raise SystemExit("未预期的下载请求：" + url)
+    raise SystemExit("unexpected download request: " + url)
 with (root / "requests.log").open("a") as log:
     log.write(url + "\\n")
 shutil.copyfile(source, sys.argv[2])
@@ -244,7 +244,7 @@ def test_sdist_shell_syntax(workflow):
 def test_builds_sdist_with_rendered_metadata(workspace, run_build, version, framework, expected_version):
     result = run_build(version=version, framework=framework)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (workspace / "source/setup.py").read_text() == "# 调用方原始构建脚本\n"
+    assert (workspace / "source/setup.py").read_text() == "# caller original build script\n"
     assert (workspace / "ci-template/ci-workflows/release-pypi/scripts/setup.py").read_bytes() == SETUP_TEMPLATE.read_bytes()
 
     rendered = (workspace / "sdist/builds" / version / "setup.py").read_text(encoding="utf-8")
@@ -318,7 +318,7 @@ def test_missing_placeholder_fails(workspace, run_build, field):
     template.write_text(template.read_text().replace(f'{field} = ""', f'{field} = "changed"'), encoding="utf-8")
     result = run_build()
     assert result.returncode != 0
-    assert "::error::源码包模板缺少预期占位字段" in result.stderr
+    assert "::error::the sdist template is missing the expected placeholder fields" in result.stderr
     assert not (workspace / "sdist").exists()
 
 
@@ -387,7 +387,7 @@ def tag_repository(workspace, monkeypatch):
     for directory in ("source", "ci-template"):
         git("init", "--quiet", directory=directory)
         git("add", ".", directory=directory)
-        git("commit", "--quiet", "-m", "初始化测试仓库", directory=directory)
+        git("commit", "--quiet", "-m", "initialize test repository", directory=directory)
     git("tag", "9.9.9", directory="ci-template")
     return git
 
@@ -398,10 +398,10 @@ def test_branch_sdist_uses_matrix_release_version(
     workspace, run_build, tag_repository, generate_matrix, annotated, prefix
 ):
     tag_repository("tag", "0.9.0")
-    tag_repository("commit", "--allow-empty", "--quiet", "-m", "待发布提交")
+    tag_repository("commit", "--allow-empty", "--quiet", "-m", "commit to release")
     tag = prefix + "1.0.0+v0.3.0"
     if annotated:
-        tag_repository("tag", "-a", tag, "-m", "版本 tag")
+        tag_repository("tag", "-a", tag, "-m", "version tag")
     else:
         tag_repository("tag", tag)
     matrix = generate_matrix(GITHUB_REF_TYPE="branch", GITHUB_REF_NAME="main")
@@ -413,14 +413,14 @@ def test_branch_sdist_uses_matrix_release_version(
     assert f'build_version = "{release_version}"' in rendered.read_text()
     archives = list((workspace / "sdist/dist").glob("*.tar.gz"))
     assert [path.name for path in archives] == [f"demo_package-{release_version}.tar.gz"]
-    assert result.stdout.count("已构建源码包版本：") == 1
+    assert result.stdout.count("Built sdist version: ") == 1
 
 
 @pytest.mark.parametrize("prefix", ["", "v", "V"])
 def test_tag_sdist_uses_prepared_release_version(workspace, run_build, tag_repository, generate_matrix, prefix):
     tag = prefix + "1.0.0+v0.3.0"
     tag_repository("tag", tag)
-    tag_repository("tag", "-a", "2.0.0", "-m", "同提交的其他 tag")
+    tag_repository("tag", "-a", "2.0.0", "-m", "another tag on the same commit")
     matrix = generate_matrix(GITHUB_REF_NAME=tag)
     result = run_build(MATRIX_JSON=matrix)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -436,7 +436,7 @@ def test_tag_sdist_uses_prepared_release_version(workspace, run_build, tag_repos
 def test_tag_version_drives_sdist_build_and_publication(
     workflow, workspace, generate_matrix, run_build, tag_version, release_version, prefix
 ):
-    # source 目录没有 Git 仓库；覆盖版本不依赖 tag 存在，两个 Torch 矩阵只构建一个源码包。
+    # The source directory has no Git repository; the overridden version does not depend on an existing tag, and the two Torch matrix entries build only one sdist.
     matrix = generate_matrix(tag_version=prefix + tag_version, GITHUB_REF_TYPE="branch", GITHUB_REF_NAME="main")
     entries = json.loads(matrix)["include"]
     assert len(entries) == 2
@@ -444,7 +444,7 @@ def test_tag_version_drives_sdist_build_and_publication(
     assert {entry["release_version"] for entry in entries} == {release_version}
     result = run_build(MATRIX_JSON=matrix)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("已构建源码包版本：") == 1
+    assert result.stdout.count("Built sdist version: ") == 1
     archives = list((workspace / "sdist/dist").glob("*.tar.gz"))
     assert len(archives) == 1
     archive_path = archives[0]
@@ -490,7 +490,7 @@ def test_later_sdist_failure_stops_remaining_versions(workspace, run_build):
     versions = ["1.2.3+sail2.1.0", "1.2.3+sail2.2.0", "1.2.4+sail2.2.0"]
     result = run_build(versions=versions, TEST_SDIST_FAIL_VERSION=versions[1])
     assert result.returncode == 23
-    assert result.stdout.count("已构建源码包版本：") == 1
+    assert result.stdout.count("Built sdist version: ") == 1
     assert not (workspace / "sdist/builds" / versions[2]).exists()
     assert [p.name for p in (workspace / "sdist/dist").glob("*.tar.gz")] == [
         f"demo_package-{versions[0]}.tar.gz"
@@ -506,7 +506,7 @@ def test_builds_and_publishes_each_distinct_release_version(workflow, workspace,
     result = run_build(versions=versions)
     assert result.returncode == 0, result.stdout + result.stderr
     unique_versions = list(dict.fromkeys(versions))
-    assert result.stdout.count("已构建源码包版本：") == len(unique_versions)
+    assert result.stdout.count("Built sdist version: ") == len(unique_versions)
     assert {p.name for p in (workspace / "sdist/builds").iterdir()} == set(unique_versions)
     archives = list((workspace / "sdist/dist").glob("*.tar.gz"))
     assert len(archives) == len(unique_versions)
@@ -548,8 +548,8 @@ def test_builds_and_publishes_each_distinct_release_version(workflow, workspace,
 
 def test_wheel_build_uses_caller_command_and_full_history(workflow):
     steps = workflow["jobs"]["matrix-job"]["steps"]
-    checkout = next(step for step in steps if step.get("name") == "检出待编译仓库")
-    build = next(step for step in steps if step.get("name") == "编译")
+    checkout = next(step for step in steps if step.get("name") == "Checkout repository to build")
+    build = next(step for step in steps if step.get("name") == "Build")
     assert checkout["with"]["fetch-depth"] == "0"
     assert checkout["with"]["submodules"] == "recursive"
     assert checkout["with"]["persist-credentials"] == "false"
@@ -561,16 +561,16 @@ def test_wheel_build_uses_caller_command_and_full_history(workflow):
 
 @pytest.fixture
 def setup_template(monkeypatch):
-    # 仅导入安装模板，阻断真实下载和外部命令；需要的环境探测由测试显式模拟。
+    # Import the install template only, blocking real downloads and external commands; required environment detection is mocked explicitly by the test.
     spec = importlib.util.spec_from_file_location("sdist_template_under_test", SETUP_TEMPLATE)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     for name in ("download_file", "run_cmd"):
         monkeypatch.setattr(module, name, create_autospec(
-            getattr(module, name), side_effect=AssertionError("测试禁止真实下载或外部命令")))
+            getattr(module, name), side_effect=AssertionError("real downloads and external commands are forbidden in this test")))
     monkeypatch.setattr(module.subprocess, "run", create_autospec(
-        module.subprocess.run, side_effect=AssertionError("测试禁止真实执行外部命令")))
+        module.subprocess.run, side_effect=AssertionError("real external commands are forbidden in this test")))
     return module
 
 
@@ -591,7 +591,7 @@ def test_runtime_falls_back_to_hgcc_for_missing_or_invalid_env(setup_template, m
     runner = setup_template.subprocess.run
     runner.side_effect = None
     output = {"stdout": "", "stderr": ""}
-    output[stream] = "编译器版本信息\nRuntime API version v2\n"
+    output[stream] = "Compiler version info\nRuntime API version v2\n"
     runner.return_value = subprocess.CompletedProcess(["hgcc", "--version"], 0, **output)
     assert setup_template.get_runtime_version() == "2"
     runner.assert_called_once_with(["hgcc", "--version"], stdout=subprocess.PIPE,

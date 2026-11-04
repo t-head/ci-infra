@@ -31,12 +31,15 @@ DEMO = ROOT / "workflows/demo-build-and-push-docker.yml"
 README = ROOT / "README.md"
 FIELDS = ("os", "python", "hggcrt", "sdk_version", "torch", "network")
 DEFAULT_INPUTS = {
+    "release_type": "release", "publish_data": True, "push_target": "t-head",
     "dockerfile": "Dockerfile", "docker_name": "team/demo", "docker_tag": "1.0.0",
     "os": "ubuntu24.04", "python": "3.12", "hggcrt": "3",
     "sdk_version": "2.2.0", "torch": "2.13.0", "network": "mellanox/EIC",
 }
 REVISION = "v1.2.3"
 IMAGE = f"download.t-head.cn/docker_release/team/demo-{REVISION}:1.0.0"
+CALLER_REPOSITORY = "Example-Org/Caller-Repo"
+GITHUB_IMAGE = f"ghcr.io/example-org/caller-repo/team/demo-{REVISION}:1.0.0"
 DIGEST = "sha256:" + "a" * 64
 FREEZE_OUTPUT = "numpy==2.1.0\ntorch==2.5.8\n"
 PACKAGE_LIST = [
@@ -113,12 +116,95 @@ def release_env(monkeypatch):
     monkeypatch.delenv("CLIENT_PRIVATE_KEY_B64", raising=False)
 
 
+def test_default_push_target_uses_caller_github_repository(validator, source):
+    inputs = {key: value for key, value in DEFAULT_INPUTS.items()
+              if key not in ("push_target", "release_type", "publish_data")}
+    outputs = validator.validate_inputs(inputs, source, CALLER_REPOSITORY)
+    assert outputs["image"] == outputs["github_image"] == outputs["images"] == GITHUB_IMAGE
+    assert outputs["t_head_image"] == ""
+
+
+@pytest.mark.parametrize("push_target", ["github", "t-head", "github/t-head"])
+@pytest.mark.parametrize("release_type", ["release", "tmp"])
+@pytest.mark.parametrize("publish_data", [True, False])
+def test_all_target_combinations(validator, source, push_target, release_type, publish_data):
+    inputs = dict(DEFAULT_INPUTS, push_target=push_target, release_type=release_type, publish_data=publish_data)
+    outputs = validator.validate_inputs(inputs, source, CALLER_REPOSITORY)
+    github_image = GITHUB_IMAGE if push_target != "t-head" else ""
+    t_head_image = IMAGE.replace("docker_release", "docker_" + release_type) if push_target != "github" else ""
+    assert outputs["github_image"] == github_image
+    assert outputs["t_head_image"] == t_head_image
+    assert outputs["image"] == (t_head_image or github_image)
+    assert outputs["images"] == ",".join(image for image in (github_image, t_head_image) if image)
+
+
+@pytest.mark.parametrize("value", [None, True, [], {}, "", "GitHub", "github ", "github,t-head", "t-head/github", "other"])
+def test_push_target_is_exact_enum(validator, source, value):
+    with pytest.raises(ValueError, match="push_target"):
+        validator.validate_inputs(dict(DEFAULT_INPUTS, push_target=value), source, CALLER_REPOSITORY)
+
+
+@pytest.mark.parametrize("repository", [None, "", "owner", "owner/repo/other", "owner/../repo", "owner/repo\n", "owner/repo:tag", "owner/.repo", "evil.example/repo"])
+def test_github_repository_rejects_invalid_namespace(validator, source, repository):
+    with pytest.raises(ValueError, match="GITHUB_REPOSITORY"):
+        validator.validate_inputs(dict(DEFAULT_INPUTS, push_target="github"), source, repository)
+
+
+def test_github_image_length_includes_caller_namespace(validator):
+    prefix = "ghcr.io/example-org/caller-repo/"
+    length = 255 - len(prefix) - len(REVISION) - 1
+    assert validator.versioned_image_reference("a" * length, REVISION, "v1", github_repository=CALLER_REPOSITORY).startswith(prefix)
+    with pytest.raises(ValueError, match="255"):
+        validator.versioned_image_reference("a" * (length + 1), REVISION, "v1", github_repository=CALLER_REPOSITORY)
+
+
+def test_default_publish_options_use_tmp_repository(validator, source):
+    inputs = {key: value for key, value in DEFAULT_INPUTS.items()
+              if key not in ("release_type", "publish_data")}
+    assert validator.validate_inputs(inputs, source)["image"] == IMAGE.replace("docker_release", "docker_tmp")
+
+
+@pytest.mark.parametrize("release_type,repository", [("release", "docker_release"), ("tmp", "docker_tmp")])
+@pytest.mark.parametrize("publish_data", [False, True])
+def test_publish_options_select_repository(validator, source, release_type, repository, publish_data):
+    inputs = dict(DEFAULT_INPUTS, release_type=release_type, publish_data=publish_data)
+    assert validator.validate_inputs(inputs, source)["image"] == IMAGE.replace("docker_release", repository)
+
+
+@pytest.mark.parametrize("value", [None, True, 1, [], {}, "", "Release", "TMP", " release", "tmp ", "other", "release\ntmp"])
+def test_release_type_is_exact_enum(validator, source, value):
+    with pytest.raises(ValueError, match="release_type"):
+        validator.validate_inputs(dict(DEFAULT_INPUTS, release_type=value), source)
+
+
+@pytest.mark.parametrize("release_type", ["release", "tmp"])
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", "", [], {}])
+def test_publish_data_requires_boolean(validator, source, release_type, value):
+    with pytest.raises(ValueError, match="publish_data"):
+        validator.validate_inputs(dict(DEFAULT_INPUTS, release_type=release_type, publish_data=value), source)
+
+
+@pytest.mark.parametrize("repository", ["docker_release", "docker_tmp"])
+def test_image_name_length_uses_selected_repository(validator, repository):
+    length = 255 - len(f"download.t-head.cn/{repository}/") - len(REVISION) - 1
+    assert validator.versioned_image_reference("a" * length, REVISION, "v1", repository).endswith(":v1")
+    with pytest.raises(ValueError, match="255"):
+        validator.versioned_image_reference("a" * (length + 1), REVISION, "v1", repository)
+
+
+@pytest.mark.parametrize("repository", ["other", "docker_tmp/other", "../docker_release", ""])
+def test_image_reference_rejects_unknown_repository(validator, repository):
+    with pytest.raises(ValueError, match="repository"):
+        validator.image_reference("demo", "v1", repository)
+
+
 @pytest.mark.parametrize("network", ["mellanox", "EIC", "mellanox/EIC"])
 def test_allowed_network_values_preserved_without_changing_image(validator, source, network):
     inputs = dict(DEFAULT_INPUTS, network=network)
     assert validator.release_metadata(inputs) == {key: inputs[key] for key in FIELDS}
     assert validator.validate_inputs(inputs, source) == {
-        "image": IMAGE, "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
+        "image": IMAGE, "images": IMAGE, "github_image": "", "t_head_image": IMAGE,
+        "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
         "source_revision": REVISION, "docker_tag": "1.0.0",
     }
 
@@ -750,21 +836,27 @@ def test_workflow_contract_and_execution_order():
     contract = workflow["on"]["workflow_call"]
     # Validate the release workflow interface directly, without depending on the temporary Docker template absent from this branch.
     required_inputs = {"dockerfile", "docker_name", "template_ref", *FIELDS}
-    defaults = {"build_context": ".", "build_args": "", "docker_tag": "", "template_repository": "t-head/ci-infra"}
+    defaults = {"build_context": ".", "build_args": "", "docker_tag": "", "template_repository": "t-head/ci-infra",
+                "release_type": "tmp", "publish_data": "false", "push_target": "github"}
     assert set(workflow["on"]) == {"workflow_call"}
     assert set(contract["inputs"]) == required_inputs | set(defaults)
     for key, definition in contract["inputs"].items():
-        assert definition["type"] == "string"
+        assert definition["type"] == ("boolean" if key == "publish_data" else "string")
         assert definition["required"] == ("true" if key in required_inputs else "false")
         if key in required_inputs:
             assert "default" not in definition
         else:
             assert definition["default"] == defaults[key]
     assert set(contract["secrets"]) == {"template_token", "release_username", "release_token", "data_token"}
-    assert contract["secrets"]["data_token"]["required"] == "true"
-    assert workflow["permissions"] == {"contents": "read"}
+    for key in ("data_token", "release_username", "release_token"):
+        assert contract["secrets"][key]["required"] == "false"
+    assert workflow["permissions"] == {"contents": "read", "packages": "write"}
     job = workflow["jobs"]["build-and-push"]
-    source, template, python, validate, credentials, dependencies, buildx, login, build, inspect, summary, post = job["steps"]
+    (source, template, python, validate, credentials, data_credentials, dependencies,
+     buildx, github_login, login, build, inspect, summary, post) = job["steps"]
+    assert github_login["uses"] == "docker/login-action@v3"
+    assert github_login["with"] == {"registry": "ghcr.io", "username": "${{ github.actor }}",
+                                     "password": "${{ github.token }}", "logout": "true"}
     assert job["runs-on"] == "ubuntu-latest" and job["timeout-minutes"] == "120"
     assert source["uses"] == template["uses"] == "actions/checkout@v4"
     assert source["with"] == {"path": "caller-source", "fetch-depth": "0", "submodules": "recursive",
@@ -785,7 +877,8 @@ def test_workflow_contract_and_execution_order():
     assert build["uses"] == "docker/build-push-action@v6"
     assert build["with"] == {
         "context": "${{ steps.validate.outputs.build_context }}", "file": "${{ steps.validate.outputs.dockerfile }}",
-        "build-args": "${{ inputs.build_args }}", "tags": "${{ steps.validate.outputs.image }}",
+        "build-args": "${{ inputs.build_args }}", "tags": "${{ steps.validate.outputs.images }}",
+        "labels": "org.opencontainers.image.source=https://github.com/${{ github.repository }}\n",
         "platforms": "linux/amd64", "push": "true",
     }
     assert inspect["id"] == "inspect"
@@ -799,14 +892,25 @@ def test_workflow_contract_and_execution_order():
                             "CLIENT_PRIVATE_KEY_B64": "${{ secrets.data_token }}"}
     assert post["run"] == "python ci-template/ci-workflows/build-and-push-docker/scripts/post_data.py"
     assert job["outputs"] == {"image": "${{ steps.validate.outputs.image }}", "digest": "${{ steps.build.outputs.digest }}",
+                              "github_image": "${{ steps.validate.outputs.github_image }}",
+                              "t_head_image": "${{ steps.validate.outputs.t_head_image }}",
                               "size": "${{ steps.inspect.outputs.size }}"}
+    assert summary["env"]["IMAGES"] == "${{ steps.validate.outputs.images }}"
     assert "env" not in job and "env" not in workflow
-    for key in ("image", "digest", "size"):
+    for key in ("image", "github_image", "t_head_image", "digest", "size"):
         assert contract["outputs"][key]["value"] == "${{ jobs.build-and-push.outputs." + key + " }}"
     for step in job["steps"]:
-        assert "if" not in step and "continue-on-error" not in step
+        assert "continue-on-error" not in step
+        if step in (data_credentials, dependencies, post):
+            assert step["if"] == "${{ inputs.push_target != 'github' && inputs.release_type == 'release' && inputs.publish_data }}"
+        elif step in (credentials, login):
+            assert step["if"] == "${{ inputs.push_target != 'github' }}"
+        elif step == github_login:
+            assert step["if"] == "${{ inputs.push_target != 't-head' }}"
+        else:
+            assert "if" not in step
         assert "${{" not in step.get("run", "")
-        if step not in (credentials, post):
+        if step not in (data_credentials, post):
             assert "secrets.data_token" not in str(step)
         if step not in (credentials, login):
             assert "secrets.release_" not in str(step)
@@ -819,7 +923,7 @@ def test_demo_matches_reusable_workflow_contract():
     demo = yaml.load(DEMO.read_text(), Loader=yaml.BaseLoader)
     contract = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)["on"]["workflow_call"]
     assert set(demo["on"]) == {"workflow_dispatch"}
-    assert demo["permissions"] == {"contents": "read"}
+    assert demo["permissions"] == {"contents": "read", "packages": "write"}
     publish = demo["jobs"]["publish"]
     inputs = publish["with"]
     assert set(inputs) == set(contract["inputs"])
@@ -831,6 +935,7 @@ def test_demo_matches_reusable_workflow_contract():
     assert "steps" not in publish and "runs-on" not in publish
     manual_inputs = demo["on"]["workflow_dispatch"]["inputs"]
     defaults = {
+        "release_type": "tmp", "publish_data": "false", "push_target": "github",
         "dockerfile": "Dockerfile", "build_context": ".", "build_args": "", "docker_tag": "",
         "os": "ubuntu24", "python": "py312", "hggcrt": "3", "sdk_version": "2.2.0",
         "torch": "2.13.0", "network": "mellanox",
@@ -840,11 +945,16 @@ def test_demo_matches_reusable_workflow_contract():
         assert definition["required"] == ("true" if key == "docker_name" else "false")
         if key != "docker_name":
             assert definition["default"] == defaults[key]
-        if key == "docker_tag":
-            assert inputs[key] == "${{ inputs.docker_tag }}"
+        if key in ("docker_tag", "release_type", "publish_data", "push_target"):
+            assert inputs[key] == "${{ inputs." + key + " }}"
         else:
             fallback = "sglang" if key == "docker_name" else defaults[key]
             assert inputs[key] == "${{ inputs." + key + " || '" + fallback + "' }}"
+    assert manual_inputs["release_type"]["type"] == "choice"
+    assert manual_inputs["release_type"]["options"] == ["release", "tmp"]
+    assert manual_inputs["publish_data"]["type"] == "boolean"
+    assert manual_inputs["push_target"]["type"] == "choice"
+    assert manual_inputs["push_target"]["options"] == ["github", "t-head", "github/t-head"]
     assert manual_inputs["network"]["type"] == "choice"
     assert manual_inputs["network"]["options"] == ["mellanox", "EIC", "mellanox/EIC"]
     assert publish["secrets"] == {
@@ -861,21 +971,28 @@ def test_demo_matches_reusable_workflow_contract():
 @pytest.mark.parametrize("network", ["mellanox", "EIC", "mellanox/EIC"])
 def test_demo_resolved_inputs_pass_validation(validator, source, post_module, release_env, monkeypatch, network):
     demo = yaml.load(DEMO.read_text(), Loader=yaml.BaseLoader)
-    manual = {key: value.get("default", "")
+    manual = {key: (value.get("default") == "true" if value["type"] == "boolean" else value.get("default", ""))
               for key, value in demo["on"]["workflow_dispatch"]["inputs"].items()}
     manual.update(docker_name="team/demo", docker_tag="1.0.0", network=network)
     inputs = dict(demo["jobs"]["publish"]["with"])
     for key, value in manual.items():
         inputs[key] = value
-    assert validator.validate_inputs(inputs, source) == {
-        "image": IMAGE, "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
+    assert validator.validate_inputs(inputs, source, CALLER_REPOSITORY) == {
+        "image": GITHUB_IMAGE, "images": GITHUB_IMAGE, "github_image": GITHUB_IMAGE, "t_head_image": "",
+        "build_context": str(source), "dockerfile": str(source / "Dockerfile"),
         "source_revision": REVISION, "docker_tag": "1.0.0",
     }
+    assert inputs["publish_data"] is False
     # The example uses its own environment versions; verify metadata is preserved rather than replaced with unit test defaults.
     assert validator.release_metadata(inputs) == {
         "os": "ubuntu24", "python": "py312", "hggcrt": "3", "sdk_version": "2.2.0", "torch": "2.13.0",
         "network": network,
     }
+    # Explicitly enable the T-Head formal release to keep verifying this repository's metadata field mapping.
+    inputs.update(push_target="t-head", release_type="release", publish_data=True)
+    outputs = validator.validate_inputs(inputs, source)
+    assert outputs["image"] == IMAGE
+    monkeypatch.setenv("IMAGE", outputs["image"])
     monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
     client = Mock()
     monkeypatch.setattr(post_module, "OpenApiClient", Mock(return_value=client))
@@ -900,7 +1017,8 @@ def test_demo_prints_outputs_without_shell_interpolation():
     step, = result["steps"]
     assert step["shell"] == "bash"
     assert step["env"] == {
-        key.upper(): "${{ needs.publish.outputs." + key + " }}" for key in ("image", "digest", "size")
+        key.upper(): "${{ needs.publish.outputs." + key + " }}"
+        for key in ("image", "github_image", "t_head_image", "digest", "size")
     }
     assert "${{" not in step["run"]
     assert "secrets." not in str(result)
@@ -908,17 +1026,51 @@ def test_demo_prints_outputs_without_shell_interpolation():
     assert syntax.returncode == 0, syntax.stderr
 
 
-@pytest.mark.parametrize("missing", [None, "RELEASE_USERNAME", "RELEASE_TOKEN", "CLIENT_PRIVATE_KEY_B64"])
-def test_credentials_checked_before_build_without_logging(missing):
+@pytest.mark.parametrize("push_target", ["github", "t-head", "github/t-head"])
+@pytest.mark.parametrize("release_type,publish_data,publishes", [
+    ("release", True, True), ("release", False, False), ("tmp", True, False), ("tmp", False, False),
+])
+@pytest.mark.parametrize("missing", [None, "RELEASE_USERNAME", "RELEASE_TOKEN", "CLIENT_PRIVATE_KEY_B64", "all"])
+def test_credentials_checked_before_build_without_logging(push_target, release_type, publish_data, publishes, missing):
     workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
-    guard = next(step for step in workflow["jobs"]["build-and-push"]["steps"] if step["name"] == "Validate publishing credentials")
+    steps = {step["name"]: step for step in workflow["jobs"]["build-and-push"]["steps"]}
+    publishes = publishes and push_target != "github"
     env = dict(os.environ, RELEASE_USERNAME="test-user", RELEASE_TOKEN="test-token", CLIENT_PRIVATE_KEY_B64="test-private-key")
-    if missing:
-        env[missing] = " \t\n"
-    result = subprocess.run(["bash", "-c", guard["run"]], env=env, capture_output=True, text=True, timeout=5)
-    assert (result.returncode == 0) == (missing is None)
-    for secret in ("test-user", "test-token", "test-private-key"):
-        assert secret not in result.stdout + result.stderr
+    for key in ("RELEASE_USERNAME", "RELEASE_TOKEN", "CLIENT_PRIVATE_KEY_B64"):
+        if missing in (key, "all"):
+            env[key] = " \t\n"
+    guard = steps["Validate publishing credentials"]
+    assert guard["env"] == {"RELEASE_USERNAME": "${{ secrets.release_username }}",
+                             "RELEASE_TOKEN": "${{ secrets.release_token }}"}
+    assert "CLIENT_PRIVATE_KEY_B64" not in guard["run"]
+    checks = {
+        "Validate publishing credentials": push_target != "github",
+        "Log in to release image registry": push_target != "github",
+        "Log in to GitHub Container Registry": push_target != "t-head",
+        "Validate release data credentials": publishes,
+        "Install release data dependencies": publishes,
+        "Publish Docker release data": publishes,
+    }
+    for name, expected in checks.items():
+        condition = steps[name]["if"]
+        assert condition in {
+            "${{ inputs.push_target != 'github' }}", "${{ inputs.push_target != 't-head' }}",
+            "${{ inputs.push_target != 'github' && inputs.release_type == 'release' && inputs.publish_data }}",
+        }
+        expression = condition.removeprefix("${{ ").removesuffix(" }}").replace("&&", "and")
+        enabled = eval(expression, {"__builtins__": {}}, {
+            "inputs": SimpleNamespace(push_target=push_target, release_type=release_type, publish_data=publish_data),
+        })
+        assert enabled is expected
+        if not enabled or name not in ("Validate publishing credentials", "Validate release data credentials"):
+            continue
+        invalid = ("CLIENT_PRIVATE_KEY_B64", "all") if name == "Validate release data credentials" else (
+            "RELEASE_USERNAME", "RELEASE_TOKEN", "all",
+        )
+        result = subprocess.run(["bash", "-c", steps[name]["run"]], env=env, capture_output=True, text=True, timeout=5)
+        assert (result.returncode == 0) == (missing not in invalid)
+        for secret in ("test-user", "test-token", "test-private-key"):
+            assert secret not in result.stdout + result.stderr
 
 
 @pytest.fixture
@@ -939,15 +1091,17 @@ def image_manifest():
     }
 
 
+@pytest.mark.parametrize("repository", ["docker_release", "docker_tmp"])
 @pytest.mark.parametrize("media_type", ["application/vnd.oci.image.manifest.v1+json",
                                         "application/vnd.docker.distribution.manifest.v2+json"])
-def test_single_manifest_size_uses_pushed_digest(image_inspector, image_manifest, media_type):
+def test_single_manifest_size_uses_pushed_digest(image_inspector, image_manifest, media_type, repository):
+    image = IMAGE.replace("docker_release", repository)
     image_manifest["mediaType"] = media_type
     image_inspector.subprocess.run.side_effect = None
     image_inspector.subprocess.run.return_value = SimpleNamespace(stdout=json.dumps(image_manifest))
-    assert image_inspector.inspect_image_size(IMAGE, DIGEST) == 3172
+    assert image_inspector.inspect_image_size(image, DIGEST) == 3172
     image_inspector.subprocess.run.assert_called_once_with(
-        ["docker", "buildx", "imagetools", "inspect", "--raw", IMAGE.rsplit(":", 1)[0] + "@" + DIGEST],
+        ["docker", "buildx", "imagetools", "inspect", "--raw", image.rsplit(":", 1)[0] + "@" + DIGEST],
         check=True, capture_output=True, text=True, timeout=120,
     )
 
@@ -1012,7 +1166,9 @@ def test_index_requires_one_valid_amd64_descriptor(image_inspector, entries):
 
 
 @pytest.mark.parametrize("image,digest", [
-    ("", DIGEST), (IMAGE.replace("docker_release", "docker_tmp"), DIGEST),
+    (None, DIGEST), ("", DIGEST), (IMAGE.replace("docker_release", "other"), DIGEST),
+    (IMAGE.replace("docker_release", "docker_tmp_extra"), DIGEST),
+    (IMAGE.replace("docker_release", "docker_tmp/../docker_release"), DIGEST),
     (IMAGE.replace("download.t-head.cn", "example.invalid"), DIGEST),
     (IMAGE.rsplit(":", 1)[0], DIGEST), (IMAGE + "\ninjected", DIGEST),
     (IMAGE, ""), (IMAGE, "sha256:abc"), (IMAGE, "sha256:" + "a" * 64 + "\n"),
@@ -1074,6 +1230,64 @@ def test_inspection_requires_output_path_before_docker(image_inspector, release_
     image_inspector.subprocess.run.assert_not_called()
 
 
+@pytest.mark.parametrize("push_target", ["github", "t-head", "github/t-head"])
+@pytest.mark.parametrize("release_type", ["release", "tmp"])
+def test_cli_outputs_flow_to_selected_registry_inspection(
+    validator, image_inspector, image_manifest, post_module, source, monkeypatch, push_target, release_type,
+):
+    output = source / "outputs"
+    inputs = dict(DEFAULT_INPUTS, push_target=push_target, release_type=release_type)
+    monkeypatch.setenv("SOURCE_DIR", str(source))
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
+    monkeypatch.setenv("GITHUB_REPOSITORY", CALLER_REPOSITORY)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert validator.main() == 0
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["github_image"] == (GITHUB_IMAGE if push_target != "t-head" else "")
+    assert outputs["t_head_image"] == (IMAGE.replace("docker_release", "docker_" + release_type)
+                                        if push_target != "github" else "")
+    for key in ("image", "source_revision"):
+        monkeypatch.setenv(key.upper(), outputs[key])
+    monkeypatch.setenv("RESOLVED_DOCKER_TAG", outputs["docker_tag"])
+    monkeypatch.setenv("DIGEST", DIGEST)
+    image_inspector.subprocess.run.side_effect = None
+    image_inspector.subprocess.run.return_value = SimpleNamespace(stdout=json.dumps(image_manifest))
+    assert image_inspector.main() == 0
+    assert output.read_text().endswith("size=3172\n")
+    reference = outputs["image"].rsplit(":", 1)[0] + "@" + DIGEST
+    assert image_inspector.subprocess.run.call_args.args[0][-1] == reference
+    if push_target != "github" and release_type == "release":
+        monkeypatch.setenv("SIZE", "3172")
+        record = post_module.read_record()
+        assert record["image"] == outputs["t_head_image"] == IMAGE
+        assert post_module.build_payload(record)["image"] == IMAGE
+    post_module.requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("image", [
+    GITHUB_IMAGE.replace("example-org", "other-org"),
+    GITHUB_IMAGE.replace("caller-repo", "other-repo"),
+    GITHUB_IMAGE.replace("caller-repo", "caller-repo-extra"),
+    GITHUB_IMAGE.replace("caller-repo/", "caller-repo/../"),
+    GITHUB_IMAGE.replace("ghcr.io", "ghcr.io.evil.invalid"),
+    GITHUB_IMAGE.rsplit(":", 1)[0], GITHUB_IMAGE + "\ninjected",
+])
+def test_github_inspection_rejects_images_outside_caller(image_inspector, image):
+    with pytest.raises(ValueError):
+        image_inspector.inspect_image_size(image, DIGEST, CALLER_REPOSITORY)
+    image_inspector.subprocess.run.assert_not_called()
+
+
+@pytest.mark.parametrize("overrides", [{"push_target": "other"}, {"release_type": "Release"}, {"publish_data": "false"}])
+def test_invalid_publish_options_do_not_emit_outputs(validator, source, monkeypatch, overrides):
+    output = source / "outputs"
+    monkeypatch.setenv("SOURCE_DIR", str(source))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(dict(DEFAULT_INPUTS, **overrides)))
+    assert validator.main() == 1
+    assert not output.exists()
+
+
 def test_public_configuration_matches_repository_api(post_module):
     # Parse only the existing public configuration in this repository; do not import or execute the PyPI publishing script.
     path = REPO / "ci-workflows/release-pypi/scripts/post_data.py"
@@ -1130,7 +1344,8 @@ def test_migrated_workflow_commands_run_from_checkout(source, script_name, overr
     assert "ModuleNotFoundError" not in result.stderr
     if success:
         assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {
-            "image": IMAGE, "build_context": str(caller), "dockerfile": str(caller / "Dockerfile"),
+            "image": IMAGE, "images": IMAGE, "github_image": "", "t_head_image": IMAGE,
+            "build_context": str(caller), "dockerfile": str(caller / "Dockerfile"),
             "source_revision": REVISION, "docker_tag": "1.0.0",
         }
     else:

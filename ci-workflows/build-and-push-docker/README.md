@@ -1,6 +1,6 @@
-# Release Docker Publishing Template
+# Docker Publishing Template
 
-Build a `linux/amd64` image from the caller repository, push it to `docker_release`, inspect its size, and publish Docker artifact metadata to the data API.
+Build a `linux/amd64` image from the caller repository, push it to GHCR, the T-Head registry, or both according to `push_target`, and inspect its size. Defaults are `push_target: github`, `release_type: tmp`, and `publish_data: false`. The metadata publishing script runs only when the target includes `t-head`, `release_type: release`, and `publish_data: true`.
 
 - Reusable workflow: [`.github/workflows/build-and-push-docker.yml`](../../.github/workflows/build-and-push-docker.yml)
 - Complete usage example: [`workflows/demo-build-and-push-docker.yml`](workflows/demo-build-and-push-docker.yml)
@@ -14,13 +14,13 @@ This is a reusable workflow called through `jobs.<job_id>.uses`, not a regular A
 
 1. Commit the Dockerfile, required build files, and an appropriate `.dockerignore` to the caller repository.
 2. Copy the [example](workflows/demo-build-and-push-docker.yml) to `.github/workflows/demo-build-and-push-docker.yml` in the caller repository. This module's `workflows/` directory contains examples only; GitHub does not execute them automatically.
-3. Configure Actions Secrets: `RELEASE_USERNAME`, `RELEASE_TOKEN`, and `DATA_TOKEN`. The registry account must have push and read access to `docker_release`; the data API private key must match the client identity.
+3. Grant `contents: read` and `packages: write` permissions in the caller workflow. GHCR uses the caller's `GITHUB_TOKEN` without additional Secrets. `RELEASE_USERNAME` and `RELEASE_TOKEN` are required only when the target includes `t-head`, and the account must have push and read permissions for the selected T-Head repository. `DATA_TOKEN` is required only when `release_type: release` and `publish_data: true` are also set.
 4. Update the fixed `os`, `python`, `hggcrt`, `sdk_version`, and `torch` values in the example to match the actual image environment. These values are release metadata only; they do not automatically install dependencies or change the build.
 5. Ensure the template revision contains the workflow and all scripts. The example uses `t-head/ci-infra@main`; for production, replace both `@main` in `uses` and `template_ref: main` with the same full commit SHA from the template repository. When using a fork, update both the repository path in `uses` and `template_repository`.
 6. Commit the caller workflow to the caller default branch. Select **Run workflow** on the Actions page, choose a trusted branch, and enter the base image name, network type, and other parameters. The image tag is optional; leave it empty to use the current UTC date.
 7. After success, find the image address, digest, and size in the logs, job summary, or the example's `result` job.
 
-**The example builds and pushes a real image and publishes metadata; it is not a dry run.** Run it only with trusted repositories, branches, and Dockerfiles.
+**The example builds and pushes real images and publishes metadata when the conditions are met; it is not a dry run.** Use only trusted repositories, branches, and Dockerfiles.
 
 Private templates must allow cross-repository calls in Actions settings; enable the `template_token` mapping in the example as needed. For same-repository relative-path calls, use `uses: ./.github/workflows/build-and-push-docker.yml` with `template_repository: ${{ github.repository }}` and `template_ref: ${{ github.sha }}`. For cross-repository calls, do not use the caller `github.sha` as the template revision.
 
@@ -37,11 +37,27 @@ Check out caller source and template tools separately
   → Assemble DOCKER metadata, encrypt and sign it, and call the publishing API
 ```
 
-The Docker client address is fixed to:
+All combinations build and push the image and inspect its size. The data key is validated, API dependencies are installed, the package list is collected, and metadata is published only when the target includes `t-head`, `release_type: release`, and `publish_data: true`.
+
+| `push_target` | Image destination | Metadata publishing conditions |
+| --- | --- | --- |
+| `github` (default) | Only the caller repository's GHCR namespace | Always skipped |
+| `t-head` | Only `download.t-head.cn` | `release_type: release` and `publish_data: true` |
+| `github/t-head` | GHCR and `download.t-head.cn` | `release_type: release` and `publish_data: true` |
+
+GHCR addresses use the lowercase form of the caller's `github.repository`, not the template repository. The image is linked to the caller repository through the `org.opencontainers.image.source` label:
 
 ```text
-download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>
+ghcr.io/<owner>/<repo>/<docker_name>-<git_tag_or_commit>:<docker_tag>
 ```
+
+The T-Head address is determined by `release_type`: `release` maps to `docker_release`, and `tmp` maps to `docker_tmp`:
+
+```text
+download.t-head.cn/<docker_release_or_docker_tmp>/<docker_name>-<git_tag_or_commit>:<docker_tag>
+```
+
+Dual-target mode builds once and tags the same build result with both destination addresses. Size inspection and metadata publishing use the T-Head address. A failure to push to either destination fails the job and prevents metadata publishing; images already pushed are not automatically rolled back. GHCR addresses do not distinguish `release_type`, so the same revision and Docker tag use the same address.
 
 The suffix comes from the caller source's checked-out `HEAD`, not the template repository: use a Git tag pointing exactly at that commit, or the full commit SHA when no exact tag exists. Both lightweight and annotated tags are supported. If multiple tags point at the commit, the first in lexicographic name order is used; tags on ancestor commits are ignored. The Git tag must be a valid lowercase Docker name component; unsupported characters (such as uppercase letters, `/`, or `+`) fail validation rather than being silently rewritten.
 
@@ -58,14 +74,17 @@ Examples with `docker_name: team/demo` (all use the prefix `download.t-head.cn/d
 
 Repeated builds of the same revision on the same UTC day target the same image address unless a distinct `docker_tag` is supplied.
 
-The Artifactory repository URL is `https://download.t-head.cn/artifactory/docker_release/`, but Docker login uses only `download.t-head.cn`. Image addresses do not include `https://` or `/artifactory/`; the destination service must configure the corresponding Docker Registry path mapping.
+The T-Head Artifactory URL is `https://download.t-head.cn/artifactory/docker_release/` or `https://download.t-head.cn/artifactory/docker_tmp/`, while the Docker login address is only `download.t-head.cn`. Image addresses do not include `https://` or `/artifactory/`; the server must configure the corresponding path mappings.
 
 ## Inputs
 
-All reusable workflow inputs are of type `string`; quote version numbers.
+`publish_data` has type `boolean` and accepts only unquoted `true`/`false`. All other inputs have type `string`; quote version numbers. `workflow_call` does not support `choice`, so the script strictly validates both enum inputs. The manually triggered demo uses dropdown options.
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
+| `release_type` | No | `tmp` | Only `release` or `tmp`; selects the T-Head repository path without changing the GHCR address. |
+| `publish_data` | No | `false` | Enables metadata publishing only when the target includes `t-head` and the release type is `release`. |
+| `push_target` | No | `github` | Only `github`, `t-head`, or `github/t-head`, case-sensitive. |
 | `dockerfile` | Yes | None | Dockerfile path relative to the caller repository root, such as `docker/Dockerfile`. |
 | `build_context` | No | `.` | Local build context directory relative to the caller repository root. |
 | `build_args` | No | Empty string | One `KEY=VALUE` per line, passed as Docker ARG values, not shell or Buildx command-line options. |
@@ -82,7 +101,7 @@ All reusable workflow inputs are of type `string`; quote version numbers.
 
 The six release fields must be non-empty printable strings without leading or trailing whitespace. Apart from the `network` enum, no additional version format restrictions apply. These fields do not automatically form the tag, become Docker ARG values, set image labels, change the runner, or configure the build network.
 
-Both the Dockerfile and build context are relative to the caller repository root, not to each other. The Dockerfile must be a non-empty regular file, and the context must be a directory. Absolute paths, `..`, remote URLs, and symlinks pointing outside the repository are not supported. The full image repository name, including the registry, `docker_release/`, and the Git tag or commit suffix, must not exceed 255 characters.
+Both the Dockerfile and build context are relative to the caller repository root, not to each other. The Dockerfile must be a non-empty regular file, and the context must be a directory. Absolute paths, `..`, remote URLs, and symlinks pointing outside the repository are not supported. The full image repository name, including the registry, repository namespace, and Git tag or commit suffix, must not exceed 255 characters.
 
 Variable names in `build_args` must match `[A-Za-z_][A-Za-z0-9_]*` and must not be duplicated; empty values and blank lines are allowed. Do not pass passwords or tokens, as build arguments may appear in image history or provenance. The template does not expose BuildKit secret mount inputs. The Dockerfile must declare and use the corresponding ARG values itself; `docker_tag` does not automatically become a build argument.
 
@@ -90,18 +109,20 @@ Variable names in `build_args` must match `[A-Za-z_][A-Za-z0-9_]*` and must not 
 
 | Template Secret | Required | Caller Secret in Example | Description |
 | --- | --- | --- | --- |
-| `release_username` | Yes | `RELEASE_USERNAME` | Docker Registry publishing username. |
-| `release_token` | Yes | `RELEASE_TOKEN` | Credentials with push and read access to the release repository. |
-| `data_token` | Yes | `DATA_TOKEN` | Client RSA private key encoded as Base64 unencrypted DER (PKCS8), not a regular Bearer token. |
+| `release_username` | When the target includes `t-head` | `RELEASE_USERNAME` | T-Head image registry username. |
+| `release_token` | When the target includes `t-head` | `RELEASE_TOKEN` | Token with push and read permissions for the selected T-Head repository. |
+| `data_token` | When the target includes `t-head`, `release_type: release`, and `publish_data: true` | `DATA_TOKEN` | Base64-encoded unencrypted DER (PKCS8) client RSA private key, not a Bearer token. |
 | `template_token` | No | `TEMPLATE_TOKEN` | Token for reading a private template repository; defaults to `github.token`, which may lack read access in cross-repository calls. |
 
-The caller must grant at least `contents: read`. The destination is Artifactory, so GitHub Packages write access is not required. Pass publishing credentials only to the relevant steps; do not include private keys in source code, logs, or build arguments.
+The workflow declares `contents: read` and `packages: write`; the caller must also grant both permissions. GHCR login uses `github.actor` and the caller's `github.token`. If an existing GHCR package is not linked to the caller repository, grant that repository Actions write access in the package settings. Organization policies must also allow package publishing. Credentials are injected only into the relevant steps and must not be placed in source code, logs, or build arguments.
 
 ## Outputs and Size Definition
 
 | Workflow Output | Description |
 | --- | --- |
-| `image` | Full image address including the tag. |
+| `image` | Primary image address: the T-Head address when the target includes `t-head`, otherwise the GHCR address. |
+| `github_image` | Full GHCR image address; empty when `github` is not selected. |
+| `t_head_image` | Full T-Head image address; empty when `t-head` is not selected. |
 | `digest` | Original digest returned by Buildx, retaining the `sha256:` prefix; may identify a single image manifest or an image index. |
 | `size` | Total size in bytes of the `linux/amd64` image config and stored layers; returned as a decimal string in GitHub Actions outputs. |
 

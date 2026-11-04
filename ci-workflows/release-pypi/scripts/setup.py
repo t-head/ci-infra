@@ -35,17 +35,20 @@ RESET = "\033[0m"
 @dataclass
 class WheelResult:
     """
-    用于封装 wheel 包查找结果的数据类。
+    Dataclass encapsulating the wheel package lookup result.
 
-    在整个构建流程中, WheelResult 作为统一的返回结构，承载了从远端仓库或本地策略
-    匹配到的 wheel 包的关键信息，包括下载地址、文件名以及最终确定的构建版本号。
+    Throughout the build pipeline, WheelResult serves as the unified return
+    structure, carrying the key information of the wheel package matched from
+    the remote repository or the local strategy, including the download URL,
+    file name and the final resolved build version.
 
     Attributes:
-        url: wheel 包的完整下载 URL。若未找到匹配的包则为 None。
-        filename: wheel 包的文件名（如 "package-1.0.0+{RUNTIME_MARK}121ubuntu2204ce-cp310-cp310-linux_x86_64.whl"）。
-                  若未找到匹配的包则为 None。
-        build_version: 最终匹配到的构建版本号字符串（如 "1.0.0+v0.1.0.sail2.0.0"）。
-                       若未找到匹配的包则为 None。
+        url: The full download URL of the wheel package; None when no matching package is found.
+        filename: The wheel file name (for example
+                  "package-1.0.0+{RUNTIME_MARK}121ubuntu2204ce-cp310-cp310-linux_x86_64.whl");
+                  None when no matching package is found.
+        build_version: The resolved build version string (for example "1.0.0+v0.1.0.sail2.0.0");
+                       None when no matching package is found.
     """
     url: Optional[str]
     filename: Optional[str]
@@ -65,20 +68,21 @@ def run_cmd(cmd: str, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIP
 
 def get_os_name():
     """
-    检测当前操作系统类型并返回标准化的操作系统名称字符串。
+    Detect the current operating system type and return a normalized OS name string.
 
-    通过读取 /etc/os-release 文件来判断当前系统类型。支持以下操作系统：
+    The system type is determined by reading /etc/os-release. Supported systems:
       - Ubuntu 20.04 -> "ubuntu2004"
       - Ubuntu 22.04 -> "ubuntu2204"
       - Ubuntu 24.04 -> "ubuntu2404"
       - AliOS -> "alios7u2"
-    如果启用了 USE_MANYLINUX 全局标志，则在不支持的系统上回退为 "alios7u2"。
-    其他不支持的系统返回 "any"。
+    When the global flag USE_MANYLINUX is enabled, unsupported systems fall back
+    to "alios7u2". Other unsupported systems return "any".
 
-    该名称用于拼接 wheel 文件名，确保安装包与目标操作系统匹配。
+    The name is used to assemble the wheel file name, ensuring the installed
+    package matches the target operating system.
 
     Returns:
-        str: 标准化的操作系统名称，如 "ubuntu2204"、"alios7u2" 或 "any"。
+        str: The normalized OS name, such as "ubuntu2204", "alios7u2" or "any".
     """
     cmd = "cat /etc/os-release"
     ret = run_cmd(cmd)
@@ -116,21 +120,25 @@ def get_platform():
 
 def get_framework_version():
     """
-    获取当前环境中安装的深度学习框架的版本号。
+    Get the version of the deep learning framework installed in the current environment.
 
-    根据全局变量 framework 的值来确定需要检测的框架类型：
-      - 若 framework 为空或 None, 返回空字符串(表示不依赖任何框架)。
-      - 若 framework 为 "torch"，则导入 PyTorch 并提取其版本号。版本号会去除
-        本地版本标识符（如 "+{RUNTIME_MARK}121"），只保留主版本.次版本.微版本格式。
-      - 若 framework 为其他值，则尝试使用 importlib 动态导入该模块并读取其 __version__ 属性。
+    The framework to detect is determined by the global variable framework:
+      - If framework is empty or None, return an empty string (meaning no framework dependency).
+      - If framework is "torch", import PyTorch and extract its version. The local
+        version label (such as "+{RUNTIME_MARK}121") is stripped, keeping only the
+        major.minor.micro format.
+      - For any other value, try to import the module dynamically via importlib and
+        read its __version__ attribute.
 
-    框架版本号用于拼接 wheel 文件名，确保安装包与当前框架版本兼容。
+    The framework version is used to assemble the wheel file name, ensuring the
+    installed package is compatible with the current framework version.
 
     Returns:
-        str: 框架版本号字符串（如 "2.1.0"），或在未指定框架时返回空字符串。
+        str: The framework version string (for example "2.1.0"), or an empty
+             string when no framework is specified.
 
     Raises:
-        SystemExit: 当 framework 为 "torch" 但导入 PyTorch 失败时，程序退出。
+        SystemExit: The program exits when framework is "torch" but importing PyTorch fails.
     """
     if framework == '' or framework is None:
         return ""
@@ -158,12 +166,12 @@ def get_framework_version():
 
 def get_runtime_version():
     """
-    获取当前环境的 runtime 版本号。
+    Get the runtime version of the current environment.
 
-    优先读取 HGGCRT_VERSION，未设置或格式非法时通过 hgcc 检测。
+    HGGCRT_VERSION is preferred; when it is unset or malformed, detect via hgcc.
 
     Returns:
-        str or None: runtime 版本号字符串，若无法获取则返回 None。
+        str or None: The runtime version string, or None when it cannot be obtained.
     """
     runtime_version = get_runtime_version_by_env()
     if runtime_version is not None:
@@ -173,15 +181,18 @@ def get_runtime_version():
 
 def get_runtime_version_by_hgcc():
     """
-    通过执行 hgcc --version 命令获取当前系统安装的 runtime 版本号。
+    Get the runtime version installed on the current system by running hgcc --version.
 
-    解析 hgcc 的输出信息，使用正则表达式匹配 "Runtime API version v2" 格式的版本号。
-    例如输出 "Runtime API version v2" 时, 提取的版本号为 "2"。
+    Parse the hgcc output and match version strings in the "Runtime API version v2"
+    format with a regular expression. For example, when the output is
+    "Runtime API version v2", the extracted version is "2".
 
-    当环境变量未提供合法版本时，使用该方法检测；仅接受整数 API 版本。
+    This method is used when the environment variable does not provide a valid
+    version; only integer API versions are accepted.
 
     Returns:
-        str or None: runtime 版本号字符串（如 "2"），若无法获取则返回 None。
+        str or None: The runtime version string (for example "2"), or None when it
+                     cannot be obtained.
     """
     try:
         result = subprocess.run(['hgcc', '--version'],
@@ -190,7 +201,7 @@ def get_runtime_version_by_hgcc():
                                 text=True,
                                 check=True)
         output = os.linesep.join((result.stdout or "", result.stderr or ""))
-        # 例如 Runtime API version v2，仅返回数字部分 2。
+        # For example "Runtime API version v2"; return only the numeric part 2.
         for line in output.splitlines():
             match = re.fullmatch(r'\s*Runtime\s+API\s+version\s+v([0-9]+)\s*', line)
             if match:
@@ -206,10 +217,12 @@ def get_runtime_version_by_hgcc():
 
 def get_runtime_version_by_env():
     """
-    通过读取环境变量 HGGCRT_VERSION 获取 hggcrt runtime 版本号。
-    环境变量 HGGCRT_VERSION 必须是 hggcrt 前缀加整数 API 版本，例如 "hggcrt3"。
+    Get the hggcrt runtime version by reading the environment variable HGGCRT_VERSION.
+    The environment variable HGGCRT_VERSION must be the hggcrt prefix plus an integer
+    API version, for example "hggcrt3".
     Returns:
-        str or None: hggcrt 版本号字符串（如 "3"），若环境变量未设置或格式不符则返回 None。
+        str or None: The hggcrt version string (for example "3"), or None when the
+                     environment variable is unset or has an unexpected format.
     """
     try:
         # HGGCRT_VERSION=hggcrt3
@@ -228,12 +241,14 @@ def get_runtime_version_by_env():
 
 def get_sdk_version_by_env():
     """
-    通过读取环境变量 SAIL_PYPI_SDK_VERSION 获取 SDK 版本号。
+    Get the SDK version by reading the environment variable SAIL_PYPI_SDK_VERSION.
 
-    该环境变量用于在无法通过其他途径自动检测 SDK 版本时，由用户手动指定。预期格式为纯版本号字符串，如 "1.7.0"。
+    This environment variable lets the user specify the SDK version manually when it
+    cannot be auto-detected by other means. The expected format is a plain version
+    string, such as "1.7.0".
 
     Returns:
-        str or None: SDK 版本号字符串，若环境变量未设置则返回 None。
+        str or None: The SDK version string, or None when the environment variable is unset.
     """
     try:
         # SDK_VESION_FOR_PYPI=1.7.0
@@ -251,18 +266,20 @@ def get_sdk_version_by_env():
 
 def load_plugin(file_path):
     """
-    从指定文件路径动态加载一个 Python 模块作为插件。
+    Dynamically load a Python module from the given file path as a plugin.
 
-    使用 importlib 的底层 API,将任意路径的 .py 文件作为名为 "dynamic_plugin"
-    的模块加载到内存中。该机制用于在运行时从远端下载的策略文件 (strategy.py)
-    中加载匹配逻辑，实现策略的动态更新而无需修改本脚本。
+    Using importlib's low-level API, a .py file at an arbitrary path is loaded into
+    memory as a module named "dynamic_plugin". This mechanism is used to load the
+    matching logic from the strategy file (strategy.py) downloaded at runtime from
+    the remote repository, allowing the strategy to be updated dynamically without
+    modifying this script.
 
     Args:
-        file_path: 要加载的 Python 文件的绝对路径。
+        file_path: The absolute path of the Python file to load.
 
     Returns:
-        module or None: 成功加载后返回模块对象，可通过 module.run() 等方式调用
-                        其中的函数。加载失败时返回 None。
+        module or None: The loaded module object on success, whose functions can be
+                        called via module.run() and so on; None when loading fails.
     """
     try:
         spec = importlib.util.spec_from_file_location("dynamic_plugin", file_path)
@@ -276,31 +293,35 @@ def load_plugin(file_path):
 
 def get_wheel_url():
     """
-    根据当前环境信息(Python 版本、平台、操作系统、RUNTIME 版本、框架版本等)
-    确定目标 wheel 包的下载 URL 和文件名。
+    Determine the download URL and file name of the target wheel package based on
+    the current environment (Python version, platform, OS, RUNTIME version,
+    framework version, etc.).
 
-    该函数是整个构建流程的核心入口，负责协调环境检测和版本匹配。处理流程如下：
+    This function is the core entry of the whole build pipeline, coordinating
+    environment detection and version matching. The flow is:
 
-    1. 收集当前环境信息: Python 版本 (cpXY)、平台标识、操作系统名称、
-       包版本号、框架版本和 RUNTIME 版本。
-    2. 检查环境变量 SAIL_SDK_MATCH_STRATEGY:
-       - 若为 "off"，使用旧版本地配置匹配逻辑 (get_wheel_url_old),
-         直接根据环境参数拼接 wheel URL。
-       - 否则（默认），从远端下载 strategy.py 策略脚本，动态加载并执行
-         其 run() 方法来进行智能版本匹配。策略脚本会下载 index.json
-         版本索引文件，综合考虑 SDK 版本兼容性选择最佳匹配。
-    3. 将匹配结果存储到全局变量 g_wheel_result 中。
-    4. 若未找到匹配的包，输出详细的环境信息错误提示并退出程序。
+    1. Collect the current environment info: Python version (cpXY), platform
+       identifier, OS name, package version, framework version and RUNTIME version.
+    2. Check the environment variable SAIL_SDK_MATCH_STRATEGY:
+       - If it is "off", use the legacy local-config matching logic
+         (get_wheel_url_old), assembling the wheel URL directly from the environment parameters.
+       - Otherwise (default), download the strategy.py script from the remote
+         repository, load it dynamically and run its run() method for intelligent
+         version matching. The strategy script downloads the index.json version
+         index file and picks the best match considering SDK version compatibility.
+    3. Store the matching result in the global variable g_wheel_result.
+    4. If no matching package is found, print detailed environment info and exit.
 
     Returns:
-        tuple: (wheel_url, wheel_filename) 元组, 分别为 wheel 包的完整下载
-               URL 和文件名。
+        tuple: (wheel_url, wheel_filename), the full download URL of the wheel
+               package and its file name.
 
     Raises:
-        SystemExit: 当无法找到与当前环境兼容的安装包时, 程序退出。
+        SystemExit: The program exits when no installation package compatible
+                    with the current environment is found.
 
     Side Effects:
-        修改全局变量 g_wheel_result, 存储完整的匹配结果。
+        Modifies the global variable g_wheel_result to store the full matching result.
     """
     python_version = None
     platform_name = None
@@ -369,28 +390,30 @@ def get_wheel_url():
 
 def get_wheel_url_old(python_version, platform_name, os_name, package_version, framework_version, runtime_version):
     """
-    使用本地配置方式拼接 wheel 包的下载 URL 和文件名（不依赖远端策略）。
+    Assemble the wheel download URL and file name from the local configuration
+    (without relying on the remote strategy).
 
-    当环境变量 SAIL_SDK_MATCH_STRATEGY 设置为 "off" 时，跳过远端策略匹配,
-    直接根据传入的环境参数按固定规则拼接 wheel 文件名和 URL。
+    When the environment variable SAIL_SDK_MATCH_STRATEGY is set to "off", the
+    remote strategy matching is skipped and the wheel file name and URL are
+    assembled directly from the given environment parameters by fixed rules.
 
-    文件名格式遵循以下规则：
-      - 有框架依赖时：{包名}-{版本}+{RUNTIME_MARK}{RUNTIME}{框架}{框架版本}{OS}{版本类型}-{Python}-{Python}-{平台}.whl
-      - 无框架依赖时：{包名}-{版本}+{RUNTIME_MARK}{RUNTIME}{OS}{版本类型}-{Python}-{Python}-{平台}.whl
+    The file name format follows these rules:
+      - With a framework dependency: {pkg}-{ver}+{RUNTIME_MARK}{RUNTIME}{framework}{fw_ver}{OS}{edition}-{Python}-{Python}-{platform}.whl
+      - Without a framework dependency: {pkg}-{ver}+{RUNTIME_MARK}{RUNTIME}{OS}{edition}-{Python}-{Python}-{platform}.whl
 
     Args:
-        python_version: Python 版本标识（如 "cp310"）。
-        platform_name: 平台标识（如 "linux_x86_64"）。
-        os_name: 操作系统名称（如 "ubuntu2204"）。
-        package_version: 包版本号（不含 build 后缀，如 "1.0.0"）。
-        framework_version: 框架版本号（如 "2.1.0"），为空表示无框架依赖。
-        runtime_version: RUNTIME 版本号（如HGGCRT 的 "3"）。
+        python_version: The Python version identifier (for example "cp310").
+        platform_name: The platform identifier (for example "linux_x86_64").
+        os_name: The OS name (for example "ubuntu2204").
+        package_version: The package version without the build suffix (for example "1.0.0").
+        framework_version: The framework version (for example "2.1.0"); empty means no framework dependency.
+        runtime_version: The RUNTIME version (for example HGGCRT's "3").
 
     Returns:
-        tuple: (wheel_url, wheel_filename) 元组。
+        tuple: (wheel_url, wheel_filename).
 
     Side Effects:
-        修改全局变量 g_wheel_result。
+        Modifies the global variable g_wheel_result.
     """
     global g_wheel_result
     print("Get whl url with local config.")
@@ -410,18 +433,21 @@ def get_wheel_url_old(python_version, platform_name, os_name, package_version, f
 
 def download_file(file_url, filename, temp_file_path=None):
     """
-    该函数使用 wget 命令下载文件。主要用于从制品仓库(Artifactory)下载 wheel 包或其他配置文件。
+    Download a file using the wget command. Mainly used to download wheel packages
+    or other configuration files from the artifact repository (Artifactory).
 
     Args:
-        file_url: 要下载的文件的完整 URL。
-        filename: 下载后保存的文件名。
-        temp_file_path: 可选的临时目录路径。若提供，文件将保存到该目录下。
+        file_url: The full URL of the file to download.
+        filename: The file name to save the download as.
+        temp_file_path: Optional temporary directory path. When provided, the file
+                        is saved under that directory.
 
     Returns:
-        str: 下载文件的本地绝对路径。
+        str: The local absolute path of the downloaded file.
 
     Raises:
-        SystemExit: 当下载失败且不是临时文件下载时，程序退出。
+        SystemExit: The program exits when the download fails and it is not a
+                    temporary file download.
     """
     file_path = os.path.abspath(filename)
     if temp_file_path is not None:
@@ -457,18 +483,18 @@ def download_file(file_url, filename, temp_file_path=None):
 
 def extract_metadata_from_wheel(wheel_file):
     """
-    从 wheel 包中提取 METADATA 文件的内容。
+    Extract the content of the METADATA file from a wheel package.
 
-    Wheel 包本质上是一个 ZIP 压缩文件，其中包含一个 METADATA 文件，
-    记录了包的元数据信息，包括名称、版本、依赖关系等。该函数打开 wheel
-    包，定位并读取 METADATA 文件的内容。
+    A wheel package is essentially a ZIP archive containing a METADATA file that
+    records the package metadata, including name, version and dependencies. This
+    function opens the wheel package, locates the METADATA file and reads its content.
 
     Args:
-        wheel_file: wheel 包文件的本地路径。
+        wheel_file: The local path of the wheel file.
 
     Returns:
-        str: METADATA 文件的完整内容。若未找到 METADATA 文件或发生错误，
-             返回空字符串。
+        str: The full content of the METADATA file. Returns an empty string when the
+             METADATA file is not found or an error occurs.
     """
     try:
         with zipfile.ZipFile(wheel_file, 'r') as zip_ref:
@@ -486,18 +512,19 @@ def extract_metadata_from_wheel(wheel_file):
 
 def marker_operand_to_str(node):
     """
-    将 Marker 三元组中的单个操作数（Variable/Op/Value）还原为 PEP 508 片段。
+    Restore a single operand (Variable/Op/Value) of a Marker triple into a PEP 508 fragment.
 
-    是否需要加引号由节点类型决定, 不能按位置判断: PEP 508 允许字面量出现在
-    左侧（如 "arm" not in platform_machine）, 此时三元组为 (Value, Op, Variable)。
-    packaging 的节点自带 serialize()，Variable 输出变量名、Value 输出带引号的
-    字符串字面量，直接复用可避免还原出非法 marker。
+    Whether quoting is needed depends on the node type, not on its position:
+    PEP 508 allows a literal on the left side (for example "arm" not in platform_machine),
+    in which case the triple is (Value, Op, Variable). packaging nodes provide their own
+    serialize(): Variable outputs the variable name and Value outputs a quoted string
+    literal; reusing them directly avoids restoring an invalid marker.
 
     Args:
-        node: Marker._markers 三元组中的 Variable、Op 或 Value 节点。
+        node: A Variable, Op or Value node from a Marker._markers triple.
 
     Returns:
-        str: 还原后的 PEP 508 片段。
+        str: The restored PEP 508 fragment.
     """
     serialize = getattr(node, "serialize", None)
     if callable(serialize):
@@ -507,16 +534,17 @@ def marker_operand_to_str(node):
 
 def marker_node_to_str(node):
     """
-    将 Marker 表达式树的单个节点还原为 PEP 508 条件字符串。
+    Restore a single node of the Marker expression tree into a PEP 508 condition string.
 
-    节点可能是 (Variable, Op, Value) 三元组（如 python_version < "3.10"）,
-    或括号分组对应的嵌套列表，嵌套列表会递归还原并加括号。
+    A node may be a (Variable, Op, Value) triple (for example python_version < "3.10")
+    or a nested list representing a parenthesized group; nested lists are restored
+    recursively and wrapped in parentheses.
 
     Args:
-        node: Marker._markers 中的单个节点。
+        node: A single node from Marker._markers.
 
     Returns:
-        str: 还原后的条件字符串。
+        str: The restored condition string.
     """
     if isinstance(node, tuple) and len(node) == 3:
         return " ".join(marker_operand_to_str(item) for item in node)
@@ -530,23 +558,26 @@ def marker_node_to_str(node):
 
 def split_extra_marker(marker):
     """
-    从 PEP 508 环境标记 (Marker) 中分离 extra 名称与剩余环境条件。
+    Separate the extra name from the remaining environment conditions in a PEP 508
+    environment marker (Marker).
 
-    Marker 内部的 _markers 是一棵表达式树, 由 (Variable, Op, Value) 三元组、
-    "and"/"or" 连接符及括号分组的嵌套列表组成, 该结构自 packaging 16.1
-    以来保持稳定。
+    Marker's internal _markers is an expression tree made of (Variable, Op, Value)
+    triples, "and"/"or" connectors and nested lists for parenthesized groups; this
+    structure has been stable since packaging 16.1.
 
-    标准打包工具生成的 METADATA 中, extra 子句总是位于顶层且由 and
-    连接（如 python_version < "3.11" and extra == 'dev'），此时可安全拆分；
-    顶层含 or 的复杂组合保守地整体视为非 extra 条件，不做拆分。
+    In METADATA produced by standard packaging tools, the extra clause is always at
+    the top level joined by and (for example python_version < "3.11" and extra == 'dev'),
+    so it can be split safely; complex combinations containing or at the top level are
+    conservatively treated as non-extra conditions as a whole and not split.
 
     Args:
-        marker: packaging.markers.Marker 对象。
+        marker: A packaging.markers.Marker object.
 
     Returns:
-        tuple: (extra_name, residual_condition) 元组。
-               extra_name 为 extra 名称（如 "dev"）, 不含 extra 子句时为 None;
-               residual_condition 为剩余条件字符串, 无剩余条件时为 None。
+        tuple: (extra_name, residual_condition).
+               extra_name is the extra name (for example "dev"), or None when there is
+               no extra clause; residual_condition is the remaining condition string,
+               or None when nothing remains.
     """
     nodes = marker._markers
     if any(node == "or" for node in nodes):
@@ -567,50 +598,57 @@ def split_extra_marker(marker):
 
 def parse_requires_dist(metadata_content):
     """
-    解析 METADATA 文件中的 Requires-Dist 字段，提取依赖关系。
+    Parse the Requires-Dist fields of the METADATA file and extract the dependencies.
 
-    METADATA 文件中的 Requires-Dist 字段列出了包的所有依赖项。
-    每行先用 packaging.requirements.Requirement 做 PEP 508 合法性校验
-    （非法行告警并跳过，避免脏数据传入 setup() 导致构建失败）,
-    再根据环境标记 (marker) 中是否含 extra 子句对依赖项分类：
-      - 无标记或仅含普通环境标记（如 platform_machine、python_version）：
-        添加到 install_requires 列表，条件原样保留，交由 pip 安装时求值。
-      - 含 extra 子句：添加到 extras_require 字典按 extra 名称分组，
-        与 extra 组合的其余条件（如 python_version < "3.11"）会保留在依赖项中。
+    The Requires-Dist fields in METADATA list all dependencies of the package.
+    Each line is first validated against PEP 508 with
+    packaging.requirements.Requirement (invalid lines are warned and skipped to
+    keep dirty data out of setup() and avoid build failures), then classified by
+    whether the environment marker contains an extra clause:
+      - No marker or only a normal environment marker (such as platform_machine,
+        python_version): appended to the install_requires list with the condition
+        kept as-is for pip to evaluate at install time.
+      - With an extra clause: added to the extras_require dict grouped by extra
+        name; conditions combined with the extra (such as python_version < "3.11")
+        are kept in the dependency entry.
 
-    依赖文本保留 METADATA 原样（不用 Requirement 重建），避免 SpecifierSet
-    规范化时重排版本约束顺序。
+    Dependency text is kept exactly as in METADATA (not rebuilt from Requirement)
+    to avoid SpecifierSet normalization reordering version constraints.
 
-    METADATA 为 RFC 822 格式: 首个空行之前是头部字段, 之后是包描述正文
-    (long_description)。只解析头部字段区域且要求字段名从行首开始, 避免把正文里
-    出现的 "Requires-Dist: xxx" 字样（如 README 中的示例代码）误当成真实依赖。
+    METADATA is RFC 822 format: header fields come before the first blank line,
+    followed by the package description body (long_description). Only the header
+    field area is parsed and field names must start at the beginning of a line,
+    so that "Requires-Dist: xxx" text inside the body (for example sample code in
+    the README) is not mistaken for a real dependency.
 
     Args:
-        metadata_content: METADATA 文件的完整内容字符串。
+        metadata_content: The full content string of the METADATA file.
 
     Returns:
-        tuple: (install_requires, extras_require) 元组。
-               install_requires 是依赖列表（可能带环境标记）。
-               extras_require 是按 extra 名称分组的条件依赖字典。
+        tuple: (install_requires, extras_require).
+               install_requires is the dependency list (possibly with environment markers).
+               extras_require is a dict of conditional dependencies grouped by extra name.
     """
     try:
         install_requires = []
         extras_require = {}
         field_prefix = "Requires-Dist:"
         for raw_line in metadata_content.splitlines():
-            # 首个空行之后是描述正文, 遇空行即停止解析字段。
-            # 旧式 METADATA 折叠在 Description 字段里的正文, 其空行会被编码为
-            # 8 个空格而非真正的空行, 因此不会在此提前截断头部字段。
+            # Everything after the first blank line is the description body; stop
+            # parsing fields at the first blank line. In legacy METADATA, blank lines
+            # inside the Description field are encoded as 8 spaces rather than truly
+            # empty lines, so header fields are never truncated early here.
             if raw_line == "":
                 break
-            # 必须从行首开始匹配: 行内出现的字样不是字段, 缩进行在 RFC 822
-            # 中属于上一字段的续行, 同样不是新的 Requires-Dist 字段。
+            # Matching must start at the beginning of the line: occurrences inside a
+            # line are not fields, and indented lines are RFC 822 continuations of the
+            # previous field, likewise not new Requires-Dist fields.
             if not raw_line.startswith(field_prefix):
                 continue
             line = raw_line[len(field_prefix):].strip()
             if not line:
                 continue
-            # 用 packaging.requirements 对整行做 PEP 508 校验与 marker 解析
+            # Validate the whole line against PEP 508 and parse the marker with packaging.requirements
             try:
                 requirement = Requirement(line)
             except InvalidRequirement as req_err:
@@ -624,15 +662,15 @@ def parse_requires_dist(metadata_content):
             if extra_name is not None:
                 if extra_name not in extras_require:
                     extras_require[extra_name] = []
-                # extras_require 的值同样支持环境标记, 保留与 extra
-                # 组合的剩余条件（如 python_version < "3.11"）
+                # Values of extras_require also support environment markers; keep the
+                # residual conditions combined with the extra (for example python_version < "3.11")
                 if residual_condition:
                     extras_require[extra_name].append(f"{dependency}; {residual_condition}")
                 else:
                     extras_require[extra_name].append(dependency)
             else:
-                # 非 extra 的环境标记（如 platform_machine、python_version 等），
-                # 原样保留条件，交由 pip 在安装时根据当前环境求值。
+                # Non-extra environment markers (such as platform_machine, python_version, etc.):
+                # keep the condition as-is so pip evaluates it against the current environment at install time.
                 condition = line.split(';', 1)[1].strip()
                 install_requires.append(f"{dependency}; {condition}")
         return install_requires, extras_require
@@ -643,12 +681,12 @@ def parse_requires_dist(metadata_content):
 
 class DisableInstallCommand(_install):
     """
-    自定义的 install 命令类，用于禁用从 PyPI 源的直接安装。
+    Custom install command class that disables direct installation from this PyPI source.
 
-    该类继承自 setuptools 的 install 命令，重写了 run 方法。
-    当用户尝试通过 pip install 直接安装此包时，会触发该命令，
-    输出提示信息并退出。这种设计是为了防止用户从 PyPI 安装不兼容的预编译包，
-    确保用户使用正确的安装方式。
+    This class inherits from setuptools' install command and overrides the run method.
+    When a user tries to install the package directly via pip install, this command is
+    triggered, prints a message and exits. The design prevents installing an incompatible
+    prebuilt package from PyPI and ensures the user takes the correct installation path.
     """
     def run(self):
         print("Custom installation from this pypi source is disabled.")
@@ -658,10 +696,11 @@ class DisableInstallCommand(_install):
 
 class CloneInstallCommand(_install):
     """
-    自定义的 install 命令类，用于禁用克隆安装方式。
+    Custom install command class that disables the clone-based installation.
 
-    该类继承自 setuptools 的 install 命令，重写了 run 方法。
-    当前实现直接退出，表示克隆安装功能已被禁用。
+    This class inherits from setuptools' install command and overrides the run method.
+    The current implementation exits directly, meaning the clone-based installation
+    has been disabled.
     """
     def run(self):
         print("Clone from github is disabled.")
@@ -670,22 +709,25 @@ class CloneInstallCommand(_install):
 
 class CachedWheelsCommand(_bdist_wheel):
     """
-    自定义的 bdist_wheel 命令类，用于使用预编译的 wheel 包。
+    Custom bdist_wheel command class that uses a prebuilt wheel package.
 
-    该类继承自 wheel 的 bdist_wheel 命令，重写了 run 方法。
-    当 pip 无法找到现有的 wheel 包时，会触发该命令。
-    本实现不执行实际的编译构建流程，而是将预先下载的 wheel 包重命名为 pip 期望的文件名，从而绕过构建过程。
+    This class inherits from wheel's bdist_wheel command and overrides the run method.
+    The command is triggered when pip cannot find an existing wheel package. Instead of
+    running the actual compilation, this implementation renames the pre-downloaded wheel
+    to the file name pip expects, thereby bypassing the build process.
 
-    实现使用预编译的二进制包，避免在用户机器上进行耗时的编译，同时确保包与当前环境完全兼容。
+    Using the prebuilt binary avoids time-consuming compilation on the user's machine
+    while ensuring the package is fully compatible with the current environment.
     """
     def run(self):
         """
-        执行 wheel 构建命令时被调用。
+        Called when the wheel build command runs.
 
-        将全局变量 g_wheel_result 中存储的预下载 wheel 包重命名为 pip 期望的标准文件名，并保存到 dist 目录。
+        Renames the pre-downloaded wheel stored in the global variable g_wheel_result
+        to the standard file name pip expects and saves it into the dist directory.
 
         Raises:
-            SystemExit: 当重命名操作失败时，程序退出。
+            SystemExit: The program exits when the rename operation fails.
         """
         try:
             # Make the archive

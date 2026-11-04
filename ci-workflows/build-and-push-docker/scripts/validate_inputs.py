@@ -1,4 +1,4 @@
-"""Validate release Docker build inputs and metadata, with the target repository fixed to docker_release."""
+"""Validate Docker build inputs and metadata, selecting the image repository based on the release type."""
 
 from datetime import datetime, timezone
 import json
@@ -11,6 +11,7 @@ import sys
 
 REGISTRY = "download.t-head.cn"
 REPOSITORY = "docker_release"
+RELEASE_REPOSITORIES = {"release": REPOSITORY, "tmp": "docker_tmp"}
 NAME_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 NAME_PATTERN = rf"{NAME_COMPONENT}(?:/{NAME_COMPONENT})*"
 TAG_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
@@ -39,7 +40,19 @@ def release_metadata(inputs):
     return metadata
 
 
-def image_reference(name, tag):
+def github_image_prefix(github_repository):
+    if not isinstance(github_repository, str) or not re.fullmatch(
+        rf"[a-z0-9][a-z0-9-]*/{NAME_COMPONENT}", github_repository.lower(),
+    ):
+        raise ValueError("GITHUB_REPOSITORY must be owner/repo and usable as a lowercase Docker image path")
+    return f"ghcr.io/{github_repository.lower()}/"
+
+
+def image_reference(name, tag, repository=REPOSITORY, *, github_repository=None):
+    if repository not in RELEASE_REPOSITORIES.values():
+        raise ValueError("repository must be docker_release or docker_tmp")
+    prefix = (f"{REGISTRY}/{repository}/" if github_repository is None
+              else github_image_prefix(github_repository))
     if not re.fullmatch(NAME_PATTERN, name):
         raise ValueError("docker_name must be a valid lowercase image name, optionally namespaced, without a tag or special characters")
     if name.startswith(("docker_release/", "docker_tmp/")) or (
@@ -48,17 +61,17 @@ def image_reference(name, tag):
         raise ValueError("docker_name must not include a registry or docker_release/docker_tmp prefix")
     if not re.fullmatch(TAG_PATTERN, tag):
         raise ValueError("docker_tag must be a single valid tag of up to 128 characters; paths, colons, and + are not supported")
-    repository = f"{REGISTRY}/{REPOSITORY}/{name}"
+    repository = f"{prefix}{name}"
     if len(repository) > 255:
-        raise ValueError("The image name, including the registry and docker_release prefix, must not exceed 255 characters")
+        raise ValueError("The image name, including the registry and repository prefix, must not exceed 255 characters")
     return f"{repository}:{tag}"
 
 
-def versioned_image_reference(name, revision, tag):
-    image_reference(name, tag)
+def versioned_image_reference(name, revision, tag, repository=REPOSITORY, *, github_repository=None):
+    image_reference(name, tag, repository, github_repository=github_repository)
     if not re.fullmatch(NAME_COMPONENT, revision):
         raise ValueError("Git tag or commit must be a valid lowercase Docker name suffix; uppercase letters, paths, and + are not supported")
-    return image_reference(f"{name}-{revision}", tag)
+    return image_reference(f"{name}-{revision}", tag, repository, github_repository=github_repository)
 
 
 def source_revision(source):
@@ -114,19 +127,36 @@ def validate_build_args(value):
         keys.add(key)
 
 
-def validate_inputs(inputs, source):
+def validate_inputs(inputs, source, github_repository=""):
     release_metadata(inputs)
+    push_target = string_input(inputs, "push_target", "github")
+    if push_target not in ("github", "t-head", "github/t-head"):
+        raise ValueError("push_target must be one of: github, t-head, github/t-head (case-sensitive)")
+    release_type = string_input(inputs, "release_type", "tmp")
+    if release_type not in RELEASE_REPOSITORIES:
+        raise ValueError("release_type must be one of: release, tmp (case-sensitive)")
+    if type(inputs.get("publish_data", False)) is not bool:
+        raise ValueError("publish_data must be a boolean (true or false)")
     source = source.resolve(strict=True)
     if not source.is_dir():
         raise ValueError("SOURCE_DIR must be the caller source directory")
     tag = string_input(inputs, "docker_tag", "") or datetime.now(timezone.utc).date().isoformat()
     revision = source_revision(source)
-    image = versioned_image_reference(string_input(inputs, "docker_name"), revision, tag)
+    name = string_input(inputs, "docker_name")
+    github_image = t_head_image = ""
+    if push_target != "t-head":
+        github_image_prefix(github_repository)
+        github_image = versioned_image_reference(name, revision, tag, github_repository=github_repository)
+    if push_target != "github":
+        t_head_image = versioned_image_reference(name, revision, tag, RELEASE_REPOSITORIES[release_type])
     context = local_path(source, string_input(inputs, "build_context", "."), "build_context", directory=True)
     dockerfile = local_path(source, string_input(inputs, "dockerfile"), "dockerfile", directory=False)
     validate_build_args(string_input(inputs, "build_args", ""))
     # Resolve the Dockerfile relative to the caller repository root; it may be outside the build context.
-    return {"image": image, "build_context": context, "dockerfile": dockerfile,
+    return {"image": t_head_image or github_image,
+            "images": ",".join(image for image in (github_image, t_head_image) if image),
+            "github_image": github_image, "t_head_image": t_head_image,
+            "build_context": context, "dockerfile": dockerfile,
             "source_revision": revision, "docker_tag": tag}
 
 
@@ -135,7 +165,10 @@ def main():
         source_dir = os.environ.get("SOURCE_DIR", "")
         if not source_dir:
             raise ValueError("SOURCE_DIR must not be empty")
-        outputs = validate_inputs(json.loads(os.environ.get("INPUTS_JSON", "{}")), Path(source_dir))
+        outputs = validate_inputs(
+            json.loads(os.environ.get("INPUTS_JSON", "{}")), Path(source_dir),
+            os.environ.get("GITHUB_REPOSITORY", ""),
+        )
         output_path = os.environ.get("GITHUB_OUTPUT", "")
         if not output_path:
             raise ValueError("GITHUB_OUTPUT must not be empty")

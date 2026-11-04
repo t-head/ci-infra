@@ -1,11 +1,26 @@
-name: Reusable Build And Push Release Docker
+name: Reusable Build And Push Docker
 
 # Build only trusted caller code; Dockerfile RUN instructions execute code.
-# The Artifactory repository is /artifactory/docker_release/; Docker clients use the address below.
-# The image address is fixed to download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>.
+# push_target defaults to github; the GHCR address uses the lowercased owner/repo namespace of the caller repository.
+# When the target contains t-head, release_type selects docker_release or docker_tmp, defaulting to docker_tmp.
 on:
   workflow_call:
     inputs:
+      release_type:
+        description: 'Release type: only release or tmp, selecting docker_release or docker_tmp respectively'
+        required: false
+        type: string
+        default: tmp
+      publish_data:
+        description: 'Publish release metadata only when true, the target includes t-head, and release_type is release'
+        required: false
+        type: boolean
+        default: false
+      push_target:
+        description: 'Image push target: only github, t-head, or github/t-head; github uses the caller repository GHCR namespace'
+        required: false
+        type: string
+        default: github
       dockerfile:
         description: 'Dockerfile path relative to the caller repository root, such as docker/Dockerfile'
         required: true
@@ -64,8 +79,14 @@ on:
         type: string
     outputs:
       image:
-        description: 'Full image address in the format download.t-head.cn/docker_release/<docker_name>-<git_tag_or_commit>:<docker_tag>'
+        description: 'Primary image address: the T-Head address when the target includes t-head, otherwise the GHCR address'
         value: ${{ jobs.build-and-push.outputs.image }}
+      github_image:
+        description: 'GHCR image address; empty when github is not selected'
+        value: ${{ jobs.build-and-push.outputs.github_image }}
+      t_head_image:
+        description: 'T-Head image address; empty when t-head is not selected'
+        value: ${{ jobs.build-and-push.outputs.t_head_image }}
       digest:
         description: 'Digest of the pushed image or image index, such as sha256:...'
         value: ${{ jobs.build-and-push.outputs.digest }}
@@ -77,25 +98,28 @@ on:
         description: 'Read-only token for checking out a private template repository; usually unnecessary for same-repository calls or public templates'
         required: false
       release_username:
-        description: 'Image registry publishing username from a caller repository or organization Actions Secret'
-        required: true
+        description: 'T-Head image registry username; required only when the push target includes t-head'
+        required: false
       release_token:
-        description: 'Image registry publishing token from a caller repository or organization Actions Secret'
-        required: true
+        description: 'T-Head image registry token; required only when the push target includes t-head'
+        required: false
       data_token:
-        description: 'Release data API client RSA private key, encoded as Base64 unencrypted DER (PKCS8)'
-        required: true
+        description: 'Data API Base64-encoded DER (PKCS8) RSA private key; required only when the target includes t-head, release_type=release, and publish_data=true'
+        required: false
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build-and-push:
-    name: Build and push release Docker image
+    name: Build and push Docker image
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
       image: ${{ steps.validate.outputs.image }}
+      github_image: ${{ steps.validate.outputs.github_image }}
+      t_head_image: ${{ steps.validate.outputs.t_head_image }}
       digest: ${{ steps.build.outputs.digest }}
       size: ${{ steps.inspect.outputs.size }}
     steps:
@@ -131,26 +155,49 @@ jobs:
         run: python ci-template/ci-workflows/build-and-push-docker/scripts/validate_inputs.py
 
       - name: Validate publishing credentials
+        if: ${{ inputs.push_target != 'github' }}
         shell: bash
         env:
           RELEASE_USERNAME: ${{ secrets.release_username }}
           RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_USERNAME//[[:space:]]/}" || -z "${RELEASE_TOKEN//[[:space:]]/}" ]]; then
+            printf '%s\n' '::error::Publishing username and registry token must not be empty' >&2
+            exit 1
+          fi
+
+      - name: Validate release data credentials
+        if: ${{ inputs.push_target != 'github' && inputs.release_type == 'release' && inputs.publish_data }}
+        shell: bash
+        env:
           CLIENT_PRIVATE_KEY_B64: ${{ secrets.data_token }}
         run: |
           set -euo pipefail
-          if [[ -z "${RELEASE_USERNAME//[[:space:]]/}" || -z "${RELEASE_TOKEN//[[:space:]]/}" || -z "${CLIENT_PRIVATE_KEY_B64//[[:space:]]/}" ]]; then
-            printf '%s\n' '::error::Publishing username, registry token, and release data private key must not be empty' >&2
+          if [[ -z "${CLIENT_PRIVATE_KEY_B64//[[:space:]]/}" ]]; then
+            printf '%s\n' '::error::Release data private key must not be empty when publishing release data' >&2
             exit 1
           fi
 
       - name: Install release data dependencies
+        if: ${{ inputs.push_target != 'github' && inputs.release_type == 'release' && inputs.publish_data }}
         shell: bash
         run: python -m pip install --no-input requests cryptography
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Log in to GitHub Container Registry
+        if: ${{ inputs.push_target != 't-head' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          logout: true
+
       - name: Log in to release image registry
+        if: ${{ inputs.push_target != 'github' }}
         uses: docker/login-action@v3
         with:
           registry: download.t-head.cn
@@ -165,7 +212,9 @@ jobs:
           context: ${{ steps.validate.outputs.build_context }}
           file: ${{ steps.validate.outputs.dockerfile }}
           build-args: ${{ inputs.build_args }}
-          tags: ${{ steps.validate.outputs.image }}
+          tags: ${{ steps.validate.outputs.images }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           platforms: linux/amd64
           push: true
 
@@ -180,15 +229,16 @@ jobs:
       - name: Print image address, digest and size
         shell: bash
         env:
-          IMAGE: ${{ steps.validate.outputs.image }}
+          IMAGES: ${{ steps.validate.outputs.images }}
           DIGEST: ${{ steps.build.outputs.digest }}
           SIZE: ${{ steps.inspect.outputs.size }}
         run: |
           set -euo pipefail
-          printf 'Pushed image: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGE" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Pushed images: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGES" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Assemble and publish metadata only after the build, push, and image size inspection succeed.
       - name: Publish Docker release data
+        if: ${{ inputs.push_target != 'github' && inputs.release_type == 'release' && inputs.publish_data }}
         shell: bash
         env:
           INPUTS_JSON: ${{ toJSON(inputs) }}

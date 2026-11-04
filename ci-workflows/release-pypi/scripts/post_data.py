@@ -32,7 +32,7 @@ class OpenApiConfig:
 
     @classmethod
     def from_env(cls):
-        """公共配置使用脚本常量，仅客户端私钥从环境变量读取。"""
+        """Public configuration uses script constants; only the client private key is read from the environment."""
         return cls(
             base_url=OPEN_API_BASE_URL,
             client_id=OPEN_API_CLIENT_ID,
@@ -51,9 +51,9 @@ class OpenApiConfig:
                 not isinstance(value, str) or not value or value != value.strip()
                 or any(character.isspace() for character in value) or value.startswith("<")
             ):
-                raise ValueError(f"{name} 不能为空、包含空白或使用占位值")
+                raise ValueError(f"{name} must not be empty, contain whitespace, or use a placeholder value")
         if not self.client_id.isascii():
-            raise ValueError("OPEN_API_CLIENT_ID 必须使用 ASCII 字符")
+            raise ValueError("OPEN_API_CLIENT_ID must use ASCII characters")
         try:
             parts = urlsplit(self.base_url)
             valid_url = (
@@ -65,7 +65,7 @@ class OpenApiConfig:
         except ValueError:
             valid_url = False
         if not valid_url:
-            raise ValueError("OPEN_API_BASE_URL 必须是仅含协议、主机及可选端口的 HTTP(S) 地址")
+            raise ValueError("OPEN_API_BASE_URL must be an HTTP(S) address with only scheme, host and optional port")
 
 
 class OpenApiClient:
@@ -82,11 +82,11 @@ class OpenApiClient:
                 password=None,
             )
         except (ValueError, TypeError, UnsupportedAlgorithm):
-            raise ValueError("密钥加载失败，请提供 Base64 编码的 DER 公钥和未加密的 DER 私钥") from None
+            raise ValueError("failed to load keys; provide Base64-encoded DER public key and unencrypted DER private key") from None
         if not isinstance(self._server_pub_key, rsa.RSAPublicKey) or not isinstance(
             self._client_priv_key, rsa.RSAPrivateKey
         ):
-            raise ValueError("服务端公钥和客户端私钥必须是 RSA 密钥")
+            raise ValueError("server public key and client private key must be RSA keys")
 
     def _build_url(self, path: str) -> str:
         return self.config.base_url.rstrip("/") + path
@@ -126,7 +126,7 @@ class OpenApiClient:
         return base64.b64encode(signature).decode("utf-8")
 
     def save_artifact(self, business_data: dict[str, Any]) -> requests.Response:
-        """加密业务数据，并对实际发送的请求体签名；失败时不自动重试。"""
+        """Encrypt the business data and sign the request body actually sent; no automatic retry on failure."""
         plain_bytes = json.dumps(
             business_data, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -149,13 +149,13 @@ class OpenApiClient:
                 data=body_bytes,
                 headers=headers,
                 timeout=self.config.timeout,
-                # 签名绑定 POST 和固定路径，禁止重定向改变请求或转发签名头。
+                # The signature binds POST and the fixed path; forbid redirects from altering the request or forwarding signature headers.
                 allow_redirects=False,
             )
         except requests.RequestException as error:
-            # 请求异常可能包含认证信息，仅保留异常类型。
-            raise ValueError(f"发布数据请求失败：{type(error).__name__}") from None
-        print(f"发布数据接口响应：HTTP {response.status_code}", flush=True)
+            # Request exceptions may contain credentials; keep only the exception type.
+            raise ValueError(f"release data request failed: {type(error).__name__}") from None
+        print(f"Release data API response: HTTP {response.status_code}", flush=True)
         check_response(response)
         return response
 
@@ -185,26 +185,26 @@ def normalize_target(target):
     if not isinstance(target, str) or not re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", target
     ):
-        raise ValueError("package_name 必须是合法的 Python 包名")
+        raise ValueError("package_name must be a valid Python package name")
     return target.replace("-", "_")
 
 
 def check_response(response):
-    # requests 的 raise_for_status 不拒绝 3xx；这里也阻止重定向被当作成功。
+    # requests' raise_for_status does not reject 3xx; also block redirects from being treated as success here.
     if not 200 <= response.status_code < 300:
-        raise ValueError(f"发布数据接口请求失败，HTTP {response.status_code}")
+        raise ValueError(f"release data API request failed, HTTP {response.status_code}")
     content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
     if content_type in {"text/html", "application/xhtml+xml"}:
-        raise ValueError("接口返回 HTML，可能进入登录页面，不能确认发布成功")
+        raise ValueError("the API returned HTML, possibly a login page, cannot confirm release success")
 
 
 def build_payload(record, target):
-    """按接口字段组装数据；保留原始矩阵值，未提供的字符串字段保持为空。"""
+    """Assemble data per API fields; keep raw matrix values; string fields not provided stay empty."""
     if not isinstance(record, dict):
-        raise ValueError("发布数据 JSON 必须是对象")
+        raise ValueError("release data JSON must be an object")
     payload = PypiData().to_dict()
     if record["artifactName"] != target or record["item"] != target:
-        raise ValueError("发布数据包名与 package_name 不一致")
+        raise ValueError("release data package name does not match package_name")
 
     record_package_name = record["artifactName"]
     record_sdk_version = record["sdkVersion"]
@@ -221,7 +221,7 @@ def build_payload(record, target):
     payload["businessType"] = "PYPI"
     payload["sdkVersion"] = record_sdk_version.lower().replace("v", "").replace("sail", "").replace("sail", "")
 
-    # 处理 osTypeList
+    # Process osTypeList
     _record_os = record_os_type_list.lower().replace(".", "")
     record_os = ""
     if "ubuntu24" in _record_os:
@@ -233,10 +233,10 @@ def build_payload(record, target):
     elif "alios7u2" in _record_os:
         record_os = "alios7u2"
     else:
-        raise ValueError("osTypeList 不在支持的列表中")
+        raise ValueError("osTypeList is not in the supported list")
     payload["osTypeList"] = [record_os]
 
-    # 使用tag获取 version 和 sub_version
+    # Derive version and sub_version from the tag
     tag_list = record_tag.split("+")
     version = ""
     sub_version = ""
@@ -248,31 +248,31 @@ def build_payload(record, target):
     payload["subVersion"] = sub_version
     payload["artifactVersion"] = version
 
-    # 处理 hggcrtVersion
+    # Process hggcrtVersion
     hggcrt_version = record_runtime_version.lower().replace("hggcrt", "").replace("hggc", "")
     payload["hggcrtVersion"] = f"hggcrt{hggcrt_version}"
 
-    # 处理 framework
+    # Process framework
     framework_version = record_framework.lower().replace("torch", "")
     if framework_version:
         payload["framework"] = f"torch{framework_version}"
     else:
         payload["framework"] = ""
 
-    # 处理 python版本
+    # Process python version
     _python_version = record_python.lower().replace("python", "").replace("py", "").replace("cp", "").replace(".", "")
     python_version_list = _python_version.split("3", 1)
     python_version = f"3.{python_version_list[1]}"
     payload["python"] = python_version
 
-    # 处理 cmdLine 和 specificLine
+    # Process cmdLine and specificLine
     payload["cmdLine"] = f"pip install {payload["item"]}=={payload["artifactVersion"]} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
     if payload["subVersion"]:
         payload["specificLine"] = f"pip install {payload['item']}=={payload['artifactVersion']}+v{payload['subVersion']}.sail{payload['sdkVersion']} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
     else:
         payload["specificLine"] = f"pip install {payload['item']}=={payload['artifactVersion']}+sail{payload['sdkVersion']} -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"
 
-    # 处理 idempotentKey
+    # Process idempotentKey
     pypi_key = f"{payload['item']}-{payload['artifactVersion']}-{payload['hggcrtVersion']}-{payload['python']}-{record_os}-{payload['framework']}-{payload['sdkVersion']}-{payload['subVersion']}-{payload['artifactType']}"
     payload['idempotentKey'] = hashlib.md5(pypi_key.encode('utf-8')).hexdigest()
 
@@ -281,34 +281,34 @@ def build_payload(record, target):
 
 def read_payload(path, target):
     if not path.is_file() or path.is_symlink():
-        raise ValueError("发布数据必须是普通 JSON 文件，不能是符号链接")
+        raise ValueError("release data must be a regular JSON file, not a symlink")
     return build_payload(json.loads(path.read_text(encoding="utf-8")), target)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="逐个推送成功矩阵任务的发布数据")
-    parser.add_argument("--input-dir", type=Path, required=True, help="发布 JSON 文件所在目录")
+    parser = argparse.ArgumentParser(description="Push release data of successful matrix jobs one by one")
+    parser.add_argument("--input-dir", type=Path, required=True, help="directory containing release JSON files")
     args = parser.parse_args(argv)
     target = normalize_target(os.environ.get("PACKAGE_NAME", ""))
     client = OpenApiClient(OpenApiConfig.from_env())
     if not args.input_dir.is_dir() or args.input_dir.is_symlink():
-        raise ValueError("发布数据目录不存在或不是普通目录")
+        raise ValueError("release data directory does not exist or is not a regular directory")
     files = sorted(args.input_dir.glob("*.json"))
     if not files:
-        raise ValueError("未找到待推送的发布数据 JSON")
-    # 全部文件先校验，再按文件逐条发送，避免坏文件导致本可避免的部分推送。
+        raise ValueError("no release data JSON files found to push")
+    # Validate all files first, then send one by one so a bad file does not cause an avoidable partial push.
     records = [(path, read_payload(path, target)) for path in files]
     for path, payload in records:
         client.save_artifact(payload)
         print("------------------------")
-        print(f"已推送发布数据：{json.dumps(path.name, ensure_ascii=True)}", flush=True)
+        print(f"Pushed release data: {json.dumps(path.name, ensure_ascii=True)}", flush=True)
         print(payload)
     print("------------------------")
-    print(f"共推送 {len(records)} 条发布数据", flush=True)
+    print(f"Pushed {len(records)} release data records in total", flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except (ValueError, OSError) as error:
-        raise SystemExit(f"::error::推送发布数据失败：{error}") from None
+        raise SystemExit(f"::error::failed to push release data: {error}") from None
