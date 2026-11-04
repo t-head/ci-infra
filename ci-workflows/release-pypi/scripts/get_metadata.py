@@ -137,7 +137,7 @@ def parse_version_safe(v):
         return Version("0.0.0")
 
 def extract_number(s, prefix=""):
-    """从类似 'cp310', 'cu126' 中提取数字"""
+    """Extract digits from strings like 'cp310', 'cu126'"""
     if not s:
         return 0
     try:
@@ -149,24 +149,24 @@ def extract_number(s, prefix=""):
 
 def sort_key(item):
     """
-    排序键函数：返回一个 tuple, Python 会按元组的第一元素、第二元素...依次比较
+    Sort key function: return a tuple; Python compares tuples element by element, first, second, ...
     """
     return (
-        # 1. 主版本号（语义化版本比较）
+        # 1. Major version (semantic version comparison)
         parse_version_safe(item.get("version")),
-        # 2. 子版本号
+        # 2. Sub version
         parse_version_safe(item.get("sub_version")),
-        # 3. Python 版本（cp310 -> 310，数字比较）
+        # 3. Python version (cp310 -> 310, numeric comparison)
         extract_number(item.get("python"), "cp"),
-        # 4. HGGCRT 版本（hggcrt3 -> 3）
+        # 4. HGGCRT version (hggcrt3 -> 3)
         extract_number(item.get("hggcrt"), "hggcrt"),
-        # 5. 操作系统字符串
+        # 5. Operating system string
         item.get("os", ""),
-        # 6. 版本类型（ce/oe 等）
+        # 6. Edition type (ce/oe etc.)
         item.get("edition", ""),
-        # 7. Torch 版本（如果有）
+        # 7. Torch version (if any)
         parse_version_safe(item.get("torch")),
-        # 8. SDK 版本（取第一个 key 的版本号，如果为空则为 0）
+        # 8. SDK version (version of the first key, 0 when empty)
         parse_version_safe(list(item.get("sdk", {}).keys())[0] if item.get("sdk") else "0.0.0")
     )
 
@@ -206,8 +206,8 @@ def get_target_json_data(target, data):
     return res
 
 def normalize_sdk_value(value):
-    """归一化 sdk 版本对应的值为 {"supported": [], "unsupported": []} 格式。
-    兼容旧格式: list 视为 supported 列表; dict 补齐缺失的 key。"""
+    """Normalize sdk version values into the {"supported": [], "unsupported": []} shape.
+    Compatible with the old shape: a list is treated as the supported list; a dict gets missing keys filled in."""
     if isinstance(value, dict):
         return {
             "supported": value.get("supported", []),
@@ -218,8 +218,8 @@ def normalize_sdk_value(value):
     return {"supported": [], "unsupported": []}
 
 def merge_sdk_data(old_data, new_data):
-    """用旧数据中已有的 sdk supported/unsupported 值回填新数据,
-    避免覆盖仓库中已定义或手动维护过的值。"""
+    """Backfill new data with sdk supported/unsupported values already present in old data,
+    avoiding overwriting values defined in the repository or maintained manually."""
     key_fields = ["version", "sub_version", "torch", "os", "hggcrt", "python", "edition"]
     old_releases = {}
     for item in old_data.get("release", []):
@@ -275,7 +275,7 @@ def normalize_target(target):
     if not isinstance(target, str) or not re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", target
     ):
-        raise ValueError("package_name 必须是合法的 Python 包名")
+        raise ValueError("package_name must be a valid Python package name")
     return target.replace("-", "_")
 
 
@@ -284,9 +284,9 @@ def index_url(target):
 
 
 def check_response(response):
-    # requests 的 raise_for_status 不拒绝 3xx；这里也阻止重定向被当作成功。
+    # requests' raise_for_status does not reject 3xx; also block redirects from being treated as success here.
     if not 200 <= response.status_code < 300:
-        raise requests.HTTPError(f"Artifactory 请求失败，HTTP {response.status_code}")
+        raise requests.HTTPError(f"Artifactory request failed, HTTP {response.status_code}")
 
 
 def get_latest_whl_info(target, username, password):
@@ -306,15 +306,15 @@ def get_latest_whl_info(target, username, password):
     check_response(resp)
     data = resp.json()
     if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-        raise ValueError("Artifactory AQL 响应缺少 results 数组")
+        raise ValueError("Artifactory AQL response is missing the results array")
     result_range = data.get("range", {})
     if result_range.get("total", len(data["results"])) > len(data["results"]):
-        raise ValueError("Artifactory AQL 结果不完整，拒绝覆盖索引")
+        raise ValueError("Artifactory AQL results are incomplete, refusing to overwrite the index")
     return data
 
 
 def get_old_index_json(target, username, password):
-    """保留已有 SDK 配置；仅 404 视为索引不存在，其他异常阻断更新。"""
+    """Keep existing SDK configuration; only 404 counts as a missing index, other errors block the update."""
     target = normalize_target(target)
     resp = requests.get(
         index_url(target), auth=(username, password),
@@ -326,14 +326,14 @@ def get_old_index_json(target, username, password):
     data = resp.json()
     if (not isinstance(data, dict) or not isinstance(data.get("release"), list)
             or data.get("name", target) != target):
-        raise ValueError("远端 index.json 格式或包名不正确，拒绝覆盖")
+        raise ValueError("remote index.json format or package name is incorrect, refusing to overwrite")
     return data
 
 
 def get_index_json(target, username, password):
     target = normalize_target(target)
     if not username or not password:
-        raise ValueError("Artifactory 用户名和密码不能为空")
+        raise ValueError("Artifactory username and password must not be empty")
     raw_data = get_latest_whl_info(target, username, password)
     artifacts = get_artifacts_info(raw_data)
     data = get_target_data(target=target, items=artifacts)
@@ -349,7 +349,7 @@ def main():
     password = os.environ.get("RELEASE_TOKEN", "")
     data = get_index_json(target, username, password)
     if not data["release"] or not any(item.get("sdk") for item in data["release"]):
-        raise ValueError("未找到有效 wheel 元数据，拒绝上传空索引")
+        raise ValueError("no valid wheel metadata found, refusing to upload an empty index")
     output = Path("index.json")
     output.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     url = index_url(target)
@@ -360,11 +360,11 @@ def main():
             timeout=REQUEST_TIMEOUT, allow_redirects=False,
         )
     check_response(resp)
-    print(f"已生成 index.json 并上传：{url}")
+    print(f"index.json generated and uploaded: {url}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except (requests.RequestException, ValueError, OSError) as error:
-        raise SystemExit(f"::error::更新元数据失败：{error}") from None
+        raise SystemExit(f"::error::failed to update metadata: {error}") from None

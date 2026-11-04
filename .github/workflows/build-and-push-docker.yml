@@ -1,8 +1,8 @@
 name: Reusable Build And Push Docker
 
 # Build only trusted caller code; Dockerfile RUN instructions execute code.
-# push_target 默认为 github；GHCR 地址使用调用方仓库的小写 owner/repo 命名空间。
-# 目标包含 t-head 时，release_type 选择 docker_release 或 docker_tmp，默认为 docker_tmp。
+# push_target defaults to github; the GHCR address uses the lowercased owner/repo namespace of the caller repository.
+# When the target contains t-head, release_type selects docker_release or docker_tmp, defaulting to docker_tmp.
 on:
   workflow_call:
     inputs:

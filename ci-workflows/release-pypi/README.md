@@ -1,4 +1,4 @@
-# release-pypi（ci-infra）
+# release-pypi (ci-infra)
 
 A Python package build and release tool for SAIL environments. It uses a GitHub Actions reusable workflow to generate a build matrix across Python, operating system, HGGCRT Runtime, PyTorch, and SDK versions, then publishes wheels, bootstrap source distributions, and associated metadata.
 
@@ -6,7 +6,7 @@ This repository provides a **reusable workflow**, referenced through `jobs.<job_
 
 ## Release Pipeline
 
-入口：[`.github/workflows/matrix-release.yml`](../../.github/workflows/matrix-release.yml)。工具和测试位于 `ci-workflows/release-pypi/`，工作流入口必须保留在仓库根目录的 `.github/workflows/`。
+Entry point: [`.github/workflows/matrix-release.yml`](../../.github/workflows/matrix-release.yml). Tools and tests are located in `ci-workflows/release-pypi/`; the workflow entry point must remain in the repository root `.github/workflows/`.
 
 ```text
 Validate the package name, release version, and image mappings
@@ -17,9 +17,9 @@ Validate the package name, release version, and image mappings
   → Submit release data for the current run
 ```
 
-非发布路径（`should_release=false`）：跳过源码包构建，仅执行矩阵编译 → 收集 wheel → 保存原始 wheel artifact，然后结束。
+Non-release path (`should_release=false`): skip sdist build, execute only matrix build → collect wheels → save original wheel artifacts, then finish.
 
-- `prepare-matrix`：规范化包名、校验版本和镜像映射；矩阵上限为 GitHub Actions 的 256 个任务。
+- `prepare-matrix`: Normalize the package name, validate versions and image mappings; the matrix limit is GitHub Actions' 256 jobs.
 - `build-sdist`: Generates `.tar.gz` files using this repository's `setup.py` template. These bootstrap packages match and download prebuilt wheels; they are **not archives of the caller's complete source code**.
 - `matrix-job`: Builds the caller's repository in the specified image, updates the wheel version with `revpkg`, and uploads it to Artifactory.
 - `publish-sdist`: Checks success markers for the current `run_id` / `run_attempt` and publishes all built source distribution versions through Twine only after at least one matrix job succeeds.
@@ -43,14 +43,14 @@ The caller's repository requires:
 | --- | --- | --- |
 | `release_username` | Yes | Artifactory publishing username |
 | `release_token` | Yes | Artifactory publishing credential |
-| `data_token` | Yes | 客户端 RSA 私钥，Base64 编码的未加密 DER 格式（PKCS8）|
+| `data_token` | Yes | Client RSA private key, Base64-encoded unencrypted DER format (PKCS8) |
 | `template_token` | No | Read-only token for checking out a private template repository; defaults to `github.token` when omitted |
 
-下方示例将调用方的大写 Secrets 映射到对应的工作流参数。不要将凭据写入 YAML 或构建命令。私有模板仓库还需在 Actions 设置中允许跨仓库调用。
+The example below maps the caller's uppercase Secrets to the corresponding workflow parameters. Do not embed credentials in YAML or build commands. Private template repositories also require cross-repository invocation to be allowed in Actions settings.
 
-发布数据使用 `/open/artifact/saveSingle`，通过 AES-256-GCM 加密业务数据、RSA-OAEP-SHA256 加密 AES 密钥，并使用 RSA-SHA256 签名。工作流保留 `data_token` Secret 名称，其值为客户端 RSA 私钥；工作流将其映射到 `CLIENT_PRIVATE_KEY_B64` 环境变量。直接运行脚本时也通过该环境变量传入私钥。
+Release data uses `/open/artifact/saveSingle`, encrypting business data with AES-256-GCM, encrypting the AES key with RSA-OAEP-SHA256, and signing with RSA-SHA256. The workflow retains the `data_token` Secret name whose value is the client RSA private key; the workflow maps it to the `CLIENT_PRIVATE_KEY_B64` environment variable. Running the script directly also passes the private key via this environment variable.
 
-`ci-workflows/release-pypi/scripts/post_data.py` 顶部的 `OPEN_API_BASE_URL`、`OPEN_API_CLIENT_ID` 和 `SERVER_PUBLIC_KEY_B64` 已包含迁入配置；同名环境变量不生效。正式发布前需向服务方确认配置与调用方私钥匹配，并通过 `template_ref` 引用确认后的版本。地址仅含协议、主机及可选端口，生产环境使用 HTTPS；公钥为 Base64 编码的 DER 格式（SubjectPublicKeyInfo）。私钥不得写入脚本。
+`OPEN_API_BASE_URL`, `OPEN_API_CLIENT_ID` and `SERVER_PUBLIC_KEY_B64` at the top of `ci-workflows/release-pypi/scripts/post_data.py` already contain the migrated configuration; environment variables of the same name have no effect. Before the official release, confirm with the service provider that the configuration matches the caller's private key, and reference the confirmed version via `template_ref`. The address contains only the protocol, host and optional port; production uses HTTPS; the public key is in Base64-encoded DER format (SubjectPublicKeyInfo). The private key must never be written into the script.
 
 ### 2. Add a Workflow to the Caller's Repository
 
@@ -102,9 +102,9 @@ jobs:
 
 This example uses the two image combinations currently configured. `pip wheel` is only a generic example; ensure your project's build dependencies are installed, or replace it with your project's own Bash build command.
 
-正式使用前，需先将本工作流合入 `main`，或引用包含它的提交。`uses` 中的 `@main` 与 `template_ref` 应同时替换为同一个完整 commit SHA：前者决定工作流版本，后者决定工具脚本版本。跨仓库调用不得将调用方的 `github.sha` 作为模板版本。
+Before formal use, merge this workflow into `main` or reference the commit containing it. `@main` in `uses` and `template_ref` should both be replaced with the same full commit SHA: the former determines the workflow version, the latter determines the tool script version. Cross-repository invocations must not use the caller's `github.sha` as the template version.
 
-`template_repository` 为可选参数，默认值为 `t-head/ci-infra`，也可像示例一样显式传入。本模块仅提供 `workflow_call` 入口；手动运行需由调用方提供 `workflow_dispatch`。
+`template_repository` is an optional parameter with the default value `t-head/ci-infra`; it can also be passed explicitly as shown in the example. This module only provides the `workflow_call` entry point; manual runs require the caller to provide a `workflow_dispatch`.
 
 ## Inputs
 
@@ -114,12 +114,12 @@ Arrays are passed as **JSON strings**, not YAML arrays. All version arrays must 
 | --- | --- | --- | --- |
 | `package_name` | Yes | None | Python package name; the entry step replaces `-` with `_`, e.g. `demo-package` → `demo_package` |
 | `framework` | Yes | None | Framework module name detected by the installation template, such as `torch`; an explicit empty string is allowed; not included in matrix expansion |
-| `python_versions` | No | `'["312"]'` | 支持 `"38"`、`"310"`、`"312"`，也接受 JSON 整数，如 `[38,310]` |
-| `os_versions` | No | `'["ubuntu2404"]'` | 支持 `ubuntu2004`、`ubuntu2204`、`ubuntu2404`、`alios7u2` |
-| `runtime_versions` | No | `'["3"]'` | 支持 `"2"`、`"3"`，元素必须是字符串 |
-| `torch_versions` | No | `'["2.10.0"]'` | 支持 `"2.10.0"`、`"2.13.0"`；`'[""]'` 表示不包含 Torch 版本 |
-| `sdk_versions` | No | `'["2.2.0"]'` | 支持 `"2.1.0"`、`"2.2.0"` |
-| `template_repository` | No | `t-head/ci-infra` | 保存模板工具脚本的仓库 |
+| `python_versions` | No | `'["312"]'` | Supports `"38"`, `"310"`, `"312"`; also accepts JSON integers such as `[38,310]` |
+| `os_versions` | No | `'["ubuntu2404"]'` | Supports `ubuntu2004`, `ubuntu2204`, `ubuntu2404`, `alios7u2` |
+| `runtime_versions` | No | `'["3"]'` | Supports `"2"`, `"3"`; elements must be strings |
+| `torch_versions` | No | `'["2.10.0"]'` | Supports `"2.10.0"`, `"2.13.0"`; `'[""]'` means no Torch version component |
+| `sdk_versions` | No | `'["2.2.0"]'` | Supports `"2.1.0"`, `"2.2.0"` |
+| `template_repository` | No | `t-head/ci-infra` | Repository containing the template tool scripts |
 | `template_ref` | Yes | None | Template repository version; must match the version referenced in `uses` |
 | `build_command` | Yes | None | Bash command executed at the root of the caller's repository; supports multiple lines; must come from trusted configuration |
 | `tag_version` | No | Empty string | Overrides the release version without changing the checked-out source version |
@@ -128,7 +128,7 @@ An allowed value does not imply that a corresponding image exists. The matrix ex
 
 ### Current Image Configuration
 
-镜像映射维护在 [`prepare_matrix.py`](scripts/prepare_matrix.py) 的 `IMAGES_MAP` 中，目前仅配置了以下组合：
+Image mappings are maintained in `IMAGES_MAP` in [`prepare_matrix.py`](scripts/prepare_matrix.py); currently only the following combinations are configured:
 
 | OS | Python | Runtime | SDK | Torch |
 | --- | --- | --- | --- | --- |
@@ -142,7 +142,7 @@ download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py
 download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 ```
 
-省略版本数组时，默认使用 Python 312 / Ubuntu 2404 / Runtime 3 / Torch 2.10.0 / SDK 2.2.0，对应已有镜像。显式传入空值仍会报错。新增组合需按以下键格式更新 `IMAGES_MAP`：
+When version arrays are omitted, the defaults are Python 312 / Ubuntu 2404 / Runtime 3 / Torch 2.10.0 / SDK 2.2.0, which correspond to a configured image. Explicitly passing empty values still causes an error. Adding new combinations requires updating `IMAGES_MAP` with the following key format:
 
 ```text
 {os_version}-py{python_version}-sdk{sdk_version}-hggcrt{runtime_version}-torch{torch_version}
@@ -158,7 +158,7 @@ The release version is selected in the following order of precedence:
 2. `github.ref_name` for tag-triggered runs.
 3. For other triggers, only tags on the caller's current commit are checked. The first correctly formatted version without `rc` is selected in descending Git version order; historical commits are not searched.
 
-所有版本来源均去除开头的一个 `v` / `V`，保留 `+v0.3.0` 等内部内容。指定版本或触发 tag 含 `rc`（忽略大小写），或当前提交没有合格 tag 时，`should_release=false`：仍校验构建参数和镜像映射，生成矩阵并编译、收集 wheel、保存 Actions artifact；不构建源码包，不执行 Repack、重命名及任何后续发布任务。此时 `RELEASE_VERSION` 和 `WHL_NAME` 为空，wheel 版本与文件名由调用方的构建命令决定。
+All version sources strip a single leading `v` / `V`, preserving internal content such as `+v0.3.0`. When the specified version or triggering tag contains `rc` (case-insensitive), or the current commit has no qualifying tag, `should_release=false`: build parameters and image mappings are still validated, the matrix is generated and wheels are built, collected and saved as Actions artifacts; no sdist is built, no Repack, rename or any subsequent publish job runs. In this case `RELEASE_VERSION` and `WHL_NAME` are empty, and the wheel version and file name are determined by the caller's build command.
 
 `tag_version` only determines the release version, artifact paths, and release data; it does not check out source code from the tag with that name. Manual runs build the triggering revision of the selected branch / ref.
 
@@ -194,32 +194,32 @@ The caller's code is checked out with its full Git history and recursive submodu
 
 These addresses are currently hardcoded in the workflow or scripts, rather than exposed as configurable inputs. Ensure upload paths do not conflict across matrix combinations.
 
-每个矩阵任务在成功收集 wheel 后都会保存原始包到 GitHub Actions artifacts，名称为 `{package_name}-collected-wheels-{run_id}-{run_attempt}-{job-index}`，按包名、运行、重试及矩阵索引隔离。保存发生在 Repack 和重命名之前，保留原始文件名与内容；仅上传 `dist/*.whl`，构建或收集失败时不上传。
+Each matrix job saves the original wheel to GitHub Actions artifacts after successfully collecting it, named `{package_name}-collected-wheels-{run_id}-{run_attempt}-{job-index}`, isolated by package name, run, retry and matrix index. Saving occurs before Repack and rename, preserving original file names and content; only `dist/*.whl` is uploaded; nothing is uploaded when building or collecting fails.
 
-发布流程还会保存源码包、发布数据 JSON 和成功标记。仅在 `should_release=true` 且由 tag 触发或显式指定 `tag_version` 时，额外保存重打包后的 `release-wheels` artifact。非发布构建仅保存上述原始 wheel artifact。
+The release pipeline also saves sdists, release data JSON and success markers. Only when `should_release=true` and triggered by a tag or with an explicit `tag_version`, the repacked `release-wheels` artifact is additionally saved. Non-release builds only save the original wheel artifacts described above.
 
 **The workflow currently does not create GitHub Releases or upload Release attachments.** The "Save GitHub Release wheel artifacts" step actually uses `actions/upload-artifact`.
 
-## 发布边界与重跑限制
+## Release Boundaries and Re-run Limitations
 
-- 源码包 artifact 使用 `{package_name}-sdist-{run_id}-{run_attempt}` 命名，消费方按构建任务输出的 artifact ID 下载，避免完整重跑时的同名冲突。
-- 成功标记和发布记录仍严格限定当前 `run_attempt`。**暂不支持只重跑失败或下游任务**：未重跑矩阵的旧记录不会被复用，可能跳过源码包发布或缺少发布数据。需要完整重跑，并先确认 Artifactory 对已发布版本的重复上传策略；工作流不保证外部发布回滚或幂等。不能通过放宽 artifact 通配符规避此限制，否则可能混入旧失败任务的记录。
-- 保留原有策略：任一矩阵成功即可发布所有源码包版本；只排除包含 `rc` 的版本，不排除所有预发布版本。是否允许部分发布及 `alpha/beta/dev` 版本由调用方确认。
-- 组织门禁未启用；调用方负责可信触发来源、发布审批和同包发布串行化。不要向不可信 PR 的构建代码提供发布凭据。
-- 远端策略脚本会执行代码，当前未启用签名验证；索引更新也没有跨工作流运行的并发保护。服务端 API 的业务成功判定及配置仍需联调确认。
+- The sdist artifact uses `{package_name}-sdist-{run_id}-{run_attempt}` naming; consumers download by the artifact ID output from the build job, avoiding name conflicts on full re-runs.
+- Success markers and release records are still strictly scoped to the current `run_attempt`. **Re-running only failed or downstream jobs is not yet supported**: old records from a matrix that was not re-run will not be reused, potentially skipping sdist publishing or missing release data. A full re-run is required; first confirm Artifactory's duplicate-upload policy for already-published versions. The workflow does not guarantee external publishing rollback or idempotency. This limitation cannot be worked around by loosening artifact wildcards, as that may mix in records from old failed jobs.
+- The original strategy is retained: any single matrix success allows publishing all sdist versions; only versions containing `rc` are excluded, not all pre-release versions. Whether partial publishing and `alpha/beta/dev` versions are allowed is determined by the caller.
+- Organization gating is not enabled; the caller is responsible for trusted trigger sources, publishing approval and serializing releases of the same package. Do not provide publishing credentials to build code from untrusted PRs.
+- The remote strategy script executes code; signature verification is not currently enabled; index updates also lack concurrency protection across workflow runs. Server-side API business success determination and configuration still need integration testing confirmation.
 
 ## Bootstrap Package Behavior
 
-[`setup.py`](scripts/setup.py) 是源码包模板，不是本仓库的安装入口。工作流填入包名、框架及版本，设置 `__FAKE_BUILD=FAKE_WHEEL` 后生成 Bootstrap 源码包，此时不下载 wheel。
+[`setup.py`](scripts/setup.py) is the sdist template, not an install entry point for this repository. The workflow fills in the package name, framework and version, sets `__FAKE_BUILD=FAKE_WHEEL` and then builds the bootstrap sdist; no wheel is downloaded at this point.
 
-安装前需在目标 Python 环境中预装匹配的 SAIL SDK / Torch，以及 `setuptools`、`wheel`、`packaging`；需使用 `--no-build-isolation` 才能探测宿主框架。`--no-cache-dir` 避免复用其他 Torch / Runtime 环境生成的 Bootstrap wheel。示例：
+Before installation, the target Python environment must have a matching SAIL SDK / Torch pre-installed along with `setuptools`, `wheel`, `packaging`; `--no-build-isolation` is required to detect the host framework. `--no-cache-dir` avoids reusing a bootstrap wheel generated for a different Torch / Runtime environment. Example:
 
 ```bash
 python -m pip install setuptools wheel packaging
 python -m pip install demo_package==1.0.0+sail2.2.0 --no-build-isolation --no-cache-dir -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple
 ```
 
-安装模板校验下载包的名称、发布版本与当前平台兼容性，并保留内部 `WHEEL` 声明的标签；不会将二进制包改名为 `py3-none-any`。
+The install template validates the downloaded package's name, release version and compatibility with the current platform, and preserves the tags declared in the internal `WHEEL` metadata; it does not rename the binary wheel to `py3-none-any`.
 
 When a user installs a bootstrap package, the template detects the Python, OS, Runtime, and framework versions. By default, it downloads and executes the remote `strategy_hggc_sail.py` to match a prebuilt wheel, then extracts its dependency information. This process depends on a trusted remote strategy service, an accessible artifact repository, and `wget`; it does not compile the caller's source code on the user's machine.
 
@@ -235,20 +235,20 @@ Relevant environment variables:
 
 ```text
 .github/workflows/
-├── matrix-release.yml           # 可复用发布入口
-└── release-pypi-ci.yml          # 无凭据的离线回归测试
+├── matrix-release.yml           # Reusable release entry point
+└── release-pypi-ci.yml          # Credential-free offline regression tests
 ci-workflows/release-pypi/
 ├── scripts/
-│   ├── prepare_matrix.py        # 版本门禁、矩阵与镜像映射
-│   ├── setup.py                 # Bootstrap 安装模板
-│   ├── get_metadata.py          # Artifactory 索引更新
-│   └── post_data.py             # 发布数据转换、加密与推送
-└── tests/                       # 迁移契约、构建、安装及发布测试
+│   ├── prepare_matrix.py        # Version gating, matrix and image mappings
+│   ├── setup.py                 # Bootstrap install template
+│   ├── get_metadata.py          # Artifactory index update
+│   └── post_data.py             # Release data transformation, encryption and push
+└── tests/                       # Migration contract, build, install and publish tests
 ```
 
 ## Local Testing
 
-推荐使用与工作流工具任务一致的 **Python 3.12**；CI 同时在 Python 3.14 上测试。需要 Git 和 Bash。
+Using **Python 3.12** consistent with the workflow tool jobs is recommended; CI also tests on Python 3.14. Git and Bash are required.
 
 Run the following from the repository root (if `.venv` already exists, check its Python version first):
 

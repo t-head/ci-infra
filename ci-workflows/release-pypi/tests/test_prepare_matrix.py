@@ -1,4 +1,4 @@
-"""矩阵准备脚本的 CPU 单元测试"""
+"""CPU unit tests for the matrix preparation script"""
 
 import importlib.util
 import itertools
@@ -55,7 +55,7 @@ def make_images(pairs):
 
 @pytest.fixture
 def script():
-    # 按文件路径加载，避免导入 deep_gemm 及其硬件依赖。
+    # Load by file path to avoid importing deep_gemm and its hardware dependencies.
     spec = importlib.util.spec_from_file_location("prepare_matrix_under_test", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -65,7 +65,7 @@ def script():
 @pytest.fixture
 def output_file(script, monkeypatch):
     output = mock_open()
-    # 仅替换目标模块的文件接口，避免影响 pytest 自身的文件读取。
+    # Only replace the target module's file interface to avoid affecting pytest's own file reads.
     monkeypatch.setattr(script, "open", output, raising=False)
     return output
 
@@ -100,19 +100,19 @@ def run_matrix(script, output_file, monkeypatch):
 
 def test_fail_formats_github_annotation(script):
     with pytest.raises(SystemExit) as error:
-        script.fail("测试错误")
-    assert str(error.value) == "::error::测试错误"
+        script.fail("test error")
+    assert str(error.value) == "::error::test error"
 
 
 @pytest.mark.parametrize("value", [["38", "310"], {"key": "value"}, None, 3, "text"])
 def test_parse_json_accepts_valid_json(script, value):
-    assert script.parse_json(json.dumps(value), "参数") == value
+    assert script.parse_json(json.dumps(value), "test_param") == value
 
 
 @pytest.mark.parametrize("raw", ["", "[", "[1,]", "not-json", None, []])
 def test_parse_json_rejects_invalid_json(script, raw):
-    with pytest.raises(SystemExit, match="::error::参数 必须是合法 JSON"):
-        script.parse_json(raw, "参数")
+    with pytest.raises(SystemExit, match="::error::test_param must be valid JSON"):
+        script.parse_json(raw, "test_param")
 
 
 def test_torch_url_stub_returns_empty_string(script):
@@ -194,7 +194,7 @@ def test_each_synthetic_image(script, run_matrix, capsys, os_version, python_ver
         "release_version": "1.0.0+v0.3.0.sail2.1.1",
         "whl_name": f"deep_gemm-1.0.0+hggcrt3torch2.10.0{os_version}oe-cp{python_version}-cp{python_version}-linux_x86_64.whl",
     }]
-    assert capsys.readouterr().out == "已生成 1 个矩阵任务\n"
+    assert capsys.readouterr().out == "Generated 1 matrix jobs\n"
 
 
 def test_package_name_changes_wheel_name_without_changing_axes(script, run_matrix):
@@ -221,7 +221,7 @@ def test_package_name_changes_wheel_name_without_changing_axes(script, run_matri
 
 
 def test_full_five_axis_cartesian_product(script, run_matrix, monkeypatch, capsys):
-    # 当前映射没有覆盖所有 Python × OS 组合；本测试补齐虚拟映射以隔离展开逻辑。
+    # The current mapping does not cover all Python x OS combinations; this test adds virtual mappings to isolate expansion logic.
     images = make_images(list(itertools.product(
         ALL_VERSIONS["os_versions"], ALL_VERSIONS["python_versions"]
     )))
@@ -248,7 +248,7 @@ def test_full_five_axis_cartesian_product(script, run_matrix, monkeypatch, capsy
             f"deep_gemm-1.0.0+hggcrt{entry['runtime_version']}torch{entry['torch_version']}"
             f"{entry['os_version']}oe-cp{entry['python_version']}-cp{entry['python_version']}-linux_x86_64.whl"
         )
-    assert capsys.readouterr().out == "已生成 96 个矩阵任务\n"
+    assert capsys.readouterr().out == "Generated 96 matrix jobs\n"
 
 
 def test_normalizes_numeric_python_and_deduplicates_all_axes(run_matrix):
@@ -295,7 +295,7 @@ def test_only_selected_image_mapping_is_required(script, run_matrix, monkeypatch
 
 
 def test_rejects_malformed_outer_json(run_matrix, output_file):
-    with pytest.raises(SystemExit, match="触发参数 必须是合法 JSON"):
+    with pytest.raises(SystemExit, match="trigger inputs must be valid JSON"):
         run_matrix(raw_inputs="{")
     output_file.assert_not_called()
 
@@ -304,14 +304,14 @@ def test_rejects_malformed_outer_json(run_matrix, output_file):
 def test_rejects_missing_input(run_matrix, output_file, name):
     inputs = dict(DEFAULT_INPUTS)
     del inputs[name]
-    with pytest.raises(SystemExit, match=f"{name} 必须是合法 JSON"):
+    with pytest.raises(SystemExit, match=f"{name} must be valid JSON"):
         run_matrix(inputs)
     output_file.assert_not_called()
 
 
 @pytest.mark.parametrize("name", DEFAULT_INPUTS)
 def test_rejects_malformed_version_array(run_matrix, output_file, name):
-    with pytest.raises(SystemExit, match=f"{name} 必须是合法 JSON"):
+    with pytest.raises(SystemExit, match=f"{name} must be valid JSON"):
         run_matrix(dict(DEFAULT_INPUTS, **{name: "["}))
     output_file.assert_not_called()
 
@@ -319,7 +319,7 @@ def test_rejects_malformed_version_array(run_matrix, output_file, name):
 @pytest.mark.parametrize("name", DEFAULT_INPUTS)
 @pytest.mark.parametrize("raw", ["[]", "null", "{}", '"310"', "310"])
 def test_requires_nonempty_array(run_matrix, output_file, name, raw):
-    with pytest.raises(SystemExit, match=f"{name} 必须是非空 JSON 数组"):
+    with pytest.raises(SystemExit, match=f"{name} must be a non-empty JSON array"):
         run_matrix(dict(DEFAULT_INPUTS, **{name: raw}))
     output_file.assert_not_called()
 
@@ -331,7 +331,7 @@ def test_requires_nonempty_array(run_matrix, output_file, name, raw):
     if not (name == "torch_versions" and value == "")
 ])
 def test_rejects_invalid_version_elements(run_matrix, output_file, name, value):
-    with pytest.raises(SystemExit, match=f"{name} 的元素必须是非空版本字符串"):
+    with pytest.raises(SystemExit, match=f"{name} elements must be non-empty version strings"):
         run_matrix(dict(DEFAULT_INPUTS, **{name: json.dumps([value])}))
     output_file.assert_not_called()
 
@@ -346,14 +346,14 @@ def test_rejects_invalid_version_elements(run_matrix, output_file, name, value):
     ("sdk_versions", "2.3.0"),
 ])
 def test_rejects_unsupported_candidates(run_matrix, output_file, name, value):
-    with pytest.raises(SystemExit, match=f"{name} 包含不支持的值 {value}"):
+    with pytest.raises(SystemExit, match=f"{name} contains unsupported value {value}"):
         run_matrix(dict(DEFAULT_INPUTS, **{name: json.dumps([value])}))
     output_file.assert_not_called()
 
 
 @pytest.mark.parametrize("name", [name for name in DEFAULT_INPUTS if name != "python_versions"])
 def test_numeric_elements_are_only_supported_for_python(run_matrix, output_file, name):
-    with pytest.raises(SystemExit, match=f"{name} 的元素必须是非空版本字符串"):
+    with pytest.raises(SystemExit, match=f"{name} elements must be non-empty version strings"):
         run_matrix(dict(DEFAULT_INPUTS, **{name: "[2]"}))
     output_file.assert_not_called()
 
@@ -381,7 +381,7 @@ def test_checks_every_selected_image_before_writing_output(run_matrix, output_fi
 
 
 def test_rejects_matrix_over_github_limit(script, run_matrix, output_file, monkeypatch):
-    # 当前候选值最多生成 144 个任务，模拟乘积以覆盖超限保护分支。
+    # Current candidates generate at most 144 jobs; simulate the product to cover the overflow guard branch.
     monkeypatch.setattr(script.math, "prod", lambda values: 257)
     with pytest.raises(SystemExit, match="257.*256"):
         run_matrix()
@@ -503,16 +503,16 @@ def test_rc_tags_generate_build_matrix_without_release_fields(script, run_matrix
     for entry in entries:
         assert entry["image"] == script.IMAGES_MAP[image_key(entry)]
         assert entry["tag"] == entry["release_version"] == entry["whl_name"] == ""
-    assert "仅构建 wheel 并保存 Actions artifact，不发布" in capsys.readouterr().out
+    assert "only build wheels and save Actions artifacts, no publish" in capsys.readouterr().out
     runner.assert_not_called()
 
 
 @pytest.mark.parametrize("source", ["tag", "override", "branch"])
 @pytest.mark.parametrize("invalid,error", [
-    ({"python_versions": "["}, "python_versions 必须是合法 JSON"),
-    ({"sdk_versions": "[]"}, "sdk_versions 必须是非空 JSON 数组"),
-    ({"package_name": "../pkg"}, "package_name 必须是合法的 Python 包名"),
-    ({"python_versions": '["38"]'}, "缺少 ubuntu2204-py38"),
+    ({"python_versions": "["}, "python_versions must be valid JSON"),
+    ({"sdk_versions": "[]"}, "sdk_versions must be a non-empty JSON array"),
+    ({"package_name": "../pkg"}, "package_name must be a valid Python package name"),
+    ({"python_versions": '["38"]'}, "missing ubuntu2204-py38"),
 ])
 def test_nonrelease_builds_still_validate_inputs_and_images(
     script, run_matrix, monkeypatch, output_file, source, invalid, error
@@ -549,7 +549,7 @@ def test_rc_script_entrypoint_outputs_build_matrix(monkeypatch):
         entries = json.loads(values["matrix"])["include"]
         assert len(entries) == 2
         assert all(entry["image"] and entry["release_version"] == "" for entry in entries)
-        assert "仅构建 wheel 并保存 Actions artifact，不发布" in result.stdout
+        assert "only build wheels and save Actions artifacts, no publish" in result.stdout
 
 
 @pytest.mark.parametrize("ref_type,ref_name", [
@@ -569,7 +569,7 @@ def test_tag_version_overrides_repository_and_drives_all_matrix_versions(
     monkeypatch.setenv("GITHUB_REF_TYPE", ref_type)
     monkeypatch.setenv("GITHUB_REF_NAME", ref_name)
     monkeypatch.delenv("SOURCE_DIR", raising=False)
-    runner = create_autospec(script.subprocess.run, side_effect=AssertionError("不应读取仓库 tag"))
+    runner = create_autospec(script.subprocess.run, side_effect=AssertionError("should not read repository tags"))
     monkeypatch.setattr(script.subprocess, "run", runner)
     entries = run_matrix(dict(DEFAULT_INPUTS, tag_version=prefix + tag_version, torch_versions='["", "2.10.0"]'))
     assert len(entries) == 2
@@ -595,7 +595,7 @@ def test_invalid_tag_version_fails_without_falling_back_or_writing_output(
     monkeypatch.setenv("GITHUB_REF_NAME", ref_name)
     runner = create_autospec(script.subprocess.run)
     monkeypatch.setattr(script.subprocess, "run", runner)
-    with pytest.raises(SystemExit, match="tag_version 必须是合法"):
+    with pytest.raises(SystemExit, match="tag_version must be a valid"):
         run_matrix(dict(DEFAULT_INPUTS, tag_version=tag_version))
     runner.assert_not_called()
     output_file.assert_not_called()
@@ -643,27 +643,27 @@ def test_tag_trigger_does_not_read_git_or_template_ref(script, run_matrix, monke
                                       "VV1.0.0", "vV1.0.0", "Vv1.0.0"])
 def test_invalid_trigger_tag_fails_without_writing_output(run_matrix, monkeypatch, output_file, tag):
     monkeypatch.setenv("GITHUB_REF_NAME", tag)
-    with pytest.raises(SystemExit, match="tag 必须是版本号"):
+    with pytest.raises(SystemExit, match="tag must be a version number"):
         run_matrix()
     output_file.assert_not_called()
 
 
 def test_tag_trigger_without_name_does_not_fall_back_to_git(run_matrix, monkeypatch, output_file):
     monkeypatch.delenv("GITHUB_REF_NAME")
-    with pytest.raises(SystemExit, match="tag 必须是版本号"):
+    with pytest.raises(SystemExit, match="tag must be a version number"):
         run_matrix()
     output_file.assert_not_called()
 
 
 @pytest.mark.parametrize("package_name", ["", None, 123, "../deep_gemm", "a/b", "a\nb", "-pkg"])
 def test_invalid_package_name(run_matrix, output_file, package_name):
-    with pytest.raises(SystemExit, match="package_name 必须是合法的 Python 包名"):
+    with pytest.raises(SystemExit, match="package_name must be a valid Python package name"):
         run_matrix(dict(DEFAULT_INPUTS, package_name=package_name))
     output_file.assert_not_called()
 
 
 def test_missing_package_name(run_matrix, output_file):
-    with pytest.raises(SystemExit, match="package_name 必须是合法的 Python 包名"):
+    with pytest.raises(SystemExit, match="package_name must be a valid Python package name"):
         run_matrix(raw_inputs=json.dumps(DEFAULT_INPUTS))
     output_file.assert_not_called()
 
@@ -676,7 +676,7 @@ def test_wheel_package_name_normalizes_separators(run_matrix, package_name):
 
 @pytest.mark.parametrize("inputs", [[], None, "text", 1])
 def test_outer_json_requires_an_object(run_matrix, output_file, inputs):
-    with pytest.raises(SystemExit, match="触发参数 必须是 JSON 对象"):
+    with pytest.raises(SystemExit, match="trigger inputs must be a JSON object"):
         run_matrix(raw_inputs=json.dumps(inputs))
     output_file.assert_not_called()
 
@@ -693,13 +693,13 @@ def test_branch_requires_explicit_caller_source(script, run_matrix, monkeypatch,
     runner.assert_not_called()
 
 
-@pytest.mark.parametrize("error", [OSError("git 不可用"), subprocess.CalledProcessError(128, "git")])
+@pytest.mark.parametrize("error", [OSError("git unavailable"), subprocess.CalledProcessError(128, "git")])
 def test_git_errors_fail_cleanly(script, run_matrix, monkeypatch, output_file, error):
     monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
     monkeypatch.setenv("SOURCE_DIR", "caller-source")
     runner = create_autospec(script.subprocess.run, side_effect=error)
     monkeypatch.setattr(script.subprocess, "run", runner)
-    with pytest.raises(SystemExit, match="无法读取调用方仓库当前提交的 tag"):
+    with pytest.raises(SystemExit, match="unable to read the tags of the caller repository current commit"):
         run_matrix()
     output_file.assert_not_called()
     assert runner.call_args.args[0] == [
@@ -709,7 +709,7 @@ def test_git_errors_fail_cleanly(script, run_matrix, monkeypatch, output_file, e
 
 @pytest.fixture
 def caller_git_repository():
-    # 所有 Git 操作仅发生在临时测试仓库，不读取用户 Git 配置或修改工作仓库。
+    # All Git operations happen only in the temporary test repository; no user Git config or workspace modifications.
     with tempfile.TemporaryDirectory(prefix=".matrix-tag-test-", dir=SCRIPT_PATH.parents[1]) as directory:
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
@@ -760,7 +760,7 @@ def test_branch_without_eligible_head_tag_builds_without_historical_release(
 ):
     directory, git = caller_git_repository
     git("tag", "1.0.0")
-    git("commit", "--allow-empty", "--quiet", "-m", "当前提交")
+    git("commit", "--allow-empty", "--quiet", "-m", "current commit")
     for tag in current_tags:
         git("tag", tag)
     monkeypatch.setenv("SOURCE_DIR", directory)
@@ -768,7 +768,7 @@ def test_branch_without_eligible_head_tag_builds_without_historical_release(
     entries = run_matrix()
     assert len(entries) == 1
     assert entries[0]["tag"] == entries[0]["release_version"] == entries[0]["whl_name"] == ""
-    assert "仅构建 wheel 并保存 Actions artifact，不发布" in capsys.readouterr().out
+    assert "only build wheels and save Actions artifacts, no publish" in capsys.readouterr().out
 
 
 def test_branch_without_any_tags_builds_without_release(run_matrix, monkeypatch, caller_git_repository):
@@ -787,7 +787,7 @@ def test_multiple_head_tags_select_highest_eligible_version(
     directory, git = caller_git_repository
     for tag in (prefix + "1.9.0", prefix + "1.10.0", prefix + "1.11.0RC1", "unrelated-tag"):
         if annotated:
-            git("tag", "-a", tag, "-m", "版本 tag")
+            git("tag", "-a", tag, "-m", "version tag")
         else:
             git("tag", tag)
     monkeypatch.setenv("SOURCE_DIR", directory)
@@ -865,7 +865,7 @@ def test_entry_normalizes_only_hyphens_and_preserves_other_inputs(run_normalize,
 def test_entry_rejects_invalid_package_before_writing_outputs(run_normalize, name):
     result, values = run_normalize(dict(DEFAULT_INPUTS, package_name=name))
     assert result.returncode != 0
-    assert "package_name 必须是合法的 Python 包名" in result.stderr
+    assert "package_name must be a valid Python package name" in result.stderr
     assert values == {}
 
 
@@ -894,11 +894,11 @@ def test_workflow_uses_caller_history_and_exposes_generated_fields():
     workflow = yaml.load((SCRIPT_PATH.parents[3] / ".github/workflows/matrix-release.yml").read_text(),
                          Loader=yaml.BaseLoader)
     steps = workflow["jobs"]["prepare-matrix"]["steps"]
-    source = next(step for step in steps if step["name"] == "检出调用方版本历史")
-    template = next(step for step in steps if step["name"] == "检出模板工具")
+    source = next(step for step in steps if step["name"] == "Checkout caller version history")
+    template = next(step for step in steps if step["name"] == "Checkout template tools")
     generate = next(step for step in steps if step.get("id") == "matrix")
-    setup = next(step for step in steps if step["name"] == "配置矩阵校验 Python")
-    install = next(step for step in steps if step["name"] == "安装版本校验依赖")
+    setup = next(step for step in steps if step["name"] == "Set up matrix validation Python")
+    install = next(step for step in steps if step["name"] == "Install version validation dependencies")
     assert steps.index(source) < steps.index(template) < steps.index(setup) < steps.index(install) < steps.index(generate)
     assert setup["uses"] == "actions/setup-python@v5"
     assert setup["with"]["python-version"] == "3.12"
@@ -994,7 +994,7 @@ def test_migrated_scripts_resolve_in_real_repository(migrated_workflow):
         assert config["persist-credentials"] == "false"
         for relative in references:
             path = repository / relative
-            assert path.is_file(), f"迁移后缺少工具文件：{relative}"
+            assert path.is_file(), f"missing tool file after migration: {relative}"
             assert path.parent == SCRIPT_PATH.parent
         paths.update(references)
     assert template_jobs == 4
@@ -1016,7 +1016,7 @@ def test_migrated_explicit_inputs_and_documented_example_run_real_matrix(
     inputs.update(package_name="demo_package", framework="torch", template_ref="fixture-sha",
                   build_command="true")
     if configuration == "explicit":
-        # 必填版本数组由调用方显式传入，不依赖 workflow_call 的 default。
+        # Required version arrays are explicitly provided by the caller; not relying on workflow_call defaults.
         inputs.update(python_versions='["312"]', os_versions='["ubuntu2404"]',
                       runtime_versions='["3"]', torch_versions='["2.10.0"]',
                       sdk_versions='["2.2.0"]')
@@ -1035,7 +1035,7 @@ def test_migrated_explicit_inputs_and_documented_example_run_real_matrix(
     assert all(name in inputs for name, definition in definitions.items() if definition.get("required") == "true")
     with tempfile.TemporaryDirectory(prefix=".migration-test-", dir=SCRIPT_PATH.parents[1]) as directory:
         root = Path(directory)
-        # 按真实目录布局复制工具，不为旧路径额外创建兼容目录。
+        # Copy tools following the real directory layout; do not create extra compatibility directories for legacy paths.
         target = root / "ci-template" / SCRIPT_PATH.parent.relative_to(SCRIPT_PATH.parents[3])
         shutil.copytree(SCRIPT_PATH.parent, target)
         steps = migrated_workflow["jobs"]["prepare-matrix"]["steps"]

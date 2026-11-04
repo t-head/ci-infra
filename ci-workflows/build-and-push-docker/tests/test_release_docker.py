@@ -988,7 +988,7 @@ def test_demo_resolved_inputs_pass_validation(validator, source, post_module, re
         "os": "ubuntu24", "python": "py312", "hggcrt": "3", "sdk_version": "2.2.0", "torch": "2.13.0",
         "network": network,
     }
-    # 显式启用 T-Head 正式发布，继续验证本仓库的元数据字段映射。
+    # Explicitly enable the T-Head formal release to keep verifying this repository's metadata field mapping.
     inputs.update(push_target="t-head", release_type="release", publish_data=True)
     outputs = validator.validate_inputs(inputs, source)
     assert outputs["image"] == IMAGE

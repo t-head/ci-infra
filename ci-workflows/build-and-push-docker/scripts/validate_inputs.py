@@ -1,4 +1,4 @@
-"""校验 Docker 构建输入和元数据，根据发布类型选择镜像仓库。"""
+"""Validate Docker build inputs and metadata, selecting the image repository based on the release type."""
 
 from datetime import datetime, timezone
 import json

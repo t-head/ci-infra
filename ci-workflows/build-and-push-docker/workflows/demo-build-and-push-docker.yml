@@ -1,7 +1,7 @@
 name: Demo Build And Push Docker
 
 # Copy to .github/workflows/demo-build-and-push-docker.yml in the caller repository.
-# 手动运行会推送真实镜像；仅当目标包含 t-head、release_type=release 且 publish_data=true 时发布元数据。仅使用可信分支和 Dockerfile。
+# Manual runs push real images; metadata is published only when the target contains t-head, release_type=release and publish_data=true. Use trusted branches and Dockerfiles only.
 on:
   workflow_dispatch:
     inputs:

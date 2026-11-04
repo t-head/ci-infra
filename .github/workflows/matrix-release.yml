@@ -1,80 +1,80 @@
 name: Reusable Matrix Release
 
-# 数组使用 JSON 字符串传参，镜像映射维护在 ci-workflows/release-pypi/scripts/prepare_matrix.py。
-# 本文件供调用方通过 job 级 uses 调用；手动触发入口由调用方提供。
-# 跨仓库调用时，template_ref 必须与 uses 中的版本一致，推荐固定为 commit SHA。
-# 私有模板仓库需允许跨仓库调用，并通过 template_token 提供模板代码的只读权限。
+# Arrays are passed as JSON strings; the image mapping is maintained in ci-workflows/release-pypi/scripts/prepare_matrix.py.
+# This file is called by callers via job-level uses; the manual trigger entry point is provided by the caller.
+# For cross-repository calls, template_ref must match the version used in the uses statement; pinning to a commit SHA is recommended.
+# A private template repository must allow cross-repository calls and grant read-only access to the template code via template_token.
 on:
   workflow_call:
     inputs:
       package_name:
-        description: '构建和发布的包名，例如 deep-gemm；入口将 - 替换为 _，不参与矩阵展开'
+        description: 'Name of the package to build and publish, for example deep-gemm; the entry point replaces - with _ and it does not participate in matrix expansion'
         required: true
         type: string
       framework:
-        description: '依赖的框架名称，例如 torch；不参与矩阵展开'
+        description: 'Name of the dependent framework, for example torch; does not participate in matrix expansion'
         required: true
         type: string
       python_versions:
-        description: 'JSON 数组，候选值：38、310、312，例如 ["38","310"]'
+        description: 'JSON array, allowed values: 38, 310, 312, for example ["38","310"]'
         required: true
         type: string
         default: '["312"]'
       os_versions:
-        description: 'JSON 数组，候选值：ubuntu2004、ubuntu2204、ubuntu2404、alios7u2'
+        description: 'JSON array, allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
         required: true
         type: string
         default: '["ubuntu2404"]'
       runtime_versions:
-        description: 'JSON 数组，候选值：2、3，例如 ["2","3"]'
+        description: 'JSON array, allowed values: 2, 3, for example ["2","3"]'
         required: true
         type: string
         default: '["3"]'
       torch_versions:
-        description: 'JSON 数组，候选值：2.10.0、2.13.0；[""] 表示不包含 Torch 版本'
+        description: 'JSON array, allowed values: 2.10.0, 2.13.0; [""] means no Torch version is included'
         required: true
         type: string
         default: '["2.10.0"]'
       sdk_versions:
-        description: 'JSON 数组，候选值：2.1.1、2.2.0'
+        description: 'JSON array, allowed values: 2.1.1, 2.2.0'
         required: true
         type: string
         default: '["2.2.0"]'
       pccl_version:
-        description: '候选值：2.1.1,2.2.0、2.2.1'
+        description: 'Allowed values: 2.1.1,2.2.0, 2.2.1'
         required: false
         type: string
         default: '2.2.1'
       template_repository:
-        description: '保存本工作流及 prepare_matrix.py 的仓库，格式为 owner/repo'
+        description: 'Repository holding this workflow and prepare_matrix.py, in owner/repo format'
         type: string
         required: false
         default: t-head/ci-infra
       template_ref:
-        description: '模板代码版本，必须与调用本工作流的 ref 一致；本仓库相对路径调用传 github.sha'
+        description: 'Template code version, must match the ref that invokes this workflow; pass github.sha for relative-path calls within this repository'
         required: true
         type: string
       build_command:
-        description: '在调用方仓库根目录执行的 Bash 编译命令，支持多行；仅接受可信配置'
+        description: 'Bash build command executed in the caller repository root, multi-line supported; only trusted configuration is accepted'
         required: true
         type: string
       tag_version:
-        description: '可选发布版本，优先于仓库 tag，例如 1.0.0 或 V1.0.0+v0.3.0；所有版本来源均去除开头的 v/V，内部内容不变；须符合 PEP 440 及现有 tag 格式，非法值报错，含 rc（忽略大小写）时仅构建 wheel 并保存 artifact，不发布；不改变代码检出版本'
+        description: 'Optional release version, taking precedence over repository tags, for example 1.0.0 or V1.0.0+v0.3.0; a leading v/V is stripped from all version sources while inner content stays unchanged; must satisfy PEP 440 and the existing tag format, invalid values raise an error, and a version containing rc (case-insensitive) only builds wheels and saves artifacts without publishing; does not change the checked-out code version'
         required: false
         type: string
         default: ''
     secrets:
       template_token:
-        description: '检出私有模板仓库的只读 token；同仓库或公开模板通常无需提供'
+        description: 'Read-only token for checking out a private template repository; usually not needed for same-repository or public templates'
         required: false
       release_username:
-        description: '发布用户名，来自调用方仓库或组织级 Actions Secret'
+        description: 'Release username, from the caller repository or organization-level Actions Secret'
         required: true
       release_token:
-        description: '发布 token，来自调用方仓库或组织级 Actions Secret'
+        description: 'Release token, from the caller repository or organization-level Actions Secret'
         required: true
       data_token:
-        description: '发布数据 Open API 客户端 RSA 私钥，Base64 编码的未加密 DER 格式'
+        description: 'Release data Open API client RSA private key, Base64-encoded unencrypted DER format'
         required: true
 
 permissions:
@@ -82,7 +82,7 @@ permissions:
 
 jobs:
   prepare-matrix:
-    name: 校验输入并生成矩阵
+    name: Validate inputs and generate matrix
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -90,7 +90,7 @@ jobs:
       should_release: ${{ steps.matrix.outputs.should_release }}
       package_name: ${{ steps.normalize-package.outputs.package_name }}
     steps:
-      - name: 规范化包名
+      - name: Normalize package name
         id: normalize-package
         shell: bash
         env:
@@ -106,7 +106,7 @@ jobs:
           if not isinstance(package_name, str) or not re.fullmatch(
               r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name
           ):
-              raise SystemExit("::error::package_name 必须是合法的 Python 包名")
+              raise SystemExit("::error::package_name must be a valid Python package name")
           package_name = package_name.replace("-", "_")
           inputs["package_name"] = package_name
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -114,20 +114,20 @@ jobs:
               output.write("inputs_json=" + json.dumps(inputs, separators=(",", ":")) + "\n")
           PY
 
-      # - name: 校验调用方组织
+      # - name: Validate caller organization
       #   shell: bash
       #   env:
       #     CALLER_ORGANIZATION: ${{ github.repository_owner }}
       #   run: |
       #     set -euo pipefail
       #     shopt -s nocasematch
-      #     # 固定允许的组织，不能从调用方可修改的 input 中获取。
+      #     # The pinned list of allowed organizations; must not come from inputs the caller can modify.
       #     if [[ "$CALLER_ORGANIZATION" != "t-head" ]]; then
-      #       printf '%s\n' '::error::只允许 t-head 组织内的仓库调用此工作流' >&2
+      #       printf '%s\n' '::error::only repositories in the t-head organization may call this workflow' >&2
       #       exit 1
       #     fi
 
-      - name: 检出调用方版本历史
+      - name: Checkout caller version history
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -135,7 +135,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: 检出模板工具
+      - name: Checkout template tools
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.template_repository }}
@@ -143,16 +143,16 @@ jobs:
           path: ci-template
           token: ${{ secrets.template_token || github.token }}
           persist-credentials: false
-      - name: 配置矩阵校验 Python
+      - name: Set up matrix validation Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装版本校验依赖
+      - name: Install version validation dependencies
         shell: bash
         run: python3 -m pip install --no-input packaging
 
-      - name: 解析版本数组和镜像映射
+      - name: Parse version arrays and image mapping
         id: matrix
         shell: bash
         env:
@@ -161,7 +161,7 @@ jobs:
         run: python3 ci-template/ci-workflows/release-pypi/scripts/prepare_matrix.py
 
   build-sdist:
-    name: 构建源码包
+    name: Build sdist
     needs: prepare-matrix
     if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
@@ -169,14 +169,14 @@ jobs:
     outputs:
       artifact_id: ${{ steps.upload-sdist.outputs.artifact-id }}
     steps:
-      - name: 检出调用方仓库及完整版本历史
+      - name: Checkout caller repository with full version history
         uses: actions/checkout@v4
         with:
           path: source
           fetch-depth: 0
           persist-credentials: false
 
-      - name: 检出源码包模板
+      - name: Checkout sdist template
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.template_repository }}
@@ -185,16 +185,16 @@ jobs:
           token: ${{ secrets.template_token || github.token }}
           persist-credentials: false
 
-      - name: 配置源码包构建 Python
+      - name: Set up Python for sdist build
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装源码包构建依赖
+      - name: Install sdist build dependencies
         shell: bash
         run: python -m pip install --no-input setuptools wheel packaging
 
-      - name: 填充模板并构建源码包
+      - name: Fill template and build sdist
         shell: bash
         env:
           pkg_name: ${{ needs.prepare-matrix.outputs.package_name }}
@@ -202,17 +202,17 @@ jobs:
           MATRIX_JSON: ${{ needs.prepare-matrix.outputs.matrix }}
         run: |
           set -euo pipefail
-          # 限制替换值，避免破坏 sed 表达式或生成的 Python 字符串。
+          # Restrict substituted values to avoid breaking the sed expressions or the generated Python strings.
           if [[ ! "$pkg_name" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]; then
-            printf '%s\n' '::error::package_name 必须是合法的 Python 包名' >&2
+            printf '%s\n' '::error::package_name must be a valid Python package name' >&2
             exit 1
           fi
           if [[ -n "$framework" && ! "$framework" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ ]]; then
-            printf '%s\n' '::error::framework 必须为空或合法的 Python 模块名' >&2
+            printf '%s\n' '::error::framework must be empty or a valid Python module name' >&2
             exit 1
           fi
 
-          # 直接使用矩阵的发布版本，先校验全部版本并去重，再逐个构建。
+          # Use the release versions from the matrix directly: validate all versions and deduplicate first, then build one by one.
           release_versions="$(python - <<'PY'
           import json
           import os
@@ -232,19 +232,19 @@ jobs:
                   if version not in versions:
                       versions.append(version)
           except (KeyError, TypeError, ValueError, InvalidVersion):
-              raise SystemExit("::error::矩阵必须包含有效的 release_version")
+              raise SystemExit("::error::matrix must contain a valid release_version")
           print("\n".join(versions))
           PY
           )"
 
           for placeholder in 'PACKAGE_NAME = ""' 'framework = ""' 'build_version = ""'; do
             if ! grep -Fxq "$placeholder" ci-template/ci-workflows/release-pypi/scripts/setup.py; then
-              printf '%s\n' '::error::源码包模板缺少预期占位字段' >&2
+              printf '%s\n' '::error::the sdist template is missing the expected placeholder fields' >&2
               exit 1
             fi
           done
 
-          # 每个版本使用独立构建目录，避免模板及 egg-info 串用；产物统一收集。
+          # Use a separate build directory per version to avoid mixing templates and egg-info; artifacts are collected together.
           mkdir -p sdist/dist
           dist_dir="$(pwd)/sdist/dist"
           export __FAKE_BUILD="FAKE_WHEEL"
@@ -257,10 +257,10 @@ jobs:
               -e "s|^build_version = \"\"$|build_version = \"$build_version\"|" \
               ci-template/ci-workflows/release-pypi/scripts/setup.py > "$build_dir/setup.py"
             (cd "$build_dir" && python setup.py sdist --dist-dir "$dist_dir")
-            printf '已构建源码包版本：%s\n' "$build_version"
+            printf 'Built sdist version: %s\n' "$build_version"
           done <<< "$release_versions"
 
-      - name: 保存源码包构建产物
+      - name: Save sdist build artifacts
         id: upload-sdist
         uses: actions/upload-artifact@v4
         with:
@@ -271,8 +271,8 @@ jobs:
   matrix-job:
     name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / runtime${{ matrix.runtime_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
     needs: [prepare-matrix, build-sdist]
-    # job 条件先于矩阵展开，跳过时不解析空的 matrix output，也不启动编译容器。
-    # 非发布构建允许源码包任务跳过；发布构建仍须等待源码包成功。
+    # The job condition is evaluated before matrix expansion; when skipped, the empty matrix output is not parsed and the build container is not started.
+    # Non-release builds allow the sdist job to be skipped; release builds must still wait for the sdist to succeed.
     if: ${{ !cancelled() && needs.prepare-matrix.result == 'success' && ((needs.prepare-matrix.outputs.should_release == 'false' && needs.build-sdist.result == 'skipped') || (needs.prepare-matrix.outputs.should_release == 'true' && needs.build-sdist.result == 'success')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -297,7 +297,7 @@ jobs:
       run:
         shell: sh
     steps:
-      - name: 输出当前矩阵参数
+      - name: Print current matrix parameters
         run: |
           printf '%s\n' \
             "PYTHON_VERSION=$PYTHON_VERSION" \
@@ -311,39 +311,39 @@ jobs:
             "SDK_URL=$SDK_URL" \
             "PCCL_URL=$PCCL_URL" \
             "CONTAINER_IMAGE=$CONTAINER_IMAGE"
-      - name: 检出待编译仓库
+      - name: Checkout repository to build
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
 
-      - name: 下载并安装 SDK run 包
+      - name: Download and install SDK run package
         shell: bash
         run: |
           set -euo pipefail
-          : "${SDK_URL:?SDK_URL 不能为空}"
+          : "${SDK_URL:?SDK_URL must not be empty}"
           download_dir="$(mktemp -d "$RUNNER_TEMP/ppu-sdk.XXXXXX")"
           wget --https-only --tries=3 --timeout=30 \
             -O "$download_dir/ppu-sdk.run" -- "$SDK_URL"
           if [[ ! -s "$download_dir/ppu-sdk.run" ]]; then
-            printf '%s\n' '::error::下载的 SDK run 包为空' >&2
+            printf '%s\n' '::error::the downloaded SDK run package is empty' >&2
             exit 1
           fi
           bash "$download_dir/ppu-sdk.run" --prefix=/usr/local --silent
           echo "/usr/local/PPU_SDK/lib" >> /etc/ld.so.conf.d/ppu.conf
           ldconfig
 
-      - name: 下载并安装 PCCL
+      - name: Download and install PCCL
         shell: bash
         env:
           PCCL_PATH: /usr/local/pccl
         run: |
           set -euo pipefail
-          : "${PCCL_URL:?PCCL_URL 不能为空}"
-          : "${PCCL_PATH:?PCCL_PATH 不能为空}"
+          : "${PCCL_URL:?PCCL_URL must not be empty}"
+          : "${PCCL_PATH:?PCCL_PATH must not be empty}"
           if [[ -e "$PCCL_PATH" || -L "$PCCL_PATH" ]]; then
-            printf '%s\n' '::error::PCCL 安装目录已存在，拒绝覆盖' >&2
+            printf '%s\n' '::error::the PCCL install directory already exists, refusing to overwrite' >&2
             exit 1
           fi
           download_dir="$(mktemp -d "$RUNNER_TEMP/pccl.XXXXXX")"
@@ -351,13 +351,13 @@ jobs:
           wget --https-only --tries=3 --timeout=30 \
             -O "$download_dir/pccl.tar.gz" -- "$PCCL_URL"
           if [[ ! -s "$download_dir/pccl.tar.gz" ]]; then
-            printf '%s\n' '::error::下载的 PCCL 包为空' >&2
+            printf '%s\n' '::error::the downloaded PCCL package is empty' >&2
             exit 1
           fi
           mkdir "$download_dir/extracted"
           tar --extract --file="$download_dir/pccl.tar.gz" --directory="$download_dir/extracted"
           if [[ ! -d "$download_dir/extracted/pccl" || -L "$download_dir/extracted/pccl" ]]; then
-            printf '%s\n' '::error::PCCL 包缺少 pccl 目录或目录为符号链接' >&2
+            printf '%s\n' '::error::the PCCL package is missing the pccl directory or the directory is a symlink' >&2
             exit 1
           fi
           mv -- "$download_dir/extracted/pccl" "$PCCL_PATH"
@@ -365,13 +365,13 @@ jobs:
           ldconfig
           printf 'PCCL_PATH=%s\n' "$PCCL_PATH" >> "$GITHUB_ENV"
 
-      - name: 编译
+      - name: Build
         shell: bash
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
         run: |
           set -eo pipefail
-          : "${BUILD_COMMAND:?build_command 不能为空}"
+          : "${BUILD_COMMAND:?build_command must not be empty}"
           ldconfig
           source /usr/local/PPU_SDK/envsetup.sh
           export PATH="$PCCL_PATH/bin:$PATH"
@@ -381,7 +381,7 @@ jobs:
           fi
           bash -e -o pipefail -c "$BUILD_COMMAND"
 
-      - name: 收集 wheel 到 dist
+      - name: Collect wheels into dist
         shell: bash
         env:
           PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}
@@ -397,14 +397,14 @@ jobs:
           dist = root / "dist"
           package_name = os.environ["PACKAGE_NAME"].lower().replace("-", "_")
           if not package_name:
-              raise SystemExit("::error::package_name 不能为空")
+              raise SystemExit("::error::package_name must not be empty")
           if dist.is_symlink() or (dist.exists() and not dist.is_dir()):
-              raise SystemExit("::error::dist 必须是普通目录，不能是符号链接")
+              raise SystemExit("::error::dist must be a regular directory, not a symlink")
 
           def scan_error(error):
-              raise SystemExit(f"::error::无法扫描源码目录：{error}")
+              raise SystemExit(f"::error::cannot scan the source directory: {error}")
 
-          # 递归查找普通文件，不跟随符号链接；先完成筛选，避免同名产物复制时互相覆盖。
+          # Find regular files recursively without following symlinks; finish filtering first to avoid same-name artifacts overwriting each other during copy.
           wheels = []
           for directory, _, filenames in os.walk(root, onerror=scan_error, followlinks=False):
               for filename in filenames:
@@ -412,36 +412,36 @@ jobs:
                   if filename.endswith(".whl") and path.is_file() and not path.is_symlink():
                       wheels.append(path)
           wheels.sort()
-          print("发现 wheel 文件：" + json.dumps([str(path.relative_to(root)) for path in wheels],
+          print("Found wheel files: " + json.dumps([str(path.relative_to(root)) for path in wheels],
                                                ensure_ascii=False), flush=True)
           if not wheels:
-              raise SystemExit("::error::源码目录中未找到 .whl 文件")
+              raise SystemExit("::error::no .whl file found in the source directory")
           candidates = wheels
           if len(wheels) > 1:
               candidates = [path for path in wheels
                             if path.name.lower().replace("-", "_").startswith(package_name)]
           if len(candidates) != 1:
-              raise SystemExit(f"::error::按 package_name 筛选后必须且只能有一个 wheel，实际为 {len(candidates)} 个")
+              raise SystemExit(f"::error::exactly one wheel must remain after filtering by package_name, got {len(candidates)}")
 
           selected = candidates[0]
           target = dist / selected.name
           existing = list(dist.glob("*.whl"))
           if any(path.is_symlink() or not path.is_file() for path in existing):
-              raise SystemExit("::error::dist 中的 wheel 必须是普通文件，不能是符号链接")
+              raise SystemExit("::error::wheels in dist must be regular files, not symlinks")
           if selected != target and target.exists():
-              raise SystemExit("::error::dist 中已存在同名产物，拒绝覆盖")
+              raise SystemExit("::error::an artifact with the same name already exists in dist, refusing to overwrite")
           dist.mkdir(exist_ok=True)
-          # 仅匹配时归一化名称，复制保留原名；已在 dist 中的选中产物无需复制。
+          # Normalize the name only on match; keep the original name when copying; the selected artifact already in dist needs no copy.
           if selected != target:
               shutil.copy2(selected, target)
-          # dist 只保留选中的 wheel，源码其他目录中的原件和非 wheel 文件不变。
+          # dist keeps only the selected wheel; originals in other source directories and non-wheel files stay untouched.
           for path in existing:
               if path != target:
                   path.unlink()
-          print("已收集 wheel：" + json.dumps(str(target.relative_to(root)), ensure_ascii=False))
+          print("Collected wheel: " + json.dumps(str(target.relative_to(root)), ensure_ascii=False))
           PY
 
-      - name: 保存收集的 wheel 产物
+      - name: Save collected wheel artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.prepare-matrix.outputs.package_name }}-collected-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -450,7 +450,7 @@ jobs:
           compression-level: 0
           include-hidden-files: true
 
-      # Docker action 与编译容器共享工作区，在指定工具镜像内完成重打包。
+      # The Docker action shares the workspace with the build container and repacks inside the specified tool image.
       - name: Repack wheel
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: docker://download.t-head.cn/docker_tool/manylinux_revpkg:04
@@ -458,25 +458,25 @@ jobs:
           entrypoint: /bin/bash
           args: |
             -euo pipefail -c "
-            : \"${RELEASE_VERSION:?RELEASE_VERSION 不能为空}\"
+            : \"${RELEASE_VERSION:?RELEASE_VERSION must not be empty}\"
             shopt -s nullglob
             wheels=(dist/*.whl)
             if (( ${#wheels[@]} != 1 )); then
-              printf '%s\n' '::error::重打包前 dist 目录必须包含且仅包含一个 wheel 文件' >&2
-              printf '%s\n' 'dist 目录文件列表（含隐藏文件）：' >&2
+              printf '%s\n' '::error::the dist directory must contain exactly one wheel file before repack' >&2
+              printf '%s\n' 'dist directory file listing (including hidden files):' >&2
               ls -la -- dist >&2 || true
               exit 1
             fi
             wheel=\"${wheels[0]}\"
             if [[ ! -f \"$wheel\" || -L \"$wheel\" ]]; then
-              printf '%s\n' '::error::待重打包的 wheel 必须是普通文件，不能是符号链接' >&2
+              printf '%s\n' '::error::the wheel to repack must be a regular file, not a symlink' >&2
               exit 1
             fi
 
             mkdir -p /tmp/origin /tmp/release
             existing=(/tmp/release/*.whl)
             if (( ${#existing[@]} != 0 )); then
-              printf '%s\n' '::error::重打包输出目录已存在 wheel 文件' >&2
+              printf '%s\n' '::error::the repack output directory already contains wheel files' >&2
               exit 1
             fi
             WHEEL_FILE=\"${wheel##*/}\"
@@ -485,51 +485,51 @@ jobs:
 
             repacked=(/tmp/release/*.whl)
             if (( ${#repacked[@]} != 1 )); then
-              printf '%s\n' '::error::重打包后必须生成且仅生成一个 wheel 文件' >&2
+              printf '%s\n' '::error::repacking must produce exactly one wheel file' >&2
               exit 1
             fi
             if [[ ! -f \"${repacked[0]}\" || -L \"${repacked[0]}\" || ! -s \"${repacked[0]}\" ]]; then
-              printf '%s\n' '::error::重打包产物必须是非空普通 wheel 文件，不能是符号链接' >&2
+              printf '%s\n' '::error::repacked artifact must be a non-empty regular wheel file, not a symlink' >&2
               exit 1
             fi
-            # 保留编译产物的原始文件名，下一步再按矩阵要求重命名。
+            # Keep the original file name of the build output; the next step renames it as required by the matrix.
             cp -- \"${repacked[0]}\" \"$wheel\"
-            printf '已重打包 wheel：%s\n' \"$wheel\"
+            printf 'Repacked wheel: %s\n' \"$wheel\"
             "
 
-      - name: 重命名 wheel
+      - name: Rename wheel
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          : "${WHL_NAME:?WHL_NAME 不能为空}"
+          : "${WHL_NAME:?WHL_NAME must not be empty}"
           if [[ ! "$WHL_NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_.+!-]*\.whl$ ]]; then
-            printf '%s\n' '::error::WHL_NAME 必须是 wheel 文件名，不能包含路径或特殊字符' >&2
+            printf '%s\n' '::error::WHL_NAME must be a wheel file name without path or special characters' >&2
             exit 1
           fi
           shopt -s nullglob
           wheels=(dist/*.whl)
           if (( ${#wheels[@]} != 1 )); then
-            printf '%s\n' '::error::重打包后 dist 目录必须包含且仅包含一个 wheel 文件' >&2
+            printf '%s\n' '::error::the dist directory must contain exactly one wheel file after repack' >&2
             exit 1
           fi
           wheel="${wheels[0]}"
           target="dist/$WHL_NAME"
           if [[ ! -f "$wheel" || -L "$wheel" ]]; then
-            printf '%s\n' '::error::待重命名的 wheel 必须是普通文件，不能是符号链接' >&2
+            printf '%s\n' '::error::the wheel to rename must be a regular file, not a symlink' >&2
             exit 1
           fi
-          # 仅重命名文件，不修改 wheel 内部元数据；已是目标名称时直接保留。
+          # Only rename the file without modifying wheel-internal metadata; keep it as is when it already has the target name.
           if [[ "$wheel" != "$target" ]]; then
             if [[ -e "$target" || -L "$target" ]]; then
-              printf '%s\n' '::error::目标 wheel 已存在，拒绝覆盖' >&2
+              printf '%s\n' '::error::the target wheel already exists, refusing to overwrite' >&2
               exit 1
             fi
             mv -- "$wheel" "$target"
           fi
-          printf 'wheel 产物：%s\n' "$target"
+          printf 'Wheel artifact: %s\n' "$target"
 
-      - name: 上传 wheel 到 Artifactory
+      - name: Upload wheel to Artifactory
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         env:
@@ -539,22 +539,22 @@ jobs:
           RELEASE_TOKEN: ${{ secrets.release_token }}
         run: |
           set -euo pipefail
-          : "${RELEASE_USERNAME:?发布用户名不能为空}"
-          : "${RELEASE_TOKEN:?发布 token 不能为空}"
-          : "${RELEASE_VERSION:?RELEASE_VERSION 不能为空}"
-          : "${WHL_NAME:?WHL_NAME 不能为空}"
+          : "${RELEASE_USERNAME:?release username must not be empty}"
+          : "${RELEASE_TOKEN:?release token must not be empty}"
+          : "${RELEASE_VERSION:?RELEASE_VERSION must not be empty}"
+          : "${WHL_NAME:?WHL_NAME must not be empty}"
           shopt -s nullglob
           wheels=(dist/*.whl)
           if (( ${#wheels[@]} == 0 )); then
-            printf '%s\n' '::error::dist 目录中未找到 wheel 文件' >&2
+            printf '%s\n' '::error::no wheel file found in the dist directory' >&2
             exit 1
           fi
 
-          # 先校验全部文件及目标路径，再发送带凭据的上传请求。
+          # Validate all files and target paths first, then send upload requests carrying credentials.
           upload_urls=()
           for wheel in "${wheels[@]}"; do
             if [[ ! -f "$wheel" || -L "$wheel" ]]; then
-              printf '%s\n' '::error::上传产物必须是普通 wheel 文件，不能是符号链接' >&2
+              printf '%s\n' '::error::the upload artifact must be a regular wheel file, not a symlink' >&2
               exit 1
             fi
             upload_url="$(python3 - "$wheel" <<'PY'
@@ -573,19 +573,19 @@ jobs:
               filename,
           )
           if match is None:
-              raise SystemExit("::error::wheel 文件名格式不合法")
+              raise SystemExit("::error::the wheel file name format is invalid")
           package_name = os.environ["PACKAGE_NAME"]
           if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name):
-              raise SystemExit("::error::package_name 必须是合法的 Python 包名")
+              raise SystemExit("::error::package_name must be a valid Python package name")
           normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
           if normalize(match["name"]) != normalize(package_name):
-              raise SystemExit("::error::wheel 包名与 package_name 不一致")
+              raise SystemExit("::error::the wheel package name does not match package_name")
           release_version = os.environ["RELEASE_VERSION"]
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+!\-]*", release_version):
-              raise SystemExit("::error::RELEASE_VERSION 必须是合法的版本目录名，不能包含路径或特殊字符")
+              raise SystemExit("::error::RELEASE_VERSION must be a valid version directory name without path or special characters")
           whl_name = os.environ["WHL_NAME"]
           if filename != whl_name:
-              raise SystemExit("::error::上传 wheel 文件名与 WHL_NAME 不一致")
+              raise SystemExit("::error::the uploaded wheel file name does not match WHL_NAME")
           components = (package_name, release_version, whl_name)
           print(os.environ["ARTIFACTORY_URL"].rstrip("/") + "/" + "/".join(quote(part, safe="") for part in components))
           PY
@@ -593,24 +593,24 @@ jobs:
             upload_urls+=("$upload_url")
           done
 
-          # 上传路径为包名/release_version/whl_name，构建方需保证不同矩阵配置的 wheel 文件名不冲突。
+          # The upload path is <package_name>/<release_version>/<whl_name>; builders must ensure wheel file names do not collide across matrix configurations.
           for index in "${!wheels[@]}"; do
             wheel="${wheels[$index]}"
-            # 不跟随重定向，避免向其他地址发送产物或发布凭据。
+            # Do not follow redirects to avoid sending artifacts or release credentials to other hosts.
             status="$(curl --fail --silent --show-error --retry 3 \
               --connect-timeout 30 --max-time 600 --proto '=https' \
               --user "$RELEASE_USERNAME:$RELEASE_TOKEN" \
               --upload-file "$wheel" --output /dev/null --write-out '%{http_code}' \
               -- "${upload_urls[$index]}")"
             if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-              printf '%s\n' "::error::Artifactory 上传失败，HTTP 状态码：$status" >&2
+              printf '%s\n' "::error::Artifactory upload failed, HTTP status: $status" >&2
               exit 1
             fi
-            printf '已上传 %s\n' "${wheel##*/}"
+            printf 'Uploaded %s\n' "${wheel##*/}"
           done
 
-      - name: 保存 GitHub Release wheel 产物
-        # 指定版本已通过矩阵校验和 rc 门禁，分支触发时也保存发布产物。
+      - name: Save GitHub Release wheel artifacts
+        # The specified version has passed matrix validation and the rc gate; also save release artifacts on branch triggers.
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' && (inputs.tag_version != '' || github.ref_type == 'tag') }}
         uses: actions/upload-artifact@v4
         with:
@@ -619,7 +619,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-      - name: 生成发布数据 JSON
+      - name: Generate release data JSON
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         env:
@@ -647,8 +647,8 @@ jobs:
           }
           index = os.environ["MATRIX_INDEX"]
           if not re.fullmatch(r"[0-9]+", index):
-              raise SystemExit("::error::矩阵索引必须是非负整数")
-          # 文件名包含矩阵索引，便于最后合并下载时保留每个成功任务的数据。
+              raise SystemExit("::error::the matrix index must be a non-negative integer")
+          # Include the matrix index in the file name so each successful job's data is kept when downloads are merged at the end.
           output = Path(os.environ["RUNNER_TEMP"]) / "release-data" / f"release-{index}.json"
           output.parent.mkdir(parents=True, exist_ok=True)
           content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
@@ -657,7 +657,7 @@ jobs:
           print(content, end="")
           PY
 
-      - name: 保存发布数据 JSON
+      - name: Save release data JSON
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
@@ -665,12 +665,12 @@ jobs:
           path: ${{ runner.temp }}/release-data/release-${{ strategy.job-index }}.json
           if-no-files-found: error
 
-      - name: 记录矩阵任务成功
+      - name: Record matrix job success
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         run: printf 'success\n' > "$RUNNER_TEMP/matrix-success.txt"
 
-      - name: 保存矩阵任务成功标记
+      - name: Save matrix job success marker
         if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
@@ -679,23 +679,23 @@ jobs:
           if-no-files-found: error
 
   publish-sdist:
-    name: 至少一个矩阵任务成功后发布源码包
+    name: Publish sdist after at least one matrix job succeeds
     needs: [prepare-matrix, build-sdist, matrix-job]
-    # 即使矩阵汇总为 failure 也检查成功标记；取消、跳过或源码包构建失败时不发布。
+    # Check success markers even when the matrix summary is failure; do not publish on cancellation, skip, or sdist build failure.
     if: ${{ !cancelled() && needs.prepare-matrix.outputs.should_release == 'true' && needs.build-sdist.result == 'success' && (needs.matrix-job.result == 'success' || needs.matrix-job.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       published: ${{ steps.publish.outcome == 'success' }}
     steps:
-      - name: 下载本次运行尝试的成功标记
+      - name: Download success markers for this run attempt
         uses: actions/download-artifact@v4
         with:
           pattern: ${{ needs.prepare-matrix.outputs.package_name }}-matrix-success-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: matrix-results
           merge-multiple: false
 
-      - name: 判断是否有矩阵任务成功
+      - name: Determine whether any matrix job succeeded
         id: matrix-success
         shell: bash
         run: |
@@ -709,10 +709,10 @@ jobs:
           )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"any_success={str(any_success).lower()}\n")
-          print("检测到成功任务，将发布源码包" if any_success else "没有成功的矩阵任务，跳过源码包发布")
+          print("Success detected, publishing sdist" if any_success else "No successful matrix jobs, skipping sdist publish")
           PY
 
-      - name: 下载待发布源码包
+      - name: Download sdist to publish
         if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
         uses: actions/download-artifact@v4
         with:
@@ -720,18 +720,18 @@ jobs:
           path: sdist-dist
           merge-multiple: true
 
-      - name: 配置源码包发布 Python
+      - name: Set up Python for sdist publish
         if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装 Twine
+      - name: Install Twine
         if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
         shell: bash
         run: python -m pip install --no-input twine
 
-      - name: 上传源码包到 Artifactory
+      - name: Upload sdist to Artifactory
         id: publish
         if: ${{ steps.matrix-success.outputs.any_success == 'true' }}
         shell: bash
@@ -743,15 +743,15 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.release_token }}
         run: |
           set -euo pipefail
-          : "${TWINE_USERNAME:?发布用户名不能为空}"
-          : "${TWINE_PASSWORD:?发布 token 不能为空}"
+          : "${TWINE_USERNAME:?release username must not be empty}"
+          : "${TWINE_PASSWORD:?release token must not be empty}"
           shopt -s nullglob
           archives=(sdist-dist/*.tar.gz)
           if (( ${#archives[@]} == 0 )); then
-            printf '%s\n' '::error::未找到待发布的源码包 tar.gz 文件' >&2
+            printf '%s\n' '::error::no sdist tar.gz file found to publish' >&2
             exit 1
           fi
-          # 所有产物与去重后的发布版本一一对应，全部校验通过后才开始上传。
+          # Every artifact must map one-to-one to a deduplicated release version; uploads start only after all validations pass.
           python3 - "${archives[@]}" <<'PY'
           import json
           import os
@@ -763,7 +763,7 @@ jobs:
 
           package_name = os.environ["PACKAGE_NAME"]
           if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name):
-              raise SystemExit("::error::package_name 必须是合法的 Python 包名")
+              raise SystemExit("::error::package_name must be a valid Python package name")
           try:
               entries = json.loads(os.environ["MATRIX_JSON"])["include"]
               if not isinstance(entries, list) or not entries:
@@ -775,45 +775,45 @@ jobs:
                       raise ValueError
                   expected.add(Version(version))
           except (KeyError, TypeError, ValueError, InvalidVersion):
-              raise SystemExit("::error::矩阵必须包含有效的 release_version")
+              raise SystemExit("::error::matrix must contain a valid release_version")
 
           found = set()
           for filename in sys.argv[1:]:
               archive = Path(filename)
               if not archive.is_file() or archive.is_symlink():
-                  raise SystemExit("::error::源码包必须是普通文件，不能是符号链接")
+                  raise SystemExit("::error::the sdist must be a regular file, not a symlink")
               if not archive.stat().st_size:
-                  raise SystemExit("::error::源码包不能为空")
+                  raise SystemExit("::error::the sdist must not be empty")
               if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+!\-]*\.tar\.gz", archive.name):
-                  raise SystemExit("::error::源码包文件名或版本不合法")
+                  raise SystemExit("::error::the sdist file name or version is invalid")
               try:
                   name, version = parse_sdist_filename(archive.name)
               except (InvalidSdistFilename, InvalidVersion):
-                  raise SystemExit("::error::源码包文件名或版本不合法")
+                  raise SystemExit("::error::the sdist file name or version is invalid")
               if name != canonicalize_name(package_name):
-                  raise SystemExit("::error::源码包包名与 package_name 不一致")
+                  raise SystemExit("::error::the sdist package name does not match package_name")
               if version not in expected or version in found:
-                  raise SystemExit("::error::源码包版本不在矩阵中或重复")
+                  raise SystemExit("::error::the sdist version is not in the matrix or is duplicated")
               found.add(version)
           if found != expected:
-              raise SystemExit("::error::源码包缺少矩阵中的 release_version")
+              raise SystemExit("::error::the sdist files are missing release_version entries from the matrix")
           PY
 
           for archive in "${archives[@]}"; do
             twine upload --repository-url "$ARTIFACTORY_URL" \
               --verbose --disable-progress-bar --non-interactive "$archive"
-            printf '已上传源码包 %s\n' "${archive##*/}"
+            printf 'Uploaded sdist %s\n' "${archive##*/}"
           done
 
   update-metadata:
     name: Update metadata
     needs: [prepare-matrix, publish-sdist]
-    # 允许部分 wheel 失败后的成功发布；源码包未实际上传、失败或取消时均不更新。
+    # Allow publishing after some wheels fail; never update when the sdist was not actually uploaded, failed, or was cancelled.
     if: ${{ !cancelled() && needs.prepare-matrix.outputs.should_release == 'true' && needs.publish-sdist.result == 'success' && needs.publish-sdist.outputs.published == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: 检出元数据工具
+      - name: Checkout metadata tools
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.template_repository }}
@@ -822,16 +822,16 @@ jobs:
           token: ${{ secrets.template_token || github.token }}
           persist-credentials: false
 
-      - name: 配置元数据更新 Python
+      - name: Set up Python for metadata update
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装元数据依赖
+      - name: Install metadata dependencies
         shell: bash
         run: python -m pip install --no-input requests packaging
 
-      - name: 生成并上传 index.json
+      - name: Generate and upload index.json
         shell: bash
         env:
           PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}
@@ -840,21 +840,21 @@ jobs:
         run: python ci-template/ci-workflows/release-pypi/scripts/get_metadata.py
 
   post-release-data:
-    name: 推送发布数据
+    name: Push release data
     needs: [prepare-matrix, update-metadata]
-    # 元数据成功更新后才推送；显式状态函数允许部分矩阵失败的发布流程继续。
+    # Push only after the metadata updates succeed; the explicit status functions let releases with partial matrix failures continue.
     if: ${{ !cancelled() && needs.prepare-matrix.outputs.should_release == 'true' && needs.update-metadata.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: 下载本次运行尝试的发布数据
+      - name: Download release data for this run attempt
         uses: actions/download-artifact@v4
         with:
           pattern: ${{ needs.prepare-matrix.outputs.package_name }}-release-data-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: release-data
           merge-multiple: true
 
-      - name: 检出发布数据工具
+      - name: Checkout release data tools
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.template_repository }}
@@ -863,16 +863,16 @@ jobs:
           token: ${{ secrets.template_token || github.token }}
           persist-credentials: false
 
-      - name: 配置发布数据 Python
+      - name: Set up Python for release data
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装发布数据依赖
+      - name: Install release data dependencies
         shell: bash
         run: python -m pip install --no-input requests cryptography
 
-      - name: 逐个推送发布数据
+      - name: Push release data one by one
         shell: bash
         env:
           PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}

@@ -1,4 +1,4 @@
-"""源码包条件发布的离线测试，模拟 artifact 传递和 Twine，验证多版本原样发布。"""
+"""Offline tests for conditional sdist publication, mocking artifact transfer and Twine, verifying multi-version uploads as-is."""
 
 from fnmatch import fnmatchcase
 import importlib.util
@@ -45,7 +45,7 @@ sys.exit(exit_code)
 ' "$@"
 }
 curl() {
-  printf "%s\n" "源码包不应再使用 curl" >&2
+  printf "%s\n" "sdist publish must not use curl anymore" >&2
   return 99
 }
 '''
@@ -124,10 +124,10 @@ def test_publish_waits_for_all_matrix_jobs_and_handles_aggregate_failure(publish
 
 def test_markers_only_follow_successful_wheel_upload(workflow, workspace, run_step):
     steps = workflow["jobs"]["matrix-job"]["steps"]
-    upload = next(step for step in steps if step.get("name") == "上传 wheel 到 Artifactory")
+    upload = next(step for step in steps if step.get("name") == "Upload wheel to Artifactory")
     create, save = steps[-2:]
     assert steps.index(upload) < steps.index(create)
-    assert create["name"] == "记录矩阵任务成功"
+    assert create["name"] == "Record matrix job success"
     assert save["uses"] == "actions/upload-artifact@v4"
     for step in (create, save):
         assert step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
@@ -198,7 +198,7 @@ def test_any_success_gate_and_conditional_upload(workflow, publish_job, workspac
                                                run_upload, outcomes, expected):
     save_name = workflow["jobs"]["matrix-job"]["steps"][-1]["with"]["name"]
     pattern = render_artifact_expression(publish_job["steps"][0]["with"]["pattern"])
-    # 即使旧尝试有成功记录，本次全部失败也不能误触发发布。
+    # Even if older attempts have success records, an all-failed current attempt must not trigger publishing by mistake.
     artifacts = [(render_artifact_expression(save_name, attempt="1"), "success\n")]
     for index, outcome in enumerate(outcomes):
         if outcome == "success":
@@ -217,7 +217,7 @@ def test_any_success_gate_and_conditional_upload(workflow, publish_job, workspac
         assert upload_result.returncode == 0, upload_result.stderr
         assert len(calls) == 1
     else:
-        assert "跳过源码包发布" in result.stdout
+        assert "skipping sdist publish" in result.stdout
         assert not (workspace / "twine-calls.jsonl").exists()
 
 
@@ -255,7 +255,7 @@ def test_twine_uploads_each_built_release_once_without_renaming(run_upload, work
         uploaded = workspace / args[-1]
         assert uploaded.parent == workspace / "sdist-dist"
         assert uploaded.read_bytes() == b"source archive test data"
-        assert f"已上传源码包 {uploaded.name}" in result.stdout
+        assert f"Uploaded sdist {uploaded.name}" in result.stdout
     assert len(list((workspace / "sdist-dist").iterdir())) == len(filenames)
     assert "test-release-token" not in result.stdout + result.stderr + str(calls)
     assert "test-release-user" not in result.stdout + result.stderr + str(calls)
@@ -327,7 +327,7 @@ def test_non_regular_source_archive_is_rejected(run_upload, workspace, kind):
         path.mkdir()
     result, calls = run_upload(())
     assert result.returncode != 0
-    assert "源码包必须是普通文件" in result.stderr
+    assert "the sdist must be a regular file" in result.stderr
     assert calls == []
 
 
@@ -339,7 +339,7 @@ def test_twine_failure_stops_remaining_uploads(run_upload, failure_at):
                               TEST_TWINE_FAIL_AT=str(failure_at), TEST_TWINE_EXIT="23")
     assert result.returncode == 23
     assert len(calls) == failure_at
-    assert result.stdout.count("已上传源码包") == failure_at - 1
+    assert result.stdout.count("Uploaded sdist") == failure_at - 1
 
 
 @pytest.mark.parametrize("exit_code", ["1", "2", "7"])
@@ -347,7 +347,7 @@ def test_upload_failure_propagates(run_upload, exit_code):
     result, calls = run_upload(TEST_TWINE_EXIT=exit_code)
     assert result.returncode == int(exit_code)
     assert len(calls) == 1
-    assert "已上传源码包" not in result.stdout
+    assert "Uploaded sdist" not in result.stdout
 
 
 @pytest.mark.parametrize("value", [
@@ -368,14 +368,14 @@ def test_invalid_matrix_fails_before_upload(run_upload, workspace, value):
 def test_missing_release_archive_blocks_all_uploads(run_upload):
     result, calls = run_upload(versions=[RELEASE_VERSION, "1.0.0+v0.3.0.sail2.1.0"])
     assert result.returncode != 0
-    assert "缺少矩阵中的 release_version" in result.stderr
+    assert "missing release_version" in result.stderr
     assert calls == []
 
 
 def test_duplicate_release_archive_blocks_all_uploads(run_upload):
     result, calls = run_upload((SDIST_NAME, f"demo-package-{RELEASE_VERSION}.tar.gz"))
     assert result.returncode != 0
-    assert "源码包版本不在矩阵中或重复" in result.stderr
+    assert "the sdist version is not in the matrix or is duplicated" in result.stderr
     assert calls == []
 
 
@@ -385,7 +385,7 @@ def test_empty_archive_blocks_all_uploads(run_upload, workspace):
     (directory / SDIST_NAME).touch()
     result, calls = run_upload(())
     assert result.returncode != 0
-    assert "源码包不能为空" in result.stderr
+    assert "the sdist must not be empty" in result.stderr
     assert calls == []
 
 
@@ -484,7 +484,7 @@ def test_update_metadata_gate_requires_actual_sdist_publication(
         "${{ !cancelled() && needs.prepare-matrix.outputs.should_release == 'true' && "
         "needs.publish-sdist.result == 'success' && needs.publish-sdist.outputs.published == 'true' }}"
     )
-    # 显式状态函数允许矩阵部分失败后继续，但不允许未上传、失败或取消时更新。
+    # The explicit status-function condition allows continuing after partial matrix failures, but forbids updating when nothing was uploaded, publishing failed, or the run was cancelled.
     values = {
         "!cancelled()": str(not cancelled),
         "needs.prepare-matrix.outputs.should_release": repr(should_release),
@@ -516,7 +516,7 @@ def metadata_script(monkeypatch):
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module.requests.sessions.Session, "request",
-                        Mock(side_effect=AssertionError("测试禁止真实网络请求")))
+                        Mock(side_effect=AssertionError("real network requests are forbidden in this test")))
     monkeypatch.setattr(module.requests, "post", Mock(return_value=metadata_response(
         200, {"results": [metadata_wheel()], "range": {"total": 1}}
     )))
@@ -622,7 +622,7 @@ def test_metadata_sail_version_flows_from_artifact_path_to_public_index(metadata
     grouped = metadata_script.get_target_data("demo_package", items)
     assert len(grouped) == 1
     assert next(iter(grouped.values()))[0]["metadata"]["sdk_version"] == sdk
-    # 内部字段更名不能改变安装模板使用的公开索引结构。
+    # Renaming internal fields must not change the public index structure used by the install template.
     assert metadata_script.get_target_json_data("demo_package", grouped) == {
         "name": "demo_package", "release": [{
             "version": "1.0.0", "sub_version": sub, "torch": "2.10.0", "os": "ubuntu2404",
@@ -677,7 +677,7 @@ def test_metadata_cli_writes_index_and_uploads_exact_file_bytes(metadata_script,
     assert kwargs["allow_redirects"] is False
     assert kwargs["timeout"] == (30, 300)
     output = capsys.readouterr()
-    assert "已生成 index.json 并上传" in output.out
+    assert "index.json generated and uploaded" in output.out
     assert "test-release-user" not in output.out + output.err
     assert "test-release-token" not in output.out + output.err
 
@@ -687,21 +687,21 @@ def test_metadata_cli_writes_index_and_uploads_exact_file_bytes(metadata_script,
 def test_metadata_http_failure_blocks_success(metadata_script, metadata_env, capsys, stage, status):
     module = metadata_script
     getattr(module.requests, stage).return_value = metadata_response(status)
-    with pytest.raises(SystemExit, match=f"更新元数据失败.*HTTP {status}"):
+    with pytest.raises(SystemExit, match=f"failed to update metadata.*HTTP {status}"):
         runpy.run_path(str(CI_ROOT / "scripts/get_metadata.py"), run_name="__main__")
     if stage != "put":
         module.requests.put.assert_not_called()
         assert not metadata_env.exists()
     if stage == "post":
         module.requests.get.assert_not_called()
-    assert "已生成 index.json 并上传" not in capsys.readouterr().out
+    assert "index.json generated and uploaded" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("stage", ["post", "get", "put"])
 def test_metadata_network_timeout_fails_job(metadata_script, metadata_env, stage):
     module = metadata_script
-    getattr(module.requests, stage).side_effect = module.requests.Timeout("连接超时")
-    with pytest.raises(SystemExit, match="更新元数据失败.*连接超时"):
+    getattr(module.requests, stage).side_effect = module.requests.Timeout("connection timeout")
+    with pytest.raises(SystemExit, match="failed to update metadata.*connection timeout"):
         runpy.run_path(str(CI_ROOT / "scripts/get_metadata.py"), run_name="__main__")
     if stage != "put":
         module.requests.put.assert_not_called()
@@ -712,9 +712,9 @@ def test_metadata_network_timeout_fails_job(metadata_script, metadata_env, stage
 def test_metadata_invalid_json_never_overwrites_index(metadata_script, metadata_env, stage):
     module = metadata_script
     response = metadata_response(200)
-    response.json.side_effect = ValueError("JSON 解析失败")
+    response.json.side_effect = ValueError("JSON parse failure")
     getattr(module.requests, stage).return_value = response
-    with pytest.raises(ValueError, match="JSON 解析失败"):
+    with pytest.raises(ValueError, match="JSON parse failure"):
         module.main()
     module.requests.put.assert_not_called()
     assert not metadata_env.exists()
@@ -739,7 +739,7 @@ def test_metadata_invalid_or_truncated_aql_never_uploads(metadata_script, metada
 def test_metadata_invalid_old_index_never_uploads(metadata_script, metadata_env, payload):
     module = metadata_script
     module.requests.get.return_value = metadata_response(200, payload)
-    with pytest.raises(ValueError, match="格式或包名不正确"):
+    with pytest.raises(ValueError, match="format or package name is incorrect"):
         module.main()
     module.requests.put.assert_not_called()
     assert not metadata_env.exists()
@@ -751,7 +751,7 @@ def test_metadata_invalid_old_index_never_uploads(metadata_script, metadata_env,
 def test_metadata_empty_or_unusable_wheels_never_replace_index(metadata_script, metadata_env, items):
     module = metadata_script
     module.requests.post.return_value = metadata_response(200, {"results": items})
-    with pytest.raises(ValueError, match="拒绝上传空索引"):
+    with pytest.raises(ValueError, match="refusing to upload an empty index"):
         module.main()
     module.requests.put.assert_not_called()
     assert not metadata_env.exists()

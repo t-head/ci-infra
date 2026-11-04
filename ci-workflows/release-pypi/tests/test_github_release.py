@@ -1,4 +1,4 @@
-"""GitHub Release wheel 产物保存测试；当前工作流不包含 Release API 发布任务。"""
+"""Tests for GitHub Release wheel artifact saving; the current workflow does not include a Release API publish job."""
 
 import base64
 from fnmatch import fnmatchcase
@@ -32,15 +32,15 @@ def workflow():
 @pytest.fixture
 def wheel_artifact(workflow):
     return next(step for step in workflow["jobs"]["matrix-job"]["steps"]
-                if step.get("name") == "保存 GitHub Release wheel 产物")
+                if step.get("name") == "Save GitHub Release wheel artifacts")
 
 
 def test_tag_artifact_follows_upload_and_precedes_success_marker(workflow, wheel_artifact):
     steps = workflow["jobs"]["matrix-job"]["steps"]
     index = steps.index(wheel_artifact)
-    assert steps[index - 1]["name"] == "上传 wheel 到 Artifactory"
+    assert steps[index - 1]["name"] == "Upload wheel to Artifactory"
     assert [step["name"] for step in steps[index + 1:]] == [
-        "生成发布数据 JSON", "保存发布数据 JSON", "记录矩阵任务成功", "保存矩阵任务成功标记",
+        "Generate release data JSON", "Save release data JSON", "Record matrix job success", "Save matrix job success marker",
     ]
     assert wheel_artifact["if"] == (
         "${{ needs.prepare-matrix.outputs.should_release == 'true' && "
@@ -73,9 +73,9 @@ def test_wheel_artifact_accepts_validated_override(wheel_artifact, tag_version, 
     ("github.run_attempt", "1"),
 ])
 @pytest.mark.parametrize("step_name,label", [
-    ("保存收集的 wheel 产物", "collected-wheels"),
-    ("保存 GitHub Release wheel 产物", "release-wheels"),
-    ("保存发布数据 JSON", "release-data"),
+    ("Save collected wheel artifacts", "collected-wheels"),
+    ("Save GitHub Release wheel artifacts", "release-wheels"),
+    ("Save release data JSON", "release-data"),
 ])
 def test_artifact_names_are_isolated_by_package_run_attempt_and_matrix(workflow, field, other, step_name, label):
     artifact = next(step for step in workflow["jobs"]["matrix-job"]["steps"] if step["name"] == step_name)
@@ -97,21 +97,21 @@ def test_artifact_names_are_isolated_by_package_run_attempt_and_matrix(workflow,
 
 def test_release_data_is_saved_after_publication_without_tag_only_gate(workflow):
     steps = workflow["jobs"]["matrix-job"]["steps"]
-    generate = next(step for step in steps if step["name"] == "生成发布数据 JSON")
+    generate = next(step for step in steps if step["name"] == "Generate release data JSON")
     save = steps[steps.index(generate) + 1]
-    assert steps.index(generate) > next(i for i, step in enumerate(steps) if step["name"] == "上传 wheel 到 Artifactory")
+    assert steps.index(generate) > next(i for i, step in enumerate(steps) if step["name"] == "Upload wheel to Artifactory")
     assert generate["shell"] == "bash"
     assert generate["env"] == {
         "PACKAGE_NAME": "${{ needs.prepare-matrix.outputs.package_name }}",
         "MATRIX_JSON": "${{ toJSON(matrix) }}",
         "MATRIX_INDEX": "${{ strategy.job-index }}",
     }
-    assert save["name"] == "保存发布数据 JSON"
+    assert save["name"] == "Save release data JSON"
     assert save["uses"] == "actions/upload-artifact@v4"
     assert save["with"]["path"] == "${{ runner.temp }}/release-data/release-${{ strategy.job-index }}.json"
     assert save["with"]["if-no-files-found"] == "error"
     for step in (generate, save):
-        # 默认 success() 保证编译或上传失败时跳过；合格分支与 tag 均可保存。
+        # Default success() ensures skipping on build or upload failure; both qualifying branches and tags can save.
         assert step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
         assert "continue-on-error" not in step
         assert "secrets." not in str(step)
@@ -164,7 +164,7 @@ def test_post_job_downloads_current_release_data_and_limits_secret_scope(workflo
 
 
 def test_post_download_pattern_matches_all_current_matrix_records(workflow):
-    save = next(step for step in workflow["jobs"]["matrix-job"]["steps"] if step["name"] == "保存发布数据 JSON")
+    save = next(step for step in workflow["jobs"]["matrix-job"]["steps"] if step["name"] == "Save release data JSON")
     download = workflow["jobs"]["post-release-data"]["steps"][0]
 
     def render(expression, **overrides):
@@ -223,7 +223,7 @@ def post_script(monkeypatch):
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module.requests.adapters.HTTPAdapter, "send",
-                        Mock(side_effect=AssertionError("测试禁止真实网络请求")))
+                        Mock(side_effect=AssertionError("test forbids real network requests")))
     monkeypatch.setattr(module.requests, "post", Mock(return_value=post_response()))
     return module
 
@@ -270,7 +270,7 @@ def api_client(post_script, open_api_env):
 
 @pytest.fixture
 def decode_request(api_keys):
-    """使用独立密钥验签、解密实际请求体，不复用生产代码的加密辅助函数。"""
+    """Independently verify signatures and decrypt actual request bodies; do not reuse production encryption helpers."""
     server_key, client_key = api_keys
 
     def decode(call):
@@ -311,7 +311,7 @@ def post_workspace(monkeypatch, open_api_env):
 
 @pytest.fixture
 def run_post_cli(post_workspace, post_script, monkeypatch):
-    """临时副本仅注入三个公共常量，保留真实 CLI 入口和私钥读取逻辑。"""
+    """A temporary copy injects only the three public constants, preserving the real CLI entry and private-key reading logic."""
     source = (CI_ROOT / "scripts/post_data.py").read_text(encoding="utf-8")
     names = ("OPEN_API_BASE_URL", "OPEN_API_CLIENT_ID", "SERVER_PUBLIC_KEY_B64")
     lines = []
@@ -441,7 +441,7 @@ def test_post_main_sends_one_request_per_json(
         assert "auth" not in call.kwargs
     assert [path.read_bytes() for path in files] == originals
     output = capsys.readouterr()
-    assert "共推送 2 条发布数据" in output.out
+    assert "Pushed 2 release data records in total" in output.out
     for name in ("SERVER_PUBLIC_KEY_B64", "CLIENT_PRIVATE_KEY_B64"):
         assert open_api_env[name] not in output.out + output.err
 
@@ -455,7 +455,7 @@ def test_post_http_failure_stops_without_retry(post_script, post_workspace, rele
     with pytest.raises(ValueError, match=f"HTTP {status}"):
         post_script.main(["--input-dir", "release-data"])
     assert post_script.requests.post.call_count == failure_at
-    assert capsys.readouterr().out.count("已推送发布数据") == failure_at - 1
+    assert capsys.readouterr().out.count("Pushed release data") == failure_at - 1
 
 
 @pytest.mark.parametrize("error_type", ["Timeout", "ConnectionError", "InvalidHeader"])
@@ -465,7 +465,7 @@ def test_post_network_errors_do_not_expose_keys(
     (post_workspace / "release-data/release-0.json").write_text(json.dumps(release_record))
     secret = open_api_env["CLIENT_PRIVATE_KEY_B64"]
     post_script.requests.post.side_effect = getattr(post_script.requests.exceptions, error_type)(secret)
-    with pytest.raises(SystemExit, match=f"推送发布数据失败.*{error_type}") as error:
+    with pytest.raises(SystemExit, match=f"failed to push release data.*{error_type}") as error:
         run_post_cli()
     output = capsys.readouterr()
     assert secret not in str(error.value) + output.out + output.err
@@ -474,12 +474,12 @@ def test_post_network_errors_do_not_expose_keys(
 
 @pytest.fixture
 def redirect_transport(post_script, monkeypatch, post_workspace):
-    """只替换网络发送层，确认 requests 不会跟随重定向。"""
+    """Only replace the network sending layer; confirm requests does not follow redirects."""
     responses, sent = [], []
 
     def send(adapter, request, **kwargs):
         sent.append(request)
-        assert responses, "出现未预期的网络请求"
+        assert responses, "unexpected network request detected"
         result = responses.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -515,7 +515,7 @@ def test_signed_requests_never_follow_redirects(api_client, redirect_transport, 
 @pytest.mark.parametrize("content_type", ["text/html; charset=UTF-8", "application/xhtml+xml"])
 def test_html_is_not_reported_as_success(post_script, api_client, capsys, content_type):
     post_script.requests.post.return_value = post_response(content_type=content_type)
-    with pytest.raises(ValueError, match="可能进入登录页面"):
+    with pytest.raises(ValueError, match="possibly a login page"):
         api_client.save_artifact({})
     post_script.requests.post.assert_called_once()
     assert "HTTP 200" in capsys.readouterr().out
@@ -529,19 +529,19 @@ def test_http_diagnostics_do_not_log_credentials_cookies_body_or_control_lines(p
     post_script.requests.post.return_value = response
     with pytest.raises(ValueError, match="HTTP 302"):
         api_client.save_artifact({})
-    assert capsys.readouterr().out == "发布数据接口响应：HTTP 302\n"
+    assert capsys.readouterr().out == "Release data API response: HTTP 302\n"
 
 
 def test_open_api_encrypts_unicode_and_signs_exact_body(post_script, api_client, decode_request, monkeypatch):
     monkeypatch.setattr(post_script.time, "time", lambda: 1700000000.123)
-    payload = {"item": "测试包", "nested": {"value": ["数据", 1]}}
+    payload = {"item": "test_package", "nested": {"value": ["data", 1]}}
     original = json.dumps(payload)
     response = api_client.save_artifact(payload)
     call = post_script.requests.post.call_args
     assert response is post_script.requests.post.return_value
     assert call.kwargs["headers"]["X-Open-Timestamp"] == "1700000000123"
     assert decode_request(call) == payload
-    assert "测试包".encode("utf-8") not in call.kwargs["data"]
+    assert "test_package".encode("utf-8") not in call.kwargs["data"]
     assert json.dumps(payload) == original
 
 
@@ -561,7 +561,7 @@ def test_open_api_rejects_invalid_keys_without_logging_values(
     post_script, open_api_env, monkeypatch, capsys, name, value
 ):
     set_open_api_value(post_script, monkeypatch, name, value)
-    with pytest.raises(ValueError, match="密钥加载失败") as error:
+    with pytest.raises(ValueError, match="failed to load keys") as error:
         post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
     output = capsys.readouterr()
     assert value not in str(error.value) + output.out + output.err
@@ -576,7 +576,7 @@ def test_open_api_rejects_non_rsa_keys(post_script, open_api_env, monkeypatch, n
     else:
         der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
     set_open_api_value(post_script, monkeypatch, name, base64.b64encode(der).decode("ascii"))
-    with pytest.raises(ValueError, match="必须是 RSA 密钥"):
+    with pytest.raises(ValueError, match="must be RSA keys"):
         post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
     post_script.requests.post.assert_not_called()
 
@@ -649,7 +649,7 @@ def test_post_validates_all_files_before_sending(post_script, post_workspace, re
 def test_post_invalid_source_types_block_all_requests(post_script, post_workspace, release_record, overrides):
     (post_workspace / "release-data/release-0.json").write_text(json.dumps(release_record))
     (post_workspace / "release-data/release-1.json").write_text(json.dumps({**release_record, **overrides}))
-    # 当前脚本直接操作字符串；坏输入会抛出属性错误，但不得发送任何请求。
+    # Current script operates on strings directly; bad input raises attribute errors but must not send any request.
     with pytest.raises(AttributeError):
         post_script.main(["--input-dir", "release-data"])
     post_script.requests.post.assert_not_called()
@@ -671,7 +671,7 @@ def test_post_missing_source_field_blocks_all_requests(post_script, post_workspa
 def test_post_unsupported_os_blocks_all_requests(post_script, post_workspace, release_record, os_type):
     (post_workspace / "release-data/release-0.json").write_text(json.dumps(release_record))
     (post_workspace / "release-data/release-1.json").write_text(json.dumps({**release_record, "osTypeList": os_type}))
-    with pytest.raises(ValueError, match="osTypeList 不在支持的列表中"):
+    with pytest.raises(ValueError, match="osTypeList is not in the supported list"):
         post_script.main(["--input-dir", "release-data"])
     post_script.requests.post.assert_not_called()
 
