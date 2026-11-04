@@ -159,10 +159,16 @@ def fake_command(tool, args):
                 print(args[1] + "/old-resource")
             return 0
         if args[0] == "logs":
-            if args[1] != os.environ["JOB_NAME"] + "-worker-0":
-                raise ValueError("Only worker-0 logs may be streamed")
+            pod_name = args[1]
+            worker_zero = os.environ["JOB_NAME"] + "-worker-0"
             if any(arg.startswith(("--tail", "--since")) for arg in args):
-                raise ValueError("Early logs must not be filtered")
+                raise ValueError("Worker logs must not be filtered")
+            if pod_name != worker_zero:
+                lines = fixture.get("pod_logs", {}).get(pod_name)
+                if lines is None or fixture.get("failed_log_error"):
+                    return 42
+                print("\n".join(lines), flush=True)
+                return 0
             if fixture.get("first_log_error") and not (root / "log-failed").exists():
                 (root / "log-failed").touch()
                 return 42
@@ -939,6 +945,47 @@ class LifecycleTests(unittest.TestCase):
                 self.assert_reported(outputs, "failed", 2)
                 self.assertEqual(int((self.root / "clock").read_text()), EPOCH)
 
+    def test_master_monitor_prints_failed_worker_logs_before_reporting(self):
+        failed_name = self.env["JOB_NAME"] + "-worker-1"
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH),
+                        pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 4)],
+                       pod_logs={failed_name: ["worker-1 setup", "worker-1 failure"]})
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "failed", 2)
+        heading = f"::group::Failed worker log: {failed_name}"
+        self.assertIn(heading, text)
+        self.assertIn("worker-1 setup\nworker-1 failure\n::endgroup::", text)
+        self.assertLess(text.index(heading), text.index("Job: "))
+        self.assertNotIn(f"::group::Failed worker log: {self.env['JOB_NAME']}-worker-0", text)
+        calls = [call["args"] for call in self.calls("kubectl")
+                 if call["args"][:1] == ["logs"] and call["args"][1] == failed_name]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--timestamps=true", calls[0])
+
+    def test_failed_worker_log_error_does_not_replace_job_result(self):
+        failed_name = self.env["JOB_NAME"] + "-worker-1"
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH),
+                        pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 4)],
+                       failed_log_error=True)
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "failed", 2)
+        self.assertIn("Unable to read the failed worker log before cleanup", text)
+
+    def test_master_timeout_prints_failed_worker_log(self):
+        failed_name = self.env["JOB_NAME"] + "-worker-1"
+        worker = pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 60)
+        worker["status"]["containerStatuses"][0]["state"]["terminated"].update(
+            exitCode=124, message=json.dumps({"source": "cluster-master-runtime", "outcome": "timeout",
+                                             "deadline": EPOCH + 60, "rank": 1}))
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH), worker],
+                       pod_logs={failed_name: ["worker-1 deadline exceeded"]})
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "timeout", 2)
+        self.assertIn("worker-1 deadline exceeded", text)
+
     def test_master_monitor_missing_or_abnormal_worker_never_reports_success(self):
         for state in ("missing", "Unknown", "Succeeded", "deleting", "init-failed"):
             with self.subTest(state=state):
@@ -951,12 +998,17 @@ class LifecycleTests(unittest.TestCase):
                 if state == "init-failed":
                     worker["status"]["initContainerStatuses"] = [{"name": "setup", "state": {
                         "terminated": {"exitCode": 7, "reason": "Error", "finishedAt": timestamp(EPOCH + 2)}}}]
-                self.configure([master] if state == "missing" else [master, worker])
+                options = {}
+                if state == "init-failed":
+                    options["pod_logs"] = {self.env["JOB_NAME"] + "-worker-1": ["init failure"]}
+                self.configure([master] if state == "missing" else [master, worker], **options)
                 rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
                 self.assertEqual(rc, 0, text)
                 self.assertEqual(outputs["job_status"], "failed", text)
                 self.assertEqual(int((self.root / "clock").read_text()), EPOCH,
                                  "Broken SSH workers must fail without an unbounded wait")
+                if state == "init-failed":
+                    self.assertIn("init failure", text)
 
     def test_master_monitor_missing_master_fails(self):
         self.configure([pod(1, "Running", EPOCH, started=EPOCH)])

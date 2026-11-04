@@ -31,6 +31,24 @@ set_output() {
 }
 set_output "job_status" "$FINAL_STATUS"
 
+print_failed_worker_logs() {
+  local pod
+  while IFS= read -r pod; do
+    [ -n "$pod" ] || continue
+    echo "::group::Failed worker log: $pod"
+    if ! timeout --signal=TERM --kill-after=2s 10s \
+      kubectl logs "$pod" -c worker -n "$NAMESPACE" --timestamps=true; then
+      echo "Unable to read the failed worker log before cleanup: $pod"
+    fi
+    echo "::endgroup::"
+  done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '
+    .items[] |
+    select(.status.phase == "Failed" or
+      any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or
+      any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0)) |
+    .metadata.name' | sort -u)
+}
+
 _on_exit() {
   local rc=$?
   trap - EXIT TERM INT
@@ -155,6 +173,7 @@ while true; do
     ABNORMAL=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(._cluster_timeout != true and (.metadata.deletionTimestamp != null or .status.phase == "Unknown" or (.status.phase != "Failed" and (any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0)))))] | length')
     if [ "$ABNORMAL" -gt 0 ]; then
       echo "::error::Master allocation contains a deleting, unknown or initialization-failed pod"
+      print_failed_worker_logs
       FINAL_STATUS="failed"
       exit 0
     fi
@@ -230,6 +249,7 @@ while true; do
     case "$W0_PHASE" in Succeeded|Failed) DRAIN_LOGS=true ;; esac
     if [ "$FAILED" -gt 0 ]; then
       echo "::error::Worker execution failed (failed=$FAILED)"
+      print_failed_worker_logs
       FINAL_STATUS="failed"
       exit 0
     fi
@@ -256,6 +276,7 @@ while true; do
   if [ "$TIMED_OUT" -gt 0 ]; then
     FINAL_STATUS="timeout"
     echo "::error::Master allocation reached its framework deadline"
+    print_failed_worker_logs
     exit 0
   fi
 
