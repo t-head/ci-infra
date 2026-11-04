@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 
-from validate_inputs import REGISTRY, REPOSITORY, image_reference
+from validate_inputs import REGISTRY, RELEASE_REPOSITORIES, github_image_prefix, image_reference
 
 
 INDEX_TYPES = {
@@ -59,12 +59,25 @@ def manifest_size(manifest):
     return size
 
 
-def inspect_image_size(image, digest):
-    prefix = f"{REGISTRY}/{REPOSITORY}/"
-    if not isinstance(image, str) or not image.startswith(prefix):
-        raise ValueError("IMAGE must be an image in the fixed docker_release repository")
-    name, separator, tag = image[len(prefix):].rpartition(":")
-    if not separator or image_reference(name, tag) != image:
+def inspect_image_size(image, digest, github_repository=""):
+    if not isinstance(image, str):
+        raise ValueError("IMAGE must be a string")
+    if image.startswith("ghcr.io/"):
+        prefix = github_image_prefix(github_repository)
+        if not image.startswith(prefix):
+            raise ValueError("IMAGE must belong to the caller GitHub repository")
+        name, separator, tag = image[len(prefix):].rpartition(":")
+        valid_image = separator and image_reference(name, tag, github_repository=github_repository)
+    else:
+        prefix = f"{REGISTRY}/"
+        if not image.startswith(prefix):
+            raise ValueError("IMAGE must be an image in GHCR or the T-Head registry")
+        image_repository, _, reference = image[len(prefix):].partition("/")
+        if image_repository not in RELEASE_REPOSITORIES.values():
+            raise ValueError("IMAGE must be in the docker_release or docker_tmp repository")
+        name, separator, tag = reference.rpartition(":")
+        valid_image = separator and image_reference(name, tag, image_repository)
+    if valid_image != image:
         raise ValueError("IMAGE must contain a valid image name and tag")
     repository = image.rsplit(":", 1)[0]
     manifest = fetch_manifest(repository, digest)
@@ -94,7 +107,10 @@ def main():
         output_path = os.environ.get("GITHUB_OUTPUT", "")
         if not output_path:
             raise ValueError("GITHUB_OUTPUT must not be empty")
-        size = inspect_image_size(os.environ.get("IMAGE", ""), os.environ.get("DIGEST", ""))
+        size = inspect_image_size(
+            os.environ.get("IMAGE", ""), os.environ.get("DIGEST", ""),
+            os.environ.get("GITHUB_REPOSITORY", ""),
+        )
         with open(output_path, "a", encoding="utf-8") as output:
             output.write(f"size={size}\n")
         print(f"Pushed image size (config + layers): {size} bytes")

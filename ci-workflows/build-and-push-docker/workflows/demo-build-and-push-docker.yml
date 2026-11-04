@@ -1,10 +1,32 @@
-name: Demo Build And Push Release Docker
+name: Demo Build And Push Docker
 
 # Copy to .github/workflows/demo-build-and-push-docker.yml in the caller repository.
-# Manual runs build and push a real image and publish metadata; use only trusted branches and Dockerfiles.
+# 手动运行会推送真实镜像；仅当目标包含 t-head、release_type=release 且 publish_data=true 时发布元数据。仅使用可信分支和 Dockerfile。
 on:
   workflow_dispatch:
     inputs:
+      release_type:
+        description: 'Release type'
+        required: false
+        type: choice
+        default: tmp
+        options:
+          - release
+          - tmp
+      publish_data:
+        description: 'Publish release metadata (only when the target includes t-head and release_type is release)'
+        required: false
+        type: boolean
+        default: false
+      push_target:
+        description: 'Image push target'
+        required: false
+        type: choice
+        default: github
+        options:
+          - github
+          - t-head
+          - github/t-head
       dockerfile:
         description: 'Dockerfile path relative to the caller repository root'
         required: false
@@ -66,6 +88,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   publish:
@@ -73,6 +96,9 @@ jobs:
     # For production, pin both @main and template_ref to the same full commit SHA in the template repository.
     uses: t-head/ci-infra/.github/workflows/build-and-push-docker.yml@main
     with:
+      release_type: ${{ inputs.release_type }}
+      publish_data: ${{ inputs.publish_data }}
+      push_target: ${{ inputs.push_target }}
       dockerfile: ${{ inputs.dockerfile || 'Dockerfile' }}
       build_context: ${{ inputs.build_context || '.' }}
       build_args: ${{ inputs.build_args || '' }}
@@ -104,8 +130,10 @@ jobs:
         shell: bash
         env:
           IMAGE: ${{ needs.publish.outputs.image }}
+          GITHUB_IMAGE: ${{ needs.publish.outputs.github_image }}
+          T_HEAD_IMAGE: ${{ needs.publish.outputs.t_head_image }}
           DIGEST: ${{ needs.publish.outputs.digest }}
           SIZE: ${{ needs.publish.outputs.size }}
         run: |
           set -euo pipefail
-          printf 'Image address: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGE" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Image address: %s\nGitHub image: %s\nT-Head image: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGE" "$GITHUB_IMAGE" "$T_HEAD_IMAGE" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"
