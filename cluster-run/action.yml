@@ -12,6 +12,18 @@ branding:
   color: 'blue'
 
 inputs:
+  launch_mode:
+    description: 'each-node executes command on every pod; master prepares passwordless SSH and executes command only on worker-0.'
+    required: false
+    default: 'each-node'
+  setup_command:
+    description: 'Initialization script executed on every node before command; master mode establishes passwordless SSH first. Exported variables are retained.'
+    required: false
+    default: ''
+  ssh_port:
+    description: 'Preferred SSH port in master mode; busy ports fall back automatically to a per-node port in 20000-24999.'
+    required: false
+    default: '2222'
   nnodes:
     description: 'Use 0 for one standalone worker pod; positive values specify the pod count in gang mode.'
     required: false
@@ -22,12 +34,12 @@ inputs:
     default: '1'
   command:
     description: >-
-      Custom launch command (required), passed unchanged to the worker pod's shell.
-      The command can reference the injected distributed environment variables: $RANK $NODE_RANK $LOCAL_RANK $WORLD_SIZE
-      $NNODES $NPROC_PER_NODE $MASTER_ADDR $MASTER_PORT.
+      Foreground launch command (required), executed on each node or only worker-0 according to launch_mode.
+      The command can reference $RANK $NODE_RANK $LOCAL_RANK $WORLD_SIZE $NNODES $NPROC_PER_NODE $MASTER_ADDR $MASTER_PORT.
+      Multi-node master mode also provides CLUSTER_HOSTS_FILE and CLUSTER_NODES_FILE, plus cluster-ssh and cluster-exec.
     required: true
   image:
-    description: 'Training/inference container image (required; must include the job code and dependencies).'
+    description: 'Workload image with code/framework dependencies; multi-node master requires a writable root Debian/Ubuntu/CentOS/Alibaba Cloud Linux image with package-manager and trust tooling.'
     required: true
   namespace:
     description: 'K8s namespace.'
@@ -194,6 +206,8 @@ runs:
         INPUT_IMAGE: ${{ inputs.image }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_NNODES: ${{ inputs.nnodes }}
+        INPUT_LAUNCH_MODE: ${{ inputs.launch_mode }}
+        INPUT_SSH_PORT: ${{ inputs.ssh_port }}
       run: |
         echo "::group::Check action inputs and PodGroup availability"
         if [ -z "$INPUT_IMAGE" ]; then
@@ -202,6 +216,18 @@ runs:
         fi
         if [ -z "$INPUT_COMMAND" ]; then
           echo "::error::Input 'command' is required"
+          exit 1
+        fi
+        case "$INPUT_LAUNCH_MODE" in
+          each-node|master) ;;
+          *) echo "::error::launch_mode must be each-node or master"; exit 1 ;;
+        esac
+        if ! [[ "$INPUT_NNODES" =~ ^(0|[1-9][0-9]*)$ ]]; then
+          echo "::error::nnodes must be a nonnegative integer"
+          exit 1
+        fi
+        if ! [[ "$INPUT_SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$INPUT_SSH_PORT" -gt 65535 ]; then
+          echo "::error::ssh_port must be between 1 and 65535"
           exit 1
         fi
         if [ "$INPUT_NNODES" != "0" ]; then
@@ -294,6 +320,9 @@ runs:
       env:
         INPUT_NNODES: ${{ inputs.nnodes }}
         INPUT_NPROC_PER_NODE: ${{ inputs.nproc_per_node }}
+        INPUT_LAUNCH_MODE: ${{ inputs.launch_mode }}
+        INPUT_SETUP_COMMAND: ${{ inputs.setup_command }}
+        INPUT_SSH_PORT: ${{ inputs.ssh_port }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_IMAGE: ${{ inputs.image }}
         INPUT_NAMESPACE: ${{ inputs.namespace }}
@@ -323,6 +352,8 @@ runs:
         JOB_NAME: ${{ steps.naming.outputs.job_name }}
         JOB_START_TIME: ${{ steps.submit.outputs.start_time }}
         JOB_DEADLINE: ${{ steps.submit.outputs.deadline }}
+        INPUT_LAUNCH_MODE: ${{ inputs.launch_mode }}
+        MASTER_RUNTIME_DIR: ${{ steps.submit.outputs.master_runtime_dir }}
         INPUT_NAMESPACE: ${{ inputs.namespace }}
         INPUT_NNODES: ${{ inputs.nnodes }}
         INPUT_NPROC_PER_NODE: ${{ inputs.nproc_per_node }}
@@ -337,6 +368,8 @@ runs:
         INPUT_NAMESPACE: ${{ inputs.namespace }}
         INPUT_NNODES: ${{ inputs.nnodes }}
         INPUT_CLEANUP_POLICY: ${{ inputs.cleanup_policy }}
+        INPUT_LAUNCH_MODE: ${{ inputs.launch_mode }}
+        MASTER_RUNTIME_DIR: ${{ steps.submit.outputs.master_runtime_dir }}
         INPUT_JOB_STATUS: ${{ steps.monitor.outputs.job_status || steps.submit.outputs.job_status }}
         INPUT_WORKFLOW_STATUS: ${{ job.status }}
         SOURCE_STAGE_DIR: ${{ env.SOURCE_STAGE_DIR }}
