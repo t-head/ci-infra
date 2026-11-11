@@ -4,13 +4,21 @@ on:
   pull_request:
     paths:
       - 'ci-workflows/release-pypi/**'
+      - 'ci-workflows/upload-artifact-properties/**'
       - '.github/workflows/matrix-release.yml'
+      - '.github/workflows/nightly-build.yml'
+      - '.github/workflows/upload-artifact-properties.yml'
+      - '.github/workflows/demo-upload-artifact-properties.yml'
       - '.github/workflows/release-pypi-ci.yml'
   push:
     branches: [main]
     paths:
       - 'ci-workflows/release-pypi/**'
+      - 'ci-workflows/upload-artifact-properties/**'
       - '.github/workflows/matrix-release.yml'
+      - '.github/workflows/nightly-build.yml'
+      - '.github/workflows/upload-artifact-properties.yml'
+      - '.github/workflows/demo-upload-artifact-properties.yml'
       - '.github/workflows/release-pypi-ci.yml'
 
 permissions:
@@ -43,4 +51,4 @@ jobs:
       - name: Run offline tests
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m pytest ci-workflows/release-pypi/tests -q -p no:cacheprovider
+        run: python -m pytest ci-workflows/release-pypi/tests ci-workflows/upload-artifact-properties/tests -q -p no:cacheprovider

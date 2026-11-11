@@ -5,8 +5,6 @@ import os
 import re
 import subprocess
 
-from packaging.version import InvalidVersion, Version
-
 IMAGES_MAP = {
     "ubuntu2404-py312": "download.t-head.cn/docker_tool/ubuntu2404-py312:06",
     "ubuntu2204-py310": "download.t-head.cn/docker_tool/ubuntu2204-py310:05",
@@ -62,6 +60,8 @@ def get_torch_url(
 
 def get_build_tag(tag_version=""):
     """Prefer the specified version; filter rc from all sources and strip the leading v/V uniformly."""
+    from packaging.version import InvalidVersion, Version
+
     version_pattern = r"[vV]?[0-9][A-Za-z0-9.!_]*(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
     if tag_version != "":
         # Validate release-path safety and PEP 440 together; an invalid override never falls back to the repository tag.
@@ -105,9 +105,10 @@ def main():
     inputs = parse_json(os.environ["INPUTS_JSON"], "trigger inputs")
     if not isinstance(inputs, dict):
         fail("trigger inputs must be a JSON object")
-    tag = get_build_tag(inputs.get("tag_version", ""))
+    nightly_build = os.environ.get("NIGHTLY_BUILD") == "true"
+    tag = None if nightly_build else get_build_tag(inputs.get("tag_version", ""))
     should_release = tag is not None
-    if not should_release:
+    if not should_release and not nightly_build:
         print("tag contains rc (case-insensitive), or the current commit has no qualifying version tag; only build wheels and save Actions artifacts, no publish")
 
     package_name = inputs.get("package_name", "")
@@ -176,6 +177,8 @@ def main():
         )
         # Non-release builds produce no release version or target file name, keeping the original wheel from the build command.
         entry.update(tag="", release_version="", whl_name="")
+        if nightly_build:
+            entry["release_version"] = inputs["package_version"]
         if should_release:
             # Record the final version (the specified tag_version or the repository tag) for release data aggregation.
             entry["tag"] = tag

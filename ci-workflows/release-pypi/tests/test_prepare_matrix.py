@@ -1059,7 +1059,10 @@ def test_module_ci_covers_migrated_paths_without_release_credentials():
     path = repository / ".github/workflows/release-pypi-ci.yml"
     workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
     assert set(workflow["on"]) == {"pull_request", "push"}
-    expected_paths = {"ci-workflows/release-pypi/**", ".github/workflows/matrix-release.yml",
+    expected_paths = {"ci-workflows/release-pypi/**", "ci-workflows/upload-artifact-properties/**",
+                      ".github/workflows/matrix-release.yml", ".github/workflows/nightly-build.yml",
+                      ".github/workflows/upload-artifact-properties.yml",
+                      ".github/workflows/demo-upload-artifact-properties.yml",
                       ".github/workflows/release-pypi-ci.yml"}
     assert set(workflow["on"]["pull_request"]["paths"]) == expected_paths
     assert set(workflow["on"]["push"]["paths"]) == expected_paths
@@ -1068,7 +1071,8 @@ def test_module_ci_covers_migrated_paths_without_release_credentials():
     assert "secrets" not in path.read_text()
     assert workflow["jobs"]["tests"]["strategy"]["matrix"]["python"] == ["3.12", "3.14"]
     commands = [step["run"] for job in workflow["jobs"].values() for step in job["steps"] if "run" in step]
-    assert any("python -m pytest ci-workflows/release-pypi/tests" in cmd for cmd in commands)
+    assert any("python -m pytest ci-workflows/release-pypi/tests ci-workflows/upload-artifact-properties/tests"
+               in cmd for cmd in commands)
     readme = SCRIPT_PATH.parents[1] / "README.md"
     for link in re.findall(r"\]\(([^)]+)\)", readme.read_text()):
         if "://" not in link and not link.startswith("#"):
@@ -1086,6 +1090,109 @@ def test_all_release_workflow_shell_steps_parse(filename):
             result = subprocess.run(["bash", "-n"], input=step["run"], capture_output=True,
                                     text=True, timeout=10)
             assert result.returncode == 0, f"{job_id}/{step['name']}: {result.stderr}"
+
+
+@pytest.mark.parametrize("package_version", [
+    "1.2.3", "V1.2.3RC1", "nightly-custom", "1..2", "1.2.3+custom", "release/custom value", "",
+])
+@pytest.mark.parametrize("ref_type,ref_name", [
+    ("branch", "main"), ("tag", "9.9.9"), ("tag", "1.0.0RC1"), ("tag", "not-a-version"),
+])
+def test_nightly_uses_raw_package_version_without_tag_resolution(
+    script, output_file, monkeypatch, capsys, package_version, ref_type, ref_name,
+):
+    inputs = dict(DEFAULT_INPUTS, package_name="demo_package", package_version=package_version,
+                  sdk_versions='["2.1.1", "2.2.0"]', torch_versions='["", "2.13.0"]')
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
+    monkeypatch.setenv("GITHUB_OUTPUT", "github-output")
+    monkeypatch.setenv("NIGHTLY_BUILD", "true")
+    monkeypatch.setenv("GITHUB_REF_TYPE", ref_type)
+    monkeypatch.setenv("GITHUB_REF_NAME", ref_name)
+    monkeypatch.delenv("SOURCE_DIR", raising=False)
+    resolver = create_autospec(script.get_build_tag, side_effect=AssertionError("must not resolve tags"))
+    runner = create_autospec(script.subprocess.run, side_effect=AssertionError("must not run git"))
+    monkeypatch.setattr(script, "get_build_tag", resolver)
+    monkeypatch.setattr(script.subprocess, "run", runner)
+    script.main()
+    written = "".join(call.args[0] for call in output_file().write.call_args_list)
+    values = dict(line.split("=", 1) for line in written.splitlines())
+    assert values["should_release"] == "false"
+    entries = json.loads(values["matrix"])["include"]
+    assert len(entries) == 4
+    for entry in entries:
+        assert entry["release_version"] == package_version
+        assert entry["tag"] == entry["whl_name"] == ""
+        assert entry["image"] == script.IMAGES_MAP[image_key(entry)]
+        assert entry["sdk_url"] == (
+            f"https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v{entry['sdk_version']}/"
+            f"ppu_hggcrt3_ubuntu2204-{entry['sdk_version']}-{script.SDK_MAP[entry['sdk_version']]}.run"
+        )
+        assert entry["pccl_url"] == (
+            "https://download.t-head.cn/artifactory/ptgai-generic-release/COMM/v2.2.1/"
+            "pccl_hggcrt3_ubuntu2204-v2.2.1.tar.gz"
+        )
+    resolver.assert_not_called()
+    runner.assert_not_called()
+    assert capsys.readouterr().out == "Generated 4 matrix jobs\n"
+
+
+@pytest.mark.parametrize("override,error", [
+    ({"python_versions": '["39"]'}, "python_versions contains unsupported value"),
+    ({"sdk_versions": "[]"}, "sdk_versions must be a non-empty JSON array"),
+    ({"package_name": "../pkg"}, "package_name must be a valid Python package name"),
+    ({"python_versions": '["38"]'}, "missing ubuntu2204-py38"),
+    ({"runtime_versions": '["13.0.0"]'}, "runtime_versions contains unsupported value"),
+    ({"pccl_version": "invalid"}, "pccl_version"),
+])
+def test_nightly_still_validates_build_matrix(script, output_file, monkeypatch, override, error):
+    inputs = dict(DEFAULT_INPUTS, package_name="demo_package", package_version="nightly-custom")
+    inputs.update(override)
+    monkeypatch.setenv("INPUTS_JSON", json.dumps(inputs))
+    monkeypatch.setenv("NIGHTLY_BUILD", "true")
+    monkeypatch.delenv("SOURCE_DIR", raising=False)
+    with pytest.raises(SystemExit, match=error):
+        script.main()
+    output_file.assert_not_called()
+
+
+@pytest.mark.parametrize("configuration", ["explicit", "workflow-defaults"])
+def test_nightly_entrypoint_runs_without_packaging_or_caller_history(configuration):
+    workflow = yaml.load((SCRIPT_PATH.parents[3] / ".github/workflows/nightly-build.yml").read_text(),
+                         Loader=yaml.BaseLoader)
+    definitions = workflow["on"]["workflow_call"]["inputs"]
+    defaults = {name: definition["default"] for name, definition in definitions.items()
+                if "default" in definition}
+    inputs = dict(DEFAULT_INPUTS if configuration == "explicit" else defaults,
+                  package_name="demo_package", package_version="custom-nightly")
+    with tempfile.TemporaryDirectory(prefix=".nightly-matrix-test-", dir=SCRIPT_PATH.parents[1]) as directory:
+        root = Path(directory)
+        output = root / "github-output"
+        target = root / "ci-template" / SCRIPT_PATH.parent.relative_to(SCRIPT_PATH.parents[3])
+        shutil.copytree(SCRIPT_PATH.parent, target)
+        env = dict(os.environ, NIGHTLY_BUILD="true", INPUTS_JSON=json.dumps(inputs),
+                   GITHUB_OUTPUT=str(output), GITHUB_REF_TYPE="tag", GITHUB_REF_NAME="not-a-version",
+                   TEST_PYTHON=sys.executable)
+        env.pop("SOURCE_DIR", None)
+        generate = next(step for step in workflow["jobs"]["prepare-matrix"]["steps"] if step.get("id") == "matrix")
+        result = subprocess.run(["bash", "-e"],
+                                input='python3() { "$TEST_PYTHON" -S "$@"; }\n' + generate["run"],
+                                cwd=root, env=env, text=True, capture_output=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert values["should_release"] == "false"
+        entry, = json.loads(values["matrix"])["include"]
+        assert entry["release_version"] == "custom-nightly"
+        assert entry["tag"] == entry["whl_name"] == ""
+        assert entry["image"].startswith("download.t-head.cn/")
+        assert entry["sdk_url"].endswith(".run")
+        assert entry["pccl_url"].startswith("https://download.t-head.cn/")
+
+
+@pytest.mark.parametrize("mode", ["", "false", "TRUE", "1"])
+def test_nightly_mode_requires_explicit_true(run_matrix, monkeypatch, mode):
+    monkeypatch.setenv("NIGHTLY_BUILD", mode)
+    entries = run_matrix(dict(DEFAULT_INPUTS, package_version="must-not-be-used"))
+    assert all(entry["release_version"] == "1.0.0+v0.3.0.sail2.1.1" for entry in entries)
 
 
 if __name__ == "__main__":

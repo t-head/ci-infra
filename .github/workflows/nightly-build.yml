@@ -1,0 +1,476 @@
+name: Reusable Nightly Build
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: 'Name of the package to build, e.g. vllm; the entry point replaces - with _; also used as the Artifactory package_name property'
+        required: true
+        type: string
+      framework:
+        description: 'Name of the dependent framework, e.g. torch; retained for compatibility with the Matrix Release entry point'
+        required: true
+        type: string
+      python_versions:
+        description: 'JSON array, allowed values: 38, 310, 312, e.g. ["38","310"]'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array, allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array, allowed HGGCRT values: 2, 3, e.g. ["2","3"]'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON array, allowed values: 2.10.0, 2.13.0; [""] means Torch is not installed'
+        required: true
+        type: string
+        default: '["2.10.0"]'
+      sdk_versions:
+        description: 'JSON array, allowed values: 2.1.1, 2.2.0'
+        required: true
+        type: string
+        default: '["2.2.0"]'
+      pccl_version:
+        description: 'A single PCCL version, allowed values: 2.1.1, 2.2.0, 2.2.1; not part of the matrix expansion'
+        required: false
+        type: string
+        default: '2.2.1'
+      template_repository:
+        description: 'Repository containing this workflow, the matrix tools, and the upload script, in owner/repo format'
+        type: string
+        required: false
+        default: t-head/ci-infra
+      template_ref:
+        description: 'Template code version; must match the ref used to call this workflow; pass github.sha for relative-path calls inside this repository'
+        required: true
+        type: string
+      branch:
+        description: 'Optional caller source branch, tag, or full commit SHA; refs/heads/ and refs/tags/ disambiguate names; when empty, use the commit that triggered the caller workflow; resolved once for all matrix jobs'
+        required: false
+        type: string
+        default: ''
+      build_command:
+        description: 'Bash build command executed in the root directory of the calling repository; multi-line is supported; only trusted configuration is accepted'
+        required: true
+        type: string
+      version:
+        description: 'Optional Artifactory directory and version property; when empty, generated as {package_version}+{short_commit}.ppu{sdk_version} for each matrix entry'
+        required: false
+        type: string
+        default: ''
+      package_version:
+        description: 'Package version used as-is for RELEASE_VERSION, the Artifactory package_version property, and automatic upload directory naming; no PEP 440 validation or Git tag lookup'
+        required: true
+        type: string
+      package_edition:
+        description: 'Artifactory item property: package edition, such as standard or enterprise'
+        required: true
+        type: string
+      runtime_type:
+        description: 'Runtime type property; defaults to sail when not provided and uses the given value as-is otherwise'
+        required: false
+        type: string
+        default: 'sail'
+      extra_info:
+        description: 'Artifactory item property: free-form extra information, such as a JSON string'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      template_token:
+        description: 'Read-only token used to check out a private template repository; usually not needed for the same repository or public templates'
+        required: false
+      release_username:
+        description: 'Artifactory publishing username; requires PUT permission on the destination path and on the item properties'
+        required: true
+      release_token:
+        description: 'Artifactory publishing token from a caller repository or organization Actions Secret'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    name: Validate inputs and generate matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      package_name: ${{ steps.normalize-package.outputs.package_name }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_branch: ${{ steps.source.outputs.branch }}
+      source_tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - name: Normalize package name
+        id: normalize-package
+        shell: bash
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          inputs = json.loads(os.environ["INPUTS_JSON"])
+          package_name = inputs.get("package_name", "")
+          if not isinstance(package_name, str) or not re.fullmatch(
+              r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", package_name
+          ):
+              raise SystemExit("::error::package_name must be a valid Python package name")
+          package_name = package_name.replace("-", "_")
+          inputs["package_name"] = package_name
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"package_name={package_name}\n")
+              output.write("inputs_json=" + json.dumps(inputs, separators=(",", ":")) + "\n")
+          PY
+
+      - name: Checkout template tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+
+      - name: Set up matrix validation Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Parse version arrays and image mapping
+        id: matrix
+        shell: bash
+        env:
+          INPUTS_JSON: ${{ steps.normalize-package.outputs.inputs_json }}
+          NIGHTLY_BUILD: 'true'
+        run: python3 ci-template/ci-workflows/release-pypi/scripts/prepare_matrix.py
+
+      - name: Check out source reference
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.sha }}
+          path: nightly-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve source metadata
+        id: source
+        shell: bash
+        working-directory: nightly-source
+        env:
+          REQUESTED_REF: ${{ inputs.branch }}
+          TRIGGER_SHA: ${{ github.sha }}
+          TRIGGER_REF_TYPE: ${{ github.ref_type }}
+          TRIGGER_REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          def git(*args, check=True):
+              return subprocess.run(
+                  ["git", *args], check=check, capture_output=True, text=True
+              ).stdout.strip()
+
+          sha = git("rev-parse", "--verify", "HEAD^{commit}")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("::error::unable to resolve the checked-out source commit")
+          requested = os.environ["REQUESTED_REF"]
+          branch = tag = ""
+          if not requested:
+              if sha != os.environ["TRIGGER_SHA"].lower():
+                  raise SystemExit("::error::the default source must match the triggering commit")
+              ref_type = os.environ["TRIGGER_REF_TYPE"]
+              if ref_type == "branch":
+                  branch = os.environ["TRIGGER_REF_NAME"]
+              elif ref_type == "tag":
+                  tag = os.environ["TRIGGER_REF_NAME"]
+          elif re.fullmatch(r"[0-9a-fA-F]{40}", requested):
+              if sha != requested.lower():
+                  raise SystemExit("::error::the checked-out source does not match the requested commit")
+          else:
+              head_ref = git("symbolic-ref", "--quiet", "HEAD", check=False)
+              if head_ref.startswith("refs/heads/"):
+                  branch = head_ref.removeprefix("refs/heads/")
+                  if requested not in (branch, head_ref):
+                      raise SystemExit("::error::the checked-out branch does not match the requested reference")
+              else:
+                  tag_ref = requested if requested.startswith("refs/tags/") else f"refs/tags/{requested}"
+                  tag_sha = git("rev-parse", "--verify", "--end-of-options", f"{tag_ref}^{{commit}}", check=False)
+                  if tag_sha != sha:
+                      raise SystemExit("::error::unable to resolve the requested source branch or tag")
+                  tag = tag_ref.removeprefix("refs/tags/")
+          values = {"sha": sha, "branch": branch, "tag": tag}
+          if any("\n" in value or "\r" in value for value in values.values()):
+              raise SystemExit("::error::source metadata must not contain line breaks")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          PY
+
+  matrix-job:
+    name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / runtime${{ matrix.runtime_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
+    container:
+      image: ${{ matrix.image }}
+    env:
+      PYTHON_VERSION: ${{ matrix.python_version }}
+      OS_VERSION: ${{ matrix.os_version }}
+      RUNTIME_VERSION: ${{ matrix.runtime_version }}
+      TORCH_VERSION: ${{ matrix.torch_version }}
+      SDK_VERSION: ${{ matrix.sdk_version }}
+      RELEASE_VERSION: ${{ matrix.release_version }}
+      WHL_NAME: ${{ matrix.whl_name }}
+      CONTAINER_IMAGE: ${{ matrix.image }}
+      TORCH_URL: ${{ matrix.torch_url }}
+      SDK_URL: ${{ matrix.sdk_url }}
+      PCCL_URL: ${{ matrix.pccl_url }}
+      SOURCE_SHA: ${{ needs.prepare-matrix.outputs.source_sha }}
+      SOURCE_BRANCH: ${{ needs.prepare-matrix.outputs.source_branch }}
+      SOURCE_TAG: ${{ needs.prepare-matrix.outputs.source_tag }}
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - name: Print current matrix parameters
+        run: |
+          printf '%s\n' \
+            "PYTHON_VERSION=$PYTHON_VERSION" \
+            "OS_VERSION=$OS_VERSION" \
+            "RUNTIME_VERSION=$RUNTIME_VERSION" \
+            "TORCH_VERSION=$TORCH_VERSION" \
+            "SDK_VERSION=$SDK_VERSION" \
+            "RELEASE_VERSION=$RELEASE_VERSION" \
+            "WHL_NAME=$WHL_NAME" \
+            "TORCH_URL=$TORCH_URL" \
+            "SDK_URL=$SDK_URL" \
+            "PCCL_URL=$PCCL_URL" \
+            "CONTAINER_IMAGE=$CONTAINER_IMAGE"
+      - name: Checkout repository to build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-matrix.outputs.source_sha }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download and install SDK run package
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SDK_URL:?SDK_URL must not be empty}"
+          download_dir="$(mktemp -d "$RUNNER_TEMP/ppu-sdk.XXXXXX")"
+          wget --https-only --tries=3 --timeout=30 \
+            -O "$download_dir/ppu-sdk.run" -- "$SDK_URL"
+          if [[ ! -s "$download_dir/ppu-sdk.run" ]]; then
+            printf '%s\n' '::error::the downloaded SDK run package is empty' >&2
+            exit 1
+          fi
+          bash "$download_dir/ppu-sdk.run" --prefix=/usr/local --silent
+          echo "/usr/local/PPU_SDK/lib" >> /etc/ld.so.conf.d/ppu.conf
+          ldconfig
+
+      - name: Download and install PCCL
+        shell: bash
+        env:
+          PCCL_PATH: /usr/local/pccl
+        run: |
+          set -euo pipefail
+          : "${PCCL_URL:?PCCL_URL must not be empty}"
+          : "${PCCL_PATH:?PCCL_PATH must not be empty}"
+          if [[ -e "$PCCL_PATH" || -L "$PCCL_PATH" ]]; then
+            printf '%s\n' '::error::the PCCL install directory already exists, refusing to overwrite' >&2
+            exit 1
+          fi
+          download_dir="$(mktemp -d "$RUNNER_TEMP/pccl.XXXXXX")"
+          trap 'rm -rf -- "$download_dir"' EXIT
+          wget --https-only --tries=3 --timeout=30 \
+            -O "$download_dir/pccl.tar.gz" -- "$PCCL_URL"
+          if [[ ! -s "$download_dir/pccl.tar.gz" ]]; then
+            printf '%s\n' '::error::the downloaded PCCL package is empty' >&2
+            exit 1
+          fi
+          mkdir "$download_dir/extracted"
+          tar --extract --file="$download_dir/pccl.tar.gz" --directory="$download_dir/extracted"
+          if [[ ! -d "$download_dir/extracted/pccl" || -L "$download_dir/extracted/pccl" ]]; then
+            printf '%s\n' '::error::the PCCL package is missing the pccl directory or the directory is a symlink' >&2
+            exit 1
+          fi
+          mv -- "$download_dir/extracted/pccl" "$PCCL_PATH"
+          printf '%s\n' "$PCCL_PATH/lib" >> /etc/ld.so.conf.d/pccl.conf
+          ldconfig
+          printf 'PCCL_PATH=%s\n' "$PCCL_PATH" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: |
+          set -eo pipefail
+          : "${BUILD_COMMAND:?build_command must not be empty}"
+          ldconfig
+          source /usr/local/PPU_SDK/envsetup.sh
+          export PATH="$PCCL_PATH/bin:$PATH"
+          export LD_LIBRARY_PATH="$PCCL_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [[ -n "${TORCH_VERSION:-}" ]]; then
+            pip install "torch==$TORCH_VERSION" -i https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple
+          fi
+          bash -e -o pipefail -c "$BUILD_COMMAND"
+
+      - name: Collect wheels into dist
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          root = Path.cwd()
+          dist = root / "dist"
+          package_name = os.environ["PACKAGE_NAME"].lower().replace("-", "_")
+          if not package_name:
+              raise SystemExit("::error::package_name must not be empty")
+          if dist.is_symlink() or (dist.exists() and not dist.is_dir()):
+              raise SystemExit("::error::dist must be a regular directory, not a symlink")
+
+          def scan_error(error):
+              raise SystemExit(f"::error::cannot scan the source directory: {error}")
+
+          # Find regular files recursively without following symlinks; finish filtering first to avoid same-name artifacts overwriting each other during copy.
+          wheels = []
+          for directory, _, filenames in os.walk(root, onerror=scan_error, followlinks=False):
+              for filename in filenames:
+                  path = Path(directory) / filename
+                  if filename.endswith(".whl") and path.is_file() and not path.is_symlink():
+                      wheels.append(path)
+          wheels.sort()
+          print("Found wheel files: " + json.dumps([str(path.relative_to(root)) for path in wheels],
+                                               ensure_ascii=False), flush=True)
+          if not wheels:
+              raise SystemExit("::error::no .whl file found in the source directory")
+          candidates = wheels
+          if len(wheels) > 1:
+              candidates = [path for path in wheels
+                            if path.name.lower().replace("-", "_").startswith(package_name)]
+          if len(candidates) != 1:
+              raise SystemExit(f"::error::exactly one wheel must remain after filtering by package_name, got {len(candidates)}")
+
+          selected = candidates[0]
+          target = dist / selected.name
+          existing = list(dist.glob("*.whl"))
+          if any(path.is_symlink() or not path.is_file() for path in existing):
+              raise SystemExit("::error::wheels in dist must be regular files, not symlinks")
+          if selected != target and target.exists():
+              raise SystemExit("::error::an artifact with the same name already exists in dist, refusing to overwrite")
+          dist.mkdir(exist_ok=True)
+          # Normalize the name only on match; keep the original name when copying; the selected artifact already in dist needs no copy.
+          if selected != target:
+              shutil.copy2(selected, target)
+          # dist keeps only the selected wheel; originals in other source directories and non-wheel files stay untouched.
+          for path in existing:
+              if path != target:
+                  path.unlink()
+          print("Collected wheel: " + json.dumps(str(target.relative_to(root)), ensure_ascii=False))
+          PY
+
+      - name: Save collected wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: true
+
+      - name: Validate required inputs
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ARTIFACT_NAME//[[:space:]]/}" ]]; then
+            printf '%s\n' "::error::artifact_name must not be empty" >&2
+            exit 1
+          fi
+
+      - name: Check out template tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repository }}
+          ref: ${{ inputs.template_ref }}
+          path: ci-template
+          token: ${{ secrets.template_token || github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Download the raw ZIP saved by GitHub without decompressing or repackaging it.
+      - name: Download artifact ZIP
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+          path: ${{ runner.temp }}/upload-artifact-properties-source
+          skip-decompress: true
+
+      - name: Upload files and set Artifactory properties
+        id: upload
+        shell: bash
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}
+          ARTIFACT_DIR: ${{ runner.temp }}/upload-artifact-properties-source
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Context-derived Artifactory properties; the caller cannot override these through inputs.
+          GITHUB_LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_USERNAME: ${{ secrets.release_username }}
+          RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          INPUTS_JSON="$(python - <<'PY'
+          import json
+          import os
+
+          inputs = json.loads(os.environ["INPUTS_JSON"])
+          matrix = json.loads(os.environ["MATRIX_JSON"])
+          inputs.update({
+              "package_type": "pypi",
+              "package_name": os.environ["PACKAGE_NAME"],
+              "os": matrix["os_version"],
+              "python_version": matrix["python_version"],
+              "runtime": matrix["runtime_version"],
+              "torch_version": matrix["torch_version"],
+              "sdk_version": matrix["sdk_version"],
+          })
+          print(json.dumps(inputs, separators=(",", ":")))
+          PY
+          )"
+          export INPUTS_JSON
+          export GITHUB_SHA="$SOURCE_SHA"
+          export GITHUB_BRANCH="$SOURCE_BRANCH"
+          export GITHUB_TAG="$SOURCE_TAG"
+          python ci-template/ci-workflows/upload-artifact-properties/scripts/upload_artifact.py

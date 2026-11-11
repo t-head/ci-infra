@@ -935,3 +935,440 @@ def test_cli_runs_without_third_party_packages_or_network(workspace):
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 1
     assert "::error::" in result.stderr
+
+
+@pytest.fixture
+def nightly_workflow():
+    return yaml.load((WORKFLOW.parent / "nightly-build.yml").read_text(encoding="utf-8"),
+                     Loader=yaml.BaseLoader)
+
+
+def test_nightly_contract_keeps_matrix_entry_and_adds_upload_metadata(nightly_workflow):
+    release = yaml.load((WORKFLOW.parent / "matrix-release.yml").read_text(encoding="utf-8"),
+                        Loader=yaml.BaseLoader)
+    properties = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert nightly_workflow["name"] == "Reusable Nightly Build"
+    assert set(nightly_workflow["on"]) == {"workflow_call"}
+    contract = nightly_workflow["on"]["workflow_call"]
+    release_inputs = {key: value for key, value in release["on"]["workflow_call"]["inputs"].items()
+                      if key != "tag_version"}
+    properties_inputs = properties["on"]["workflow_call"]["inputs"]
+    additions = {"version", "package_version", "package_edition", "runtime_type", "extra_info"}
+    assert set(contract["inputs"]) == set(release_inputs) | additions | {"branch"}
+    expected_inputs = {**release_inputs, **{key: properties_inputs[key] for key in additions}}
+    for name, expected in expected_inputs.items():
+        for field in ("type", "required", "default"):
+            assert contract["inputs"][name].get(field) == expected.get(field), (name, field)
+    assert set(contract["secrets"]) == {"template_token", "release_username", "release_token"}
+    for name, definition in contract["secrets"].items():
+        assert definition["required"] == ("false" if name == "template_token" else "true")
+    assert "outputs" not in contract
+    assert nightly_workflow["permissions"] == {"contents": "read"}
+
+
+def test_nightly_keeps_only_requested_jobs_and_steps(nightly_workflow):
+    release = yaml.load((WORKFLOW.parent / "matrix-release.yml").read_text(encoding="utf-8"),
+                        Loader=yaml.BaseLoader)
+    properties = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert set(nightly_workflow["jobs"]) == {"prepare-matrix", "matrix-job"}
+    prepare = dict(release["jobs"]["prepare-matrix"])
+    prepare["outputs"] = {key: value for key, value in prepare["outputs"].items()
+                          if key != "should_release"}
+    prepare["steps"] = [dict(step) for step in prepare["steps"] if step["name"] not in {
+        "Checkout caller version history", "Install version validation dependencies",
+    }]
+    generate = next(step for step in prepare["steps"] if step.get("id") == "matrix")
+    generate["env"] = {"INPUTS_JSON": "${{ steps.normalize-package.outputs.inputs_json }}",
+                       "NIGHTLY_BUILD": "true"}
+    prepare["outputs"].update({
+        f"source_{key}": "${{ steps.source.outputs." + key + " }}" for key in ("sha", "branch", "tag")
+    })
+    actual_prepare = dict(nightly_workflow["jobs"]["prepare-matrix"])
+    actual_prepare["steps"] = actual_prepare["steps"][:-2]
+    assert actual_prepare == prepare
+    job = nightly_workflow["jobs"]["matrix-job"]
+    original_job = release["jobs"]["matrix-job"]
+    original_job["env"].update({
+        f"SOURCE_{key.upper()}": "${{ needs.prepare-matrix.outputs.source_" + key + " }}"
+        for key in ("sha", "branch", "tag")
+    })
+    source_checkout = next(step for step in original_job["steps"]
+                           if step["name"] == "Checkout repository to build")
+    source_checkout["with"]["ref"] = "${{ needs.prepare-matrix.outputs.source_sha }}"
+    assert job["needs"] == "prepare-matrix"
+    assert "if" not in job
+    assert {key: value for key, value in job.items() if key not in ("steps", "needs")} == {
+        key: value for key, value in original_job.items() if key not in ("steps", "needs", "if")
+    }
+    cutoff = next(index for index, step in enumerate(original_job["steps"])
+                  if step["name"] == "Save collected wheel artifacts") + 1
+    artifact_name = (
+        "${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-"
+        "${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}"
+        "${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-"
+        "${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}"
+    )
+    original_job["steps"][cutoff - 1]["with"]["name"] = artifact_name
+    assert job["steps"][:cutoff] == original_job["steps"][:cutoff]
+    guard, checkout, setup, download, upload = job["steps"][cutoff:]
+    original_guard, original_checkout, original_setup, original_download, original_upload = (
+        properties["jobs"]["upload-artifact"]["steps"]
+    )
+    assert [step["name"] for step in job["steps"][cutoff:]] == [
+        step["name"] for step in properties["jobs"]["upload-artifact"]["steps"]
+    ]
+    assert not artifact_name.endswith(".zip")
+    assert guard == dict(original_guard, env={"ARTIFACT_NAME": artifact_name})
+    assert checkout == original_checkout
+    assert setup == original_setup
+    assert download == dict(original_download, **{
+        "with": dict(original_download["with"], name=artifact_name),
+    })
+    original_env = {key: value for key, value in original_upload["env"].items()
+                    if key not in ("GITHUB_SHA", "GITHUB_BRANCH", "GITHUB_TAG")}
+    assert upload["env"] == dict(
+        original_env, MATRIX_JSON="${{ toJSON(matrix) }}",
+        PACKAGE_NAME="${{ needs.prepare-matrix.outputs.package_name }}",
+    )
+    assert upload["run"].rstrip().endswith(
+        "python ci-template/ci-workflows/upload-artifact-properties/scripts/upload_artifact.py"
+    )
+    assert upload["env"]["ARTIFACT_DIR"] == download["with"]["path"]
+    for step in job["steps"]:
+        assert "if" not in step
+        assert "continue-on-error" not in step
+        assert "${{" not in step.get("run", "")
+        if step is not upload:
+            assert "RELEASE_TOKEN" not in step.get("env", {})
+    assert "should_release" not in (WORKFLOW.parent / "nightly-build.yml").read_text()
+
+
+def test_nightly_uses_package_version_without_release_version_validation(nightly_workflow):
+    contract = nightly_workflow["on"]["workflow_call"]
+    assert "tag_version" not in contract["inputs"]
+    assert contract["inputs"]["package_version"]["required"] == "true"
+    assert contract["inputs"]["version"]["required"] == "false"
+    text = (WORKFLOW.parent / "nightly-build.yml").read_text()
+    for removed in ("tag_version", "caller-source", "SOURCE_DIR", "pip install --no-input packaging",
+                    "ci-templates/", "flytiger", "cuda", "NCCL"):
+        assert removed not in text
+    prepare = nightly_workflow["jobs"]["prepare-matrix"]
+    generate = next(step for step in prepare["steps"] if step.get("id") == "matrix")
+    assert generate["env"]["NIGHTLY_BUILD"] == "true"
+    assert nightly_workflow["jobs"]["matrix-job"]["env"]["RELEASE_VERSION"] == "${{ matrix.release_version }}"
+    for relative in (generate["run"].split()[-1],
+                     nightly_workflow["jobs"]["matrix-job"]["steps"][-1]["run"].split()[-1]):
+        assert (ROOT.parents[1] / relative.removeprefix("ci-template/")).is_file()
+
+
+def test_nightly_embedded_scripts_have_valid_syntax(nightly_workflow):
+    for job in nightly_workflow["jobs"].values():
+        for step in job["steps"]:
+            if "run" not in step:
+                continue
+            shell = step.get("shell", job.get("defaults", {}).get("run", {}).get("shell", "bash"))
+            result = subprocess.run([shell, "-n"], input=step["run"], text=True,
+                                    capture_output=True, timeout=5)
+            assert result.returncode == 0, (step["name"], result.stderr)
+            if "<<'PY'\n" in step["run"]:
+                source = step["run"].split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+                compile(source, step["name"], "exec")
+
+
+@pytest.mark.parametrize("python_version,os_version", [
+    ("38", "ubuntu2004"), ("310", "ubuntu2204"), ("312", "alios7u2"),
+])
+@pytest.mark.parametrize("sdk_version", ["2.1.1", "2.2.0"])
+@pytest.mark.parametrize("torch_version", ["", "2.13.0"])
+@pytest.mark.parametrize("version", ["", "custom-nightly"])
+@pytest.mark.parametrize("package_version", ["1.2.3", "V1.2.3RC1", "nightly-custom", "1..2"])
+@pytest.mark.parametrize("package_edition", ["standard", "enterprise"])
+def test_nightly_matrix_properties_reach_uploader(
+    nightly_workflow, python_version, os_version, sdk_version, torch_version, version, package_version,
+    package_edition, make_file, artifact_zip_bytes, request,
+):
+    contract = nightly_workflow["on"]["workflow_call"]
+    inputs = {key: definition.get("default", "") for key, definition in contract["inputs"].items()}
+    inputs.update(package_name="demo-package", framework="torch", package_version=package_version,
+                  package_edition=package_edition, version=version, extra_info='{"note":"a,b;c=d"}')
+    matrix = {
+        "python_version": python_version, "os_version": os_version, "runtime_version": "3",
+        "torch_version": torch_version, "sdk_version": sdk_version,
+        "tag": "", "release_version": package_version, "whl_name": "",
+    }
+    upload = nightly_workflow["jobs"]["matrix-job"]["steps"][-1]
+    mapping, command = upload["run"].rstrip().rsplit("\n", 1)
+    assert command == "python ci-template/ci-workflows/upload-artifact-properties/scripts/upload_artifact.py"
+    torch_part = f"-torch{torch_version}" if torch_version else ""
+    filename = (f"demo_package-demo_package-{package_edition}-hggcrt3{torch_part}"
+                f"-{os_version}-py{python_version}-sdk{sdk_version}.zip")
+    archive = make_file(filename=filename, content=artifact_zip_bytes)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c",
+         'python() { "$TEST_PYTHON" "$@"; }\n' + mapping
+         + '\npython -c \'import os; print(os.environ["INPUTS_JSON"])\''],
+        env=dict(os.environ, INPUTS_JSON=json.dumps(inputs), MATRIX_JSON=json.dumps(matrix),
+                 PACKAGE_NAME="demo_package", TEST_PYTHON=sys.executable,
+                 SOURCE_SHA=DEFAULT_CONTEXT_ENV["GITHUB_SHA"], SOURCE_BRANCH="main", SOURCE_TAG="",
+                 ARTIFACT_DIR=str(archive.parent)),
+        text=True, capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(result.stdout)
+    assert metadata == dict(inputs, package_type="pypi", package_name="demo_package",
+                            os=os_version, python_version=python_version, runtime="3",
+                            torch_version=torch_version, sdk_version=sdk_version)
+    assert list(archive.parent.iterdir()) == [archive]
+    assert archive.read_bytes() == artifact_zip_bytes
+    code, transport = request.getfixturevalue("run_upload")(inputs=metadata)
+    assert code == 0
+    assert transport.call_count == 2
+    url, source = _last_curl_flags(_curl_args(transport)[0])
+    expected_version = version or f"{package_version}+abcdef1.ppu{sdk_version}"
+    assert unquote(url) == f"{BASE_URL}/{CALLER_REPOSITORY}/{expected_version}/{archive.name}"
+    assert source == str(archive)
+    assert archive.read_bytes() == artifact_zip_bytes
+    storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
+    assert _query_pairs(storage_url) == dict(
+        expected_property_values(), package_type="pypi", os=os_version, runtime="3",
+        python_version=python_version, torch_version=torch_version, sdk_version=sdk_version,
+        version=expected_version, package_version=package_version, package_edition=package_edition,
+        extra_info=inputs["extra_info"],
+    )
+
+
+def test_nightly_source_reference_contract(nightly_workflow):
+    branch_input = nightly_workflow["on"]["workflow_call"]["inputs"]["branch"]
+    assert {key: branch_input[key] for key in ("type", "required", "default")} == {
+        "type": "string", "required": "false", "default": "",
+    }
+    prepare = nightly_workflow["jobs"]["prepare-matrix"]
+    checkout, resolve = prepare["steps"][-2:]
+    assert checkout["name"] == "Check out source reference"
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"] == {
+        "ref": "${{ inputs.branch || github.sha }}", "path": "nightly-source",
+        "fetch-depth": "1", "persist-credentials": "false",
+    }
+    assert resolve["name"] == "Resolve source metadata"
+    assert resolve["id"] == "source"
+    assert resolve["working-directory"] == checkout["with"]["path"]
+    assert resolve["env"] == {
+        "REQUESTED_REF": "${{ inputs.branch }}", "TRIGGER_SHA": "${{ github.sha }}",
+        "TRIGGER_REF_TYPE": "${{ github.ref_type }}", "TRIGGER_REF_NAME": "${{ github.ref_name }}",
+    }
+    for step in (checkout, resolve):
+        assert "continue-on-error" not in step and "if" not in step
+    job = nightly_workflow["jobs"]["matrix-job"]
+    build_checkout = next(step for step in job["steps"] if step["name"] == "Checkout repository to build")
+    assert build_checkout["with"]["ref"] == "${{ needs.prepare-matrix.outputs.source_sha }}"
+    assert build_checkout["with"]["submodules"] == "recursive"
+    for key in ("sha", "branch", "tag"):
+        assert prepare["outputs"][f"source_{key}"] == "${{ steps.source.outputs." + key + " }}"
+        assert job["env"][f"SOURCE_{key.upper()}"] == "${{ needs.prepare-matrix.outputs.source_" + key + " }}"
+        assert f'export GITHUB_{key.upper()}="$SOURCE_{key.upper()}"' in job["steps"][-1]["run"]
+    for current_job in nightly_workflow["jobs"].values():
+        for step in current_job["steps"]:
+            if step.get("with", {}).get("path") == "ci-template":
+                assert step["with"]["ref"] == "${{ inputs.template_ref }}"
+
+
+@pytest.fixture
+def nightly_source_repository(workspace):
+    directory = workspace / "nightly-source"
+    directory.mkdir()
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_AUTHOR_NAME="CI Test", GIT_AUTHOR_EMAIL="ci@example.invalid",
+                       GIT_COMMITTER_NAME="CI Test", GIT_COMMITTER_EMAIL="ci@example.invalid")
+
+    def git(*args):
+        result = subprocess.run(["git", "-C", str(directory), *args], env=environment,
+                                check=True, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+
+    git("init", "--quiet", "--initial-branch=main")
+    git("commit", "--allow-empty", "--quiet", "-m", "trigger")
+    trigger = git("rev-parse", "HEAD")
+    git("checkout", "--quiet", "-b", "feature/topic")
+    git("commit", "--allow-empty", "--quiet", "-m", "source")
+    sha = git("rev-parse", "HEAD")
+    git("tag", "-a", "v1.2.3RC1", "-m", "annotated tag")
+    git("tag", "custom-nightly")
+    git("branch", "shared")
+    git("tag", "shared", trigger)
+    return {"directory": directory, "env": environment, "git": git, "sha": sha, "trigger": trigger}
+
+
+@pytest.fixture
+def run_nightly_source(nightly_workflow, nightly_source_repository, workspace):
+    repo = nightly_source_repository
+    step = nightly_workflow["jobs"]["prepare-matrix"]["steps"][-1]
+    counter = 0
+
+    def run(requested="", checkout=None, **overrides):
+        nonlocal counter
+        counter += 1
+        if checkout is not None:
+            repo["git"]("checkout", "--quiet", checkout)
+        output = workspace / f"source-outputs-{counter}"
+        environment = dict(repo["env"], REQUESTED_REF=requested, TRIGGER_SHA=repo["trigger"],
+                           TRIGGER_REF_TYPE="branch", TRIGGER_REF_NAME="main",
+                           GITHUB_OUTPUT=str(output), TEST_PYTHON=sys.executable)
+        environment.update(overrides)
+        shim = 'python3() { "$TEST_PYTHON" "$@"; }\n'
+        result = subprocess.run(["bash", "-e"], input=shim + step["run"], cwd=repo["directory"],
+                                env=environment, text=True, capture_output=True, timeout=10)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines()) if output.exists() else {}
+        return result, values
+
+    return run
+
+
+@pytest.mark.parametrize("requested,checkout,branch,tag", [
+    ("feature/topic", "feature/topic", "feature/topic", ""),
+    ("refs/heads/feature/topic", "feature/topic", "feature/topic", ""),
+    ("v1.2.3RC1", "refs/tags/v1.2.3RC1", "", "v1.2.3RC1"),
+    ("refs/tags/v1.2.3RC1", "refs/tags/v1.2.3RC1", "", "v1.2.3RC1"),
+    ("custom-nightly", "refs/tags/custom-nightly", "", "custom-nightly"),
+    ("shared", "shared", "shared", ""),
+    ("refs/heads/shared", "shared", "shared", ""),
+    ("refs/tags/shared", "refs/tags/shared", "", "shared"),
+    ("$sha", "$sha", "", ""),
+])
+def test_nightly_source_metadata_matches_selected_ref(
+    requested, checkout, branch, tag, run_nightly_source, nightly_source_repository,
+):
+    repo = nightly_source_repository
+    requested = repo["sha"] if requested == "$sha" else requested
+    checkout = repo["sha"] if checkout == "$sha" else checkout
+    result, values = run_nightly_source(requested, checkout)
+    assert result.returncode == 0, result.stderr
+    expected_sha = repo["trigger"] if tag == "shared" else repo["sha"]
+    assert values == {"sha": expected_sha, "branch": branch, "tag": tag}
+
+
+@pytest.mark.parametrize("ref_type,ref_name,branch,tag", [
+    ("branch", "main", "main", ""),
+    ("tag", "custom-trigger-tag", "", "custom-trigger-tag"),
+    ("branch", "123/merge", "123/merge", ""),
+])
+def test_nightly_default_pins_trigger_commit_even_if_branch_moves(
+    ref_type, ref_name, branch, tag, run_nightly_source, nightly_source_repository,
+):
+    repo = nightly_source_repository
+    repo["git"]("branch", "-f", "main", repo["sha"])
+    result, values = run_nightly_source("", repo["trigger"], TRIGGER_REF_TYPE=ref_type, TRIGGER_REF_NAME=ref_name)
+    assert result.returncode == 0, result.stderr
+    assert values == {"sha": repo["trigger"], "branch": branch, "tag": tag}
+    assert repo["git"]("rev-parse", "main") != values["sha"]
+
+
+@pytest.mark.parametrize("requested,checkout", [
+    ("", "$sha"),
+    ("$sha", "$trigger"),
+    ("missing-branch", "feature/topic"),
+    ("refs/heads/missing", "feature/topic"),
+    ("refs/tags/shared", "$sha"),
+    ("refs/tags/missing", "$sha"),
+    ("$(touch marker)", "$sha"),
+    ("--help", "$sha"),
+])
+def test_nightly_invalid_or_mismatched_source_emits_no_metadata(
+    requested, checkout, run_nightly_source, nightly_source_repository,
+):
+    repo = nightly_source_repository
+    requested = repo["sha"] if requested == "$sha" else requested
+    checkout = repo[checkout[1:]] if checkout.startswith("$") else checkout
+    result, values = run_nightly_source(requested, checkout)
+    assert result.returncode != 0
+    assert "::error::" in result.stderr
+    assert values == {}
+    assert not (repo["directory"] / "marker").exists()
+
+
+def test_nightly_source_metadata_cannot_inject_outputs(run_nightly_source, nightly_source_repository):
+    result, values = run_nightly_source("", nightly_source_repository["trigger"],
+                                       TRIGGER_REF_NAME="main\nsha=forged")
+    assert result.returncode != 0
+    assert "line breaks" in result.stderr
+    assert values == {}
+
+
+def test_nightly_resolved_sha_remains_fixed_after_branch_updates(run_nightly_source, nightly_source_repository):
+    repo = nightly_source_repository
+    result, values = run_nightly_source("feature/topic", "feature/topic")
+    assert result.returncode == 0, result.stderr
+    repo["git"]("commit", "--allow-empty", "--quiet", "-m", "branch advanced")
+    assert repo["git"]("rev-parse", "feature/topic") != values["sha"]
+    repo["git"]("checkout", "--quiet", values["sha"])
+    assert repo["git"]("rev-parse", "HEAD") == repo["sha"] == values["sha"]
+
+
+@pytest.mark.parametrize("requested,checkout,branch,tag", [
+    ("", "$trigger", "main", ""),
+    ("feature/topic", "feature/topic", "feature/topic", ""),
+    ("refs/heads/feature/topic", "feature/topic", "feature/topic", ""),
+    ("v1.2.3RC1", "refs/tags/v1.2.3RC1", "", "v1.2.3RC1"),
+    ("refs/tags/shared", "refs/tags/shared", "", "shared"),
+    ("$sha", "$sha", "", ""),
+])
+@pytest.mark.parametrize("version", ["", "custom-upload-directory"])
+def test_nightly_selected_source_reaches_upload_version_and_properties(
+    requested, checkout, branch, tag, version, nightly_workflow, run_nightly_source,
+    nightly_source_repository, make_file, artifact_zip_bytes, request,
+):
+    repo = nightly_source_repository
+    requested = repo["sha"] if requested == "$sha" else requested
+    checkout = repo[checkout[1:]] if checkout.startswith("$") else checkout
+    result, source = run_nightly_source(requested, checkout)
+    assert result.returncode == 0, result.stderr
+    inputs = dict(DEFAULT_INPUTS, branch=requested, version=version, package_version="nightly-custom")
+    matrix = {
+        "python_version": "310", "os_version": "ubuntu2204", "runtime_version": "3",
+        "torch_version": "2.13.0", "sdk_version": "2.2.0",
+    }
+    mapping, _ = nightly_workflow["jobs"]["matrix-job"]["steps"][-1]["run"].rstrip().rsplit("\n", 1)
+    capture = '''
+python - <<'PY'
+import json
+import os
+print(json.dumps({
+    "inputs": json.loads(os.environ["INPUTS_JSON"]),
+    "context": {key: os.environ[key] for key in (
+        "GITHUB_SHA", "GITHUB_BRANCH", "GITHUB_TAG", "GITHUB_LOG_URL",
+        "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+    )},
+}))
+PY
+'''
+    environment = dict(os.environ, **DEFAULT_CONTEXT_ENV)
+    environment.update(INPUTS_JSON=json.dumps(inputs), MATRIX_JSON=json.dumps(matrix),
+                       PACKAGE_NAME="demo_package", SOURCE_SHA=source["sha"],
+                       SOURCE_BRANCH=source["branch"], SOURCE_TAG=source["tag"],
+                       GITHUB_SHA=repo["trigger"], GITHUB_BRANCH="trigger-branch",
+                       GITHUB_TAG="trigger-tag", TEST_PYTHON=sys.executable)
+    shim = 'python() { "$TEST_PYTHON" "$@"; }\n'
+    result = subprocess.run(["bash", "-e"], input=shim + mapping + capture, env=environment,
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    captured = json.loads(result.stdout)
+    assert captured["context"] == dict(DEFAULT_CONTEXT_ENV, GITHUB_SHA=source["sha"],
+                                       GITHUB_BRANCH=branch, GITHUB_TAG=tag)
+    archive = make_file(filename="source-wheels.zip", content=artifact_zip_bytes)
+    code, transport = request.getfixturevalue("run_upload")(
+        inputs=captured["inputs"], **captured["context"],
+    )
+    assert code == 0
+    assert transport.call_count == 2
+    upload_url, upload_source = _last_curl_flags(_curl_args(transport)[0])
+    expected_version = version or f"nightly-custom+{source['sha'][:7]}.ppu2.2.0"
+    assert unquote(upload_url) == f"{BASE_URL}/{CALLER_REPOSITORY}/{expected_version}/{archive.name}"
+    assert upload_source == str(archive)
+    assert archive.read_bytes() == artifact_zip_bytes
+    storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
+    assert _query_pairs(storage_url) == dict(
+        expected_property_values(), package_type="pypi", package_version="nightly-custom", runtime="3",
+        version=expected_version, os="ubuntu2204", python_version="310", torch_version="2.13.0",
+        commit=source["sha"], branch=branch, tag=tag,
+    )
