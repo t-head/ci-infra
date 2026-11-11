@@ -1,0 +1,144 @@
+name: Demo Upload Artifact Properties
+
+# Copy this file to .github/workflows/demo-upload-artifact-properties.yml in the caller repository.
+# Manual runs actually PUT files to Artifactory and set the properties; run only on trusted branches.
+# Replace the build job with your own packaging step and adapt the property inputs to the released artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version path segment placed after run_attempt in the upload URL; leave empty to use the run timestamp'
+        required: false
+        type: string
+        default: ''
+      package_type:
+        description: 'Artifactory item property: package type'
+        required: false
+        type: string
+        default: 'pypi'
+      package_name:
+        description: 'Artifactory item property: package name'
+        required: false
+        type: string
+        default: 'test_package'
+      package_version:
+        description: 'Artifactory item property: package version'
+        required: false
+        type: string
+        default: '1.0.0'
+      os:
+        description: 'Artifactory item property: operating system'
+        required: false
+        type: string
+        default: 'ubuntu2404'
+      python_version:
+        description: 'Artifactory item property: Python version'
+        required: false
+        type: string
+        default: '312'
+      runtime:
+        description: 'Artifactory item property: runtime version'
+        required: false
+        type: string
+        default: '13.0.0'
+      torch_version:
+        description: 'Artifactory item property: PyTorch version; leave empty when Torch is not applicable'
+        required: false
+        type: string
+        default: '2.10.0'
+      sdk_version:
+        description: 'Artifactory item property: SDK version'
+        required: false
+        type: string
+        default: '2.2.0'
+      package_edition:
+        description: 'Artifactory item property: package edition'
+        required: false
+        type: string
+        default: 'oe'
+      extra_info:
+        description: 'Artifactory item property: free-form extra information'
+        required: false
+        type: string
+        default: '{"foo":"bar"}'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and stage artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: generic-${{ github.run_id }}-${{ github.run_attempt }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out caller code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Replace with the actual build command; the template uploads the whole ZIP saved by Actions directly.
+      - name: Stage files for upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/upload-artifact-properties-dist"
+          printf 'placeholder payload\n' \
+            > "$RUNNER_TEMP/upload-artifact-properties-dist/demo.txt"
+
+      - name: Save artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/upload-artifact-properties-dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Call upload artifact properties template
+    needs: build
+    # For production, replace both @main and template_ref with the same full commit SHA from the template repository.
+    uses: t-head/ci-infra/.github/workflows/upload-artifact-properties.yml@main
+    with:
+      artifact_name: ${{ needs.build.outputs.artifact_name }}
+      # version: ${{ needs.build.outputs.version }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      package_name: ${{ inputs.package_name || 'test_package' }}
+      package_version: ${{ inputs.package_version || '0.1.0' }}
+      os: ${{ inputs.os || 'ubuntu2404' }}
+      python_version: ${{ inputs.python_version || 'py312' }}
+      runtime: ${{ inputs.runtime || '13.0.0' }}
+      torch_version: ${{ inputs.torch_version || '2.10.0' }}
+      sdk_version: ${{ inputs.sdk_version || '2.2.0' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      # branch, tag, commit, and log_url properties are derived from GitHub Actions context
+      # by the template workflow itself and are not configurable here.
+      extra_info: ${{ inputs.extra_info || '{"foo":"bar"}' }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      # Enable as needed for private templates, and allow cross-repository calls in the template repository Actions settings.
+      # template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show uploaded URLs
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          BATCH_URL: ${{ needs.publish.outputs.batch_url }}
+          UPLOAD_URLS: ${{ needs.publish.outputs.upload_urls }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Batch directory: %s\n' "$BATCH_URL"
+            printf 'Uploaded files:\n%s\n' "$UPLOAD_URLS"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
