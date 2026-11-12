@@ -64,6 +64,11 @@ on:
         required: false
         type: string
         default: ''
+      package_type:
+        description: 'Artifactory item property: package type; defaults to binary'
+        required: false
+        type: string
+        default: 'binary'
       package_version:
         description: 'Package version used as-is for RELEASE_VERSION, the Artifactory package_version property, and automatic upload directory naming; no PEP 440 validation or Git tag lookup'
         required: true
@@ -458,7 +463,6 @@ jobs:
           inputs = json.loads(os.environ["INPUTS_JSON"])
           matrix = json.loads(os.environ["MATRIX_JSON"])
           inputs.update({
-              "package_type": "pypi",
               "package_name": os.environ["PACKAGE_NAME"],
               "os": matrix["os_version"],
               "python_version": matrix["python_version"],

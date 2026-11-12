@@ -953,9 +953,10 @@ def test_nightly_contract_keeps_matrix_entry_and_adds_upload_metadata(nightly_wo
     release_inputs = {key: value for key, value in release["on"]["workflow_call"]["inputs"].items()
                       if key != "tag_version"}
     properties_inputs = properties["on"]["workflow_call"]["inputs"]
-    additions = {"version", "package_version", "package_edition", "runtime_type", "extra_info"}
+    additions = {"version", "package_version", "package_edition", "runtime_type", "extra_info", "package_type"}
     assert set(contract["inputs"]) == set(release_inputs) | additions | {"branch"}
     expected_inputs = {**release_inputs, **{key: properties_inputs[key] for key in additions}}
+    expected_inputs["package_type"] = {"type": "string", "required": "false", "default": "binary"}
     for name, expected in expected_inputs.items():
         for field in ("type", "required", "default"):
             assert contract["inputs"][name].get(field) == expected.get(field), (name, field)
@@ -1083,14 +1084,18 @@ def test_nightly_embedded_scripts_have_valid_syntax(nightly_workflow):
 @pytest.mark.parametrize("version", ["", "custom-nightly"])
 @pytest.mark.parametrize("package_version", ["1.2.3", "V1.2.3RC1", "nightly-custom", "1..2"])
 @pytest.mark.parametrize("package_edition", ["standard", "enterprise"])
+@pytest.mark.parametrize("package_type", [None, "pypi"])
 def test_nightly_matrix_properties_reach_uploader(
     nightly_workflow, python_version, os_version, sdk_version, torch_version, version, package_version,
-    package_edition, make_file, artifact_zip_bytes, request,
+    package_edition, package_type, make_file, artifact_zip_bytes, request,
 ):
     contract = nightly_workflow["on"]["workflow_call"]
     inputs = {key: definition.get("default", "") for key, definition in contract["inputs"].items()}
     inputs.update(package_name="demo-package", framework="torch", package_version=package_version,
                   package_edition=package_edition, version=version, extra_info='{"note":"a,b;c=d"}')
+    if package_type is not None:
+        inputs["package_type"] = package_type
+    expected_package_type = "binary" if package_type is None else package_type
     matrix = {
         "python_version": python_version, "os_version": os_version, "runtime_version": "3",
         "torch_version": torch_version, "sdk_version": sdk_version,
@@ -1115,7 +1120,7 @@ def test_nightly_matrix_properties_reach_uploader(
     )
     assert result.returncode == 0, result.stderr
     metadata = json.loads(result.stdout)
-    assert metadata == dict(inputs, package_type="pypi", package_name="demo_package",
+    assert metadata == dict(inputs, package_type=expected_package_type, package_name="demo_package",
                             os=os_version, python_version=python_version, runtime="3",
                             torch_version=torch_version, sdk_version=sdk_version)
     assert list(archive.parent.iterdir()) == [archive]
@@ -1130,7 +1135,7 @@ def test_nightly_matrix_properties_reach_uploader(
     assert archive.read_bytes() == artifact_zip_bytes
     storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
     assert _query_pairs(storage_url) == dict(
-        expected_property_values(), package_type="pypi", os=os_version, runtime="3",
+        expected_property_values(), package_type=expected_package_type, os=os_version, runtime="3",
         python_version=python_version, torch_version=torch_version, sdk_version=sdk_version,
         version=expected_version, package_version=package_version, package_edition=package_edition,
         extra_info=inputs["extra_info"],
@@ -1368,7 +1373,7 @@ PY
     assert archive.read_bytes() == artifact_zip_bytes
     storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
     assert _query_pairs(storage_url) == dict(
-        expected_property_values(), package_type="pypi", package_version="nightly-custom", runtime="3",
+        expected_property_values(), package_version="nightly-custom", runtime="3",
         version=expected_version, os="ubuntu2204", python_version="310", torch_version="2.13.0",
         commit=source["sha"], branch=branch, tag=tag,
     )
