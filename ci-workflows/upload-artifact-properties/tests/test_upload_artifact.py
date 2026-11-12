@@ -1004,26 +1004,34 @@ def test_nightly_keeps_only_requested_jobs_and_steps(nightly_workflow):
     cutoff = next(index for index, step in enumerate(original_job["steps"])
                   if step["name"] == "Save collected wheel artifacts") + 1
     artifact_name = (
-        "${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-"
+        "${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_version }}-"
+        "${{ steps.rename-wheel.outputs.short_commit }}-"
         "${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}"
         "${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-"
         "${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}"
     )
     original_job["steps"][cutoff - 1]["with"]["name"] = artifact_name
-    assert job["steps"][:cutoff] == original_job["steps"][:cutoff]
-    guard, checkout, setup, download, upload = job["steps"][cutoff:]
+    rename_index = cutoff - 1
+    assert job["steps"][rename_index - 1]["name"] == "Collect wheels into dist"
+    assert job["steps"][rename_index]["name"] == "Rename collected wheel"
+    assert job["steps"][rename_index]["id"] == "rename-wheel"
+    assert job["steps"][rename_index + 1]["name"] == "Save collected wheel artifacts"
+    without_rename = job["steps"][:rename_index] + job["steps"][rename_index + 1:]
+    assert without_rename[:cutoff] == original_job["steps"][:cutoff]
+    guard, checkout, setup, download, upload = without_rename[cutoff:]
     original_guard, original_checkout, original_setup, original_download, original_upload = (
         properties["jobs"]["upload-artifact"]["steps"]
     )
-    assert [step["name"] for step in job["steps"][cutoff:]] == [
-        step["name"] for step in properties["jobs"]["upload-artifact"]["steps"]
+    assert [step["name"] for step in without_rename[cutoff:]] == [
+        original_guard["name"], original_checkout["name"], original_setup["name"],
+        "Download and extract wheel artifact", "Upload wheels and set Artifactory properties",
     ]
     assert not artifact_name.endswith(".zip")
     assert guard == dict(original_guard, env={"ARTIFACT_NAME": artifact_name})
     assert checkout == original_checkout
     assert setup == original_setup
-    assert download == dict(original_download, **{
-        "with": dict(original_download["with"], name=artifact_name),
+    assert download == dict(original_download, name="Download and extract wheel artifact", **{
+        "with": dict(original_download["with"], name=artifact_name, **{"skip-decompress": "false"}),
     })
     original_env = {key: value for key, value in original_upload["env"].items()
                     if key not in ("GITHUB_SHA", "GITHUB_BRANCH", "GITHUB_TAG")}
@@ -1076,6 +1084,145 @@ def test_nightly_embedded_scripts_have_valid_syntax(nightly_workflow):
                 compile(source, step["name"], "exec")
 
 
+@pytest.fixture
+def nightly_wheel_bytes():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as wheel:
+        wheel.writestr("demo_package/__init__.py", b"__version__ = '1.2.3'\n")
+        wheel.writestr("demo_package-1.2.3.dist-info/METADATA", b"Name: demo_package\nVersion: 1.2.3\n")
+        wheel.writestr("demo_package-1.2.3.dist-info/WHEEL", b"Wheel-Version: 1.0\nTag: py3-none-any\n")
+        wheel.writestr("demo_package-1.2.3.dist-info/RECORD", b"unchanged record\n")
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def run_nightly_rename(nightly_workflow, workspace):
+    step = next(step for step in nightly_workflow["jobs"]["matrix-job"]["steps"]
+                if step["name"] == "Rename collected wheel")
+
+    def run(**overrides):
+        environment = dict(os.environ, SOURCE_SHA="abcdef1" + "0" * 33,
+                           GITHUB_SHA="1234567" + "0" * 33, RELEASE_VERSION="not-the-wheel-version",
+                           RUNTIME_VERSION="3", OS_VERSION="ubuntu2204", SDK_VERSION="2.2.0",
+                           TEST_PYTHON=sys.executable, GITHUB_OUTPUT=str(workspace / "rename-output"))
+        environment.update(overrides)
+        shim = 'python3() { "$TEST_PYTHON" "$@"; }\n'
+        return subprocess.run(["bash", "-e"], input=shim + step["run"], cwd=workspace,
+                              env=environment, text=True, capture_output=True, timeout=10)
+
+    return run
+
+
+@pytest.mark.parametrize("whl_version,separator", [
+    ("1.2.3", "+"), ("1.2.3+custom", "."), ("1.2.3+custom.7", "."),
+    ("V1.2.3RC1", "+"), ("1..2", "+"),
+])
+@pytest.mark.parametrize("tags", ["py3-none-any", "cp310-cp310-linux_x86_64", "1-cp312-cp312-manylinux_2_17_x86_64"])
+@pytest.mark.parametrize("runtime,os_version,sdk", [
+    ("3", "ubuntu2204", "2.2.0"), ("2", "alios7u2", "2.1.1"),
+])
+def test_nightly_rename_uses_wheel_version_and_preserves_contents(
+    whl_version, separator, tags, runtime, os_version, sdk, make_file, nightly_wheel_bytes, run_nightly_rename,
+):
+    original = make_file(filename=f"demo_package-{whl_version}-{tags}.whl", directory="dist",
+                         content=nightly_wheel_bytes)
+    result = run_nightly_rename(RUNTIME_VERSION=runtime, OS_VERSION=os_version, SDK_VERSION=sdk)
+    assert result.returncode == 0, result.stderr
+    expected = original.with_name(
+        f"demo_package-{whl_version}{separator}abcdef1.hggcrt{runtime}.{os_version}.sdk{sdk}-{tags}.whl"
+    )
+    assert not original.exists()
+    assert list(expected.parent.iterdir()) == [expected]
+    assert expected.read_bytes() == nightly_wheel_bytes
+    assert (expected.parent.parent / "rename-output").read_text() == "short_commit=abcdef1\n"
+    with zipfile.ZipFile(expected) as wheel:
+        assert wheel.read("demo_package-1.2.3.dist-info/METADATA") == b"Name: demo_package\nVersion: 1.2.3\n"
+        assert wheel.read("demo_package-1.2.3.dist-info/RECORD") == b"unchanged record\n"
+
+
+@pytest.mark.parametrize("case", [
+    "missing", "empty", "multiple", "symlink", "directory", "dist-symlink", "bad-name", "empty-version",
+    "target-exists", "invalid-sha", "unsafe-suffix",
+])
+def test_nightly_rename_rejects_unsafe_or_ambiguous_files(case, workspace, make_file, run_nightly_rename):
+    original = workspace / "dist" / "demo_package-1.2.3-py3-none-any.whl"
+    overrides = {}
+    if case == "missing":
+        pass
+    elif case == "empty":
+        original.parent.mkdir()
+    elif case == "dist-symlink":
+        (workspace / "elsewhere").mkdir()
+        original.parent.symlink_to(workspace / "elsewhere", target_is_directory=True)
+    else:
+        original.parent.mkdir()
+        if case == "symlink":
+            original.symlink_to(make_file(filename="outside.whl", directory="elsewhere"))
+        elif case == "directory":
+            original.mkdir()
+        else:
+            filename = {"bad-name": "bad.whl", "empty-version": "demo_package--py3-none-any.whl"}.get(case, original.name)
+            original = make_file(filename=filename, directory="dist", content=b"original")
+            if case == "multiple":
+                make_file(filename="other-1.2.3-py3-none-any.whl", directory="dist", content=b"other")
+            elif case == "target-exists":
+                make_file(filename="demo_package-1.2.3+abcdef1.hggcrt3.ubuntu2204.sdk2.2.0-py3-none-any.whl",
+                          directory="dist", content=b"existing target")
+            elif case == "invalid-sha":
+                overrides["SOURCE_SHA"] = "not-a-commit"
+            elif case == "unsafe-suffix":
+                overrides["SDK_VERSION"] = "../../outside"
+    before = {str(path): path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+    result = run_nightly_rename(**overrides)
+    assert result.returncode != 0
+    assert "::error::" in result.stderr
+    after = {str(path): path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+    assert after == before
+
+
+@pytest.mark.parametrize("case", ["zip", "empty", "multiple", "extra-file", "symlink", "directory", "root-symlink"])
+def test_nightly_upload_rejects_non_wheel_artifacts(case, nightly_workflow, workspace, make_file):
+    directory = workspace / "artifact"
+    directory.mkdir()
+    if case == "root-symlink":
+        link = workspace / "linked-artifact"
+        link.symlink_to(directory, target_is_directory=True)
+        directory = link
+    elif case != "empty":
+        filename = "artifact.zip" if case == "zip" else "demo_package-1.2.3-py3-none-any.whl"
+        if case == "symlink":
+            (directory / filename).symlink_to(make_file(filename="outside.whl", directory="elsewhere"))
+        elif case == "directory":
+            (directory / filename).mkdir()
+        else:
+            make_file(filename=filename)
+            if case in ("multiple", "extra-file"):
+                make_file(filename="other.whl" if case == "multiple" else "notes.txt")
+    mapping, _ = nightly_workflow["jobs"]["matrix-job"]["steps"][-1]["run"].rstrip().rsplit("\n", 1)
+    environment = dict(os.environ, ARTIFACT_DIR=str(directory), TEST_PYTHON=sys.executable)
+    shim = 'python() { "$TEST_PYTHON" "$@"; }\n'
+    result = subprocess.run(["bash", "-e"], input=shim + mapping, env=environment,
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode != 0
+    assert "::error::" in result.stderr
+    assert not (workspace / "outputs").exists()
+
+
+@pytest.fixture
+def extract_nightly_artifact(workspace):
+    def extract(wheel):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as artifact:
+            artifact.write(wheel, arcname=wheel.name)
+        directory = workspace / "artifact"
+        directory.mkdir()
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as artifact:
+            artifact.extractall(directory)
+        return directory / wheel.name
+
+    return extract
+
+
 @pytest.mark.parametrize("python_version,os_version", [
     ("38", "ubuntu2004"), ("310", "ubuntu2204"), ("312", "alios7u2"),
 ])
@@ -1087,7 +1234,8 @@ def test_nightly_embedded_scripts_have_valid_syntax(nightly_workflow):
 @pytest.mark.parametrize("package_type", [None, "pypi"])
 def test_nightly_matrix_properties_reach_uploader(
     nightly_workflow, python_version, os_version, sdk_version, torch_version, version, package_version,
-    package_edition, package_type, make_file, artifact_zip_bytes, request,
+    package_edition, package_type, make_file, nightly_wheel_bytes, run_nightly_rename,
+    extract_nightly_artifact, request,
 ):
     contract = nightly_workflow["on"]["workflow_call"]
     inputs = {key: definition.get("default", "") for key, definition in contract["inputs"].items()}
@@ -1104,10 +1252,14 @@ def test_nightly_matrix_properties_reach_uploader(
     upload = nightly_workflow["jobs"]["matrix-job"]["steps"][-1]
     mapping, command = upload["run"].rstrip().rsplit("\n", 1)
     assert command == "python ci-template/ci-workflows/upload-artifact-properties/scripts/upload_artifact.py"
-    torch_part = f"-torch{torch_version}" if torch_version else ""
-    filename = (f"demo_package-demo_package-{package_edition}-hggcrt3{torch_part}"
-                f"-{os_version}-py{python_version}-sdk{sdk_version}.zip")
-    archive = make_file(filename=filename, content=artifact_zip_bytes)
+    original = make_file(filename="demo_package-1.2.3-py3-none-any.whl", directory="dist",
+                         content=nightly_wheel_bytes)
+    result = run_nightly_rename(OS_VERSION=os_version, SDK_VERSION=sdk_version)
+    assert result.returncode == 0, result.stderr
+    filename = f"demo_package-1.2.3+abcdef1.hggcrt3.{os_version}.sdk{sdk_version}-py3-none-any.whl"
+    wheel = original.with_name(filename)
+    assert not original.exists()
+    archive = extract_nightly_artifact(wheel)
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c",
          'python() { "$TEST_PYTHON" "$@"; }\n' + mapping
@@ -1124,7 +1276,7 @@ def test_nightly_matrix_properties_reach_uploader(
                             os=os_version, python_version=python_version, runtime="3",
                             torch_version=torch_version, sdk_version=sdk_version)
     assert list(archive.parent.iterdir()) == [archive]
-    assert archive.read_bytes() == artifact_zip_bytes
+    assert archive.read_bytes() == nightly_wheel_bytes
     code, transport = request.getfixturevalue("run_upload")(inputs=metadata)
     assert code == 0
     assert transport.call_count == 2
@@ -1132,7 +1284,7 @@ def test_nightly_matrix_properties_reach_uploader(
     expected_version = version or f"{package_version}+abcdef1.ppu{sdk_version}"
     assert unquote(url) == f"{BASE_URL}/{CALLER_REPOSITORY}/{expected_version}/{archive.name}"
     assert source == str(archive)
-    assert archive.read_bytes() == artifact_zip_bytes
+    assert archive.read_bytes() == nightly_wheel_bytes
     storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
     assert _query_pairs(storage_url) == dict(
         expected_property_values(), package_type=expected_package_type, os=os_version, runtime="3",
@@ -1321,7 +1473,8 @@ def test_nightly_resolved_sha_remains_fixed_after_branch_updates(run_nightly_sou
 @pytest.mark.parametrize("version", ["", "custom-upload-directory"])
 def test_nightly_selected_source_reaches_upload_version_and_properties(
     requested, checkout, branch, tag, version, nightly_workflow, run_nightly_source,
-    nightly_source_repository, make_file, artifact_zip_bytes, request,
+    nightly_source_repository, make_file, nightly_wheel_bytes, run_nightly_rename,
+    extract_nightly_artifact, request,
 ):
     repo = nightly_source_repository
     requested = repo["sha"] if requested == "$sha" else requested
@@ -1333,6 +1486,14 @@ def test_nightly_selected_source_reaches_upload_version_and_properties(
         "python_version": "310", "os_version": "ubuntu2204", "runtime_version": "3",
         "torch_version": "2.13.0", "sdk_version": "2.2.0",
     }
+    original = make_file(filename="demo_package-1.2.3+custom-py3-none-any.whl", directory="dist",
+                         content=nightly_wheel_bytes)
+    result = run_nightly_rename(SOURCE_SHA=source["sha"], SDK_VERSION="2.2.0")
+    assert result.returncode == 0, result.stderr
+    wheel = original.with_name(
+        f"demo_package-1.2.3+custom.{source['sha'][:7]}.hggcrt3.ubuntu2204.sdk2.2.0-py3-none-any.whl"
+    )
+    archive = extract_nightly_artifact(wheel)
     mapping, _ = nightly_workflow["jobs"]["matrix-job"]["steps"][-1]["run"].rstrip().rsplit("\n", 1)
     capture = '''
 python - <<'PY'
@@ -1352,7 +1513,8 @@ PY
                        PACKAGE_NAME="demo_package", SOURCE_SHA=source["sha"],
                        SOURCE_BRANCH=source["branch"], SOURCE_TAG=source["tag"],
                        GITHUB_SHA=repo["trigger"], GITHUB_BRANCH="trigger-branch",
-                       GITHUB_TAG="trigger-tag", TEST_PYTHON=sys.executable)
+                       GITHUB_TAG="trigger-tag", TEST_PYTHON=sys.executable,
+                       ARTIFACT_DIR=str(archive.parent))
     shim = 'python() { "$TEST_PYTHON" "$@"; }\n'
     result = subprocess.run(["bash", "-e"], input=shim + mapping + capture, env=environment,
                             text=True, capture_output=True, timeout=10)
@@ -1360,7 +1522,7 @@ PY
     captured = json.loads(result.stdout)
     assert captured["context"] == dict(DEFAULT_CONTEXT_ENV, GITHUB_SHA=source["sha"],
                                        GITHUB_BRANCH=branch, GITHUB_TAG=tag)
-    archive = make_file(filename="source-wheels.zip", content=artifact_zip_bytes)
+    assert list(archive.parent.iterdir()) == [archive]
     code, transport = request.getfixturevalue("run_upload")(
         inputs=captured["inputs"], **captured["context"],
     )
@@ -1370,7 +1532,7 @@ PY
     expected_version = version or f"nightly-custom+{source['sha'][:7]}.ppu2.2.0"
     assert unquote(upload_url) == f"{BASE_URL}/{CALLER_REPOSITORY}/{expected_version}/{archive.name}"
     assert upload_source == str(archive)
-    assert archive.read_bytes() == artifact_zip_bytes
+    assert archive.read_bytes() == nightly_wheel_bytes
     storage_url, _ = _last_curl_flags(_curl_args(transport)[1])
     assert _query_pairs(storage_url) == dict(
         expected_property_values(), package_version="nightly-custom", runtime="3",

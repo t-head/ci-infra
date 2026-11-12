@@ -397,10 +397,49 @@ jobs:
           print("Collected wheel: " + json.dumps(str(target.relative_to(root)), ensure_ascii=False))
           PY
 
+      - name: Rename collected wheel
+        id: rename-wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          dist = Path("dist")
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::dist must be a regular directory")
+          wheels = list(dist.glob("*.whl"))
+          if len(wheels) != 1 or wheels[0].is_symlink() or not wheels[0].is_file():
+              raise SystemExit("::error::expected exactly one regular wheel in dist")
+          source_sha = os.environ["SOURCE_SHA"]
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", source_sha):
+              raise SystemExit("::error::SOURCE_SHA must be the resolved source commit")
+          key_str = (f"{source_sha[:7]}.hggcrt{os.environ['RUNTIME_VERSION']}."
+                     f"{os.environ['OS_VERSION']}.sdk{os.environ['SDK_VERSION']}")
+          if not re.fullmatch(r"[A-Za-z0-9._]+", key_str):
+              raise SystemExit("::error::wheel suffix must contain only letters, digits, dots, or underscores")
+          wheel = wheels[0]
+          parts = wheel.name.split("-")
+          if len(parts) not in (5, 6) or not all(parts):
+              raise SystemExit("::error::wheel filename must contain a distribution, version, and wheel tags")
+          whl_version = parts[1]
+          parts[1] = whl_version + ("." if "+" in whl_version else "+") + key_str
+          target = wheel.with_name("-".join(parts))
+          if target.exists() or target.is_symlink():
+              raise SystemExit("::error::renamed wheel already exists; refusing to overwrite")
+          wheel.rename(target)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"short_commit={source_sha[:7]}\n")
+          print("Renamed wheel: " + json.dumps(target.name))
+          PY
+
       - name: Save collected wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_version }}-${{ steps.rename-wheel.outputs.short_commit }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
           path: dist/*.whl
           if-no-files-found: error
           compression-level: 0
@@ -409,7 +448,7 @@ jobs:
       - name: Validate required inputs
         shell: bash
         env:
-          ARTIFACT_NAME: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+          ARTIFACT_NAME: ${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_version }}-${{ steps.rename-wheel.outputs.short_commit }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
         run: |
           set -euo pipefail
           if [[ -z "${ARTIFACT_NAME//[[:space:]]/}" ]]; then
@@ -431,15 +470,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Download the raw ZIP saved by GitHub without decompressing or repackaging it.
-      - name: Download artifact ZIP
+      - name: Download and extract wheel artifact
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
+          name: ${{ needs.prepare-matrix.outputs.package_name }}-${{ inputs.package_version }}-${{ steps.rename-wheel.outputs.short_commit }}-${{ inputs.package_edition }}-hggcrt${{ matrix.runtime_version }}${{ matrix.torch_version != '' && format('-torch{0}', matrix.torch_version) || '' }}-${{ matrix.os_version }}-py${{ matrix.python_version }}-sdk${{ matrix.sdk_version }}
           path: ${{ runner.temp }}/upload-artifact-properties-source
-          skip-decompress: true
+          skip-decompress: false
 
-      - name: Upload files and set Artifactory properties
+      - name: Upload wheels and set Artifactory properties
         id: upload
         shell: bash
         env:
@@ -459,7 +497,15 @@ jobs:
           INPUTS_JSON="$(python - <<'PY'
           import json
           import os
+          from pathlib import Path
 
+          artifact_dir = Path(os.environ["ARTIFACT_DIR"])
+          if artifact_dir.is_symlink() or not artifact_dir.is_dir():
+              raise SystemExit("::error::artifact directory must be a regular directory")
+          wheels = list(artifact_dir.iterdir())
+          if (len(wheels) != 1 or wheels[0].is_symlink()
+                  or not wheels[0].is_file() or wheels[0].suffix != ".whl"):
+              raise SystemExit("::error::expected exactly one extracted wheel before uploading")
           inputs = json.loads(os.environ["INPUTS_JSON"])
           matrix = json.loads(os.environ["MATRIX_JSON"])
           inputs.update({
