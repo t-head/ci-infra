@@ -55,6 +55,11 @@ on:
         required: false
         type: string
         default: ''
+      runs_on:
+        description: 'Runner for all jobs: a single label such as ubuntu-latest, or a JSON array of labels such as ["self-hosted","linux","x64"]; defaults to ubuntu-latest'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
       build_command:
         description: 'Bash build command executed in the root directory of the calling repository; multi-line is supported; only trusted configuration is accepted'
         required: true
@@ -104,7 +109,7 @@ permissions:
 jobs:
   prepare-matrix:
     name: Validate inputs and generate matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -226,7 +231,7 @@ jobs:
   matrix-job:
     name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / runtime${{ matrix.runtime_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
     needs: prepare-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
