@@ -317,12 +317,23 @@ if [ -n "$RACK_NODES" ]; then
     log_error "rack_nodes requires board-type=ZW-M890P in node_selector; other boards have no icn-rack labels"
     exit 1
   fi
+  if [[ "$RACK_NODES" == *$'\n'* || "$RACK_NODES" == *$'\r'* ]]; then
+    log_error "rack_nodes must not contain line breaks"
+    exit 1
+  fi
+  if [[ "$RACK_NODES" == *, ]]; then
+    log_error "rack_nodes must not contain empty entries"
+    exit 1
+  fi
   _rack_seen=","
   _rack_summary=""
   IFS=',' read -ra _rack_pairs <<< "$RACK_NODES"
   for _pair in "${_rack_pairs[@]}"; do
     _pair=$(printf '%s' "$_pair" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -z "$_pair" ] && continue
+    if [ -z "$_pair" ]; then
+      log_error "rack_nodes must not contain empty entries"
+      exit 1
+    fi
     _rack="${_pair%%=*}"
     _count="${_pair#*=}"
     if [[ "$_pair" != *=* ]] || [ ${#_rack} -gt 63 ] \

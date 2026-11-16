@@ -742,6 +742,19 @@ class LifecycleTests(unittest.TestCase):
             ("2", board, "=2", "RACK=COUNT"),
             ("2", board, "rack 01=2", "RACK=COUNT"),
             ("2", board, "rack-01=2;touch unsafe", "RACK=COUNT"),
+            ("2", board, "rack-01=2,\nrack-02=1", "line breaks"),
+            ("2", board, "rack-01=2,\r\nrack-02=1", "line breaks"),
+            ("2", board, "rack-01=2\r", "line breaks"),
+            ("2", board, "\nrack-01=2", "line breaks"),
+            ("2", board, "rack-01=2\n", "line breaks"),
+            ("2", board, "rack-01=1, ,rack-02=1", "empty entries"),
+            ("2", board, "rack-01=1,,rack-02=1", "empty entries"),
+            ("2", board, ",rack-01=2", "empty entries"),
+            ("2", board, " ,rack-01=2", "empty entries"),
+            ("2", board, "rack-01=2,", "empty entries"),
+            ("2", board, "rack-01=2, \t", "empty entries"),
+            ("2", board, " \t ", "empty entries"),
+            ("2", board, ",", "empty entries"),
         )
         for nodes, selector, racks, message in cases:
             with self.subTest(selector=selector, racks=racks):
