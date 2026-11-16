@@ -119,6 +119,7 @@ that name. Existing destinations are kept as-is, while missing paths are warning
 | `cleanup_policy` | no | `always` | Accepted but not applied; resource removal is unconditional |
 | `source_dir` | no | `/workspace/source` | Path where staged source is extracted in the pod |
 | `node_selector` | no | | `KEY1=VAL1,...`, merged into `spec.nodeSelector` |
+| `rack_nodes` | no | | Workers per ICN rack, `RACK1=COUNT1,...`; see below |
 | `container_options` | no | | YAML snippet, see below |
 | `artifact_paths` | no | | Extra paths (one per line) staged with the source |
 | `job_suffix` | no | | Readable segment of resource names; a unique hash is always appended |
@@ -128,6 +129,21 @@ Changing `cleanup_policy` cannot keep pods or other job resources, which are rem
 for all terminal states. The current implementation treats `on_failure` exactly like
 `always`: kernel logs also remain on NAS after successful execution, not just after
 an error, deadline or cancellation.
+
+### `rack_nodes`
+
+`rack_nodes: rack-01=4,rack-02=4` with `nnodes: 8` places four workers in each ICN
+rack. Each worker receives an extra `icn-rack` node selector, while the shared
+`PodGroup` and per-host anti-affinity are unchanged. Racks are filled in the listed
+order: here ranks 0-3, including worker-0 and `MASTER_ADDR`, are in `rack-01` and
+ranks 4-7 are in `rack-02`.
+
+Validation happens before any resource is created. Counts must be positive and add
+up to `nnodes`, a rack may be listed only once, gang mode is required, and
+`node_selector` must contain `board-type=ZW-M890P` without its own `icn-rack` entry;
+810E boards have no rack labels. There is no rack fallback: when one rack cannot hold
+its share, the whole gang waits until `timeout_minutes` expires instead of being
+placed unevenly.
 
 ### `container_options`
 

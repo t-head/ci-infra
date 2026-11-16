@@ -80,6 +80,15 @@ inputs:
       to target nodes with matching labels (combined with the base ack.node.ppu.schedule label as a hard AND constraint).
     required: false
     default: ''
+  rack_nodes:
+    description: >-
+      Worker count per ICN rack in RACK1=COUNT1,RACK2=COUNT2 format, for example rack-01=4,rack-02=4.
+      Counts must add up to nnodes. Workers are assigned to racks in the listed order, so the first rack
+      receives worker-0 and the lowest ranks; each worker is pinned to its rack through the icn-rack node label.
+      Requires gang mode (nnodes of 1 or more) and board-type=ZW-M890P in node_selector. No rack fallback is applied:
+      if one rack lacks capacity, the whole gang waits until the timeout.
+    required: false
+    default: ''
   container_options:
     description: >-
       Container runtime options (a YAML fragment, optionally multiline). Supported keys: privileged: true/false
@@ -332,6 +341,7 @@ runs:
         INPUT_MASTER_PORT: ${{ inputs.master_port }}
         INPUT_CLEANUP_POLICY: ${{ inputs.cleanup_policy }}
         INPUT_NODE_SELECTOR: ${{ inputs.node_selector }}
+        INPUT_RACK_NODES: ${{ inputs.rack_nodes }}
         INPUT_SOURCE_DIR: ${{ inputs.source_dir }}
         CONTAINER_OPTIONS: ${{ inputs.container_options }}
         SOURCE_STAGE_DIR: ${{ env.SOURCE_STAGE_DIR }}

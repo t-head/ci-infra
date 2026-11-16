@@ -406,7 +406,8 @@ class StagingTests(unittest.TestCase):
     def test_master_action_inputs_and_internal_output_handoff(self):
         existing = {"nnodes", "nproc_per_node", "command", "image", "namespace", "timeout_minutes",
                     "host_volumes", "extra_env", "master_port", "cleanup_policy", "source_dir",
-                    "node_selector", "container_options", "artifact_paths", "job_suffix", "dmesg_policy"}
+                    "node_selector", "container_options", "artifact_paths", "job_suffix", "dmesg_policy",
+                    "rack_nodes"}
         self.assertEqual(set(self.action["inputs"]) - existing, {"launch_mode", "setup_command", "ssh_port"})
         for key, default in (("launch_mode", "each-node"), ("setup_command", ""), ("ssh_port", "2222")):
             self.assertEqual(str(self.action["inputs"][key]["default"]), default)
@@ -419,6 +420,13 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(steps[name]["env"]["MASTER_RUNTIME_DIR"], "${{ steps.submit.outputs.master_runtime_dir }}")
         self.assertEqual(steps["monitor"]["env"]["JOB_DEADLINE"], "${{ steps.submit.outputs.deadline }}")
         self.assertEqual(steps["cleanup"]["if"], "always()")
+
+    def test_rack_nodes_input_is_optional_and_reaches_submission(self):
+        rack_nodes = self.action["inputs"]["rack_nodes"]
+        self.assertEqual(rack_nodes["default"], "")
+        self.assertIs(rack_nodes.get("required", False), False)
+        steps = {step["id"]: step for step in self.action["runs"]["steps"] if "id" in step}
+        self.assertEqual(steps["submit"]["env"]["INPUT_RACK_NODES"], "${{ inputs.rack_nodes }}")
 
     def test_master_preflight_validates_mode_and_port_without_cluster_side_effects(self):
         self.fake("kubectl")

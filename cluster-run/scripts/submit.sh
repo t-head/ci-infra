@@ -106,6 +106,7 @@ EXTRA_ENV="${INPUT_EXTRA_ENV:-}"
 MASTER_PORT="${INPUT_MASTER_PORT:-29500}"
 CLEANUP_POLICY="${INPUT_CLEANUP_POLICY:-always}"
 NODE_SELECTOR="${INPUT_NODE_SELECTOR:-}"
+RACK_NODES="${INPUT_RACK_NODES:-}"
 SOURCE_STAGE_DIR="${SOURCE_STAGE_DIR:-}"
 SOURCE_MOUNT_PATH="${INPUT_SOURCE_DIR:-/workspace/source}"
 CONTAINER_OPTIONS="${CONTAINER_OPTIONS:-}"
@@ -293,12 +294,58 @@ if [ -n "$NODE_SELECTOR" ]; then
       BOARD_TYPE="$_val"
       [ "$_val" = "ZW-810E" ] && _val="OAM-810E"
     fi
+    if [ "$_key" = "icn-rack" ] && [ -n "$RACK_NODES" ]; then
+      log_error "node_selector cannot set icn-rack when rack_nodes is used"
+      exit 1
+    fi
     _ns_items+="    ${_key}: \"${_val}\""$'\n'
   done
   _ns_items="${_ns_items%$'\n'}"
   if [ -n "$_ns_items" ]; then
     NODE_SELECTOR_YAML="  nodeSelector:"$'\n'"${_ns_items}"
   fi
+fi
+
+# --- Expand rack_nodes into one ICN rack per worker index ---
+WORKER_RACKS=()
+if [ -n "$RACK_NODES" ]; then
+  if [ "$SINGLE_MODE" = true ]; then
+    log_error "rack_nodes requires gang mode (nnodes of 1 or more)"
+    exit 1
+  fi
+  if [ "$BOARD_TYPE" != "ZW-M890P" ]; then
+    log_error "rack_nodes requires board-type=ZW-M890P in node_selector; other boards have no icn-rack labels"
+    exit 1
+  fi
+  _rack_seen=","
+  _rack_summary=""
+  IFS=',' read -ra _rack_pairs <<< "$RACK_NODES"
+  for _pair in "${_rack_pairs[@]}"; do
+    _pair=$(printf '%s' "$_pair" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$_pair" ] && continue
+    _rack="${_pair%%=*}"
+    _count="${_pair#*=}"
+    if [[ "$_pair" != *=* ]] || [ ${#_rack} -gt 63 ] \
+       || ! [[ "$_rack" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?$ ]] \
+       || ! [[ "$_count" =~ ^[1-9][0-9]{0,3}$ ]]; then
+      log_error "rack_nodes requires RACK=COUNT entries with a valid label value and a positive count, got '${_pair}'"
+      exit 1
+    fi
+    if [[ "$_rack_seen" == *",${_rack},"* ]]; then
+      log_error "rack_nodes lists rack '${_rack}' more than once"
+      exit 1
+    fi
+    _rack_seen+="${_rack},"
+    for (( _n = 0; _n < _count; _n++ )); do
+      WORKER_RACKS+=("$_rack")
+    done
+    _rack_summary+="${_rack_summary:+ }${_rack}=${_count}"
+  done
+  if [ "${#WORKER_RACKS[@]}" -ne "$NNODES" ]; then
+    log_error "rack_nodes counts add up to ${#WORKER_RACKS[@]}, but nnodes is ${NNODES}"
+    exit 1
+  fi
+  log_info "Rack allocation: ${_rack_summary} (workers assigned in listed order)"
 fi
 
 # --- Parse container runtime options ---
@@ -759,6 +806,10 @@ MASTER_ADDR="${JOB_NAME}-worker-0.${JOB_NAME}.${NAMESPACE}.svc.cluster.local"
 
 # --- Create N Pods in a loop ---
 for i in $(seq 0 $(( NNODES - 1 ))); do
+  WORKER_NODE_SELECTOR_YAML="$NODE_SELECTOR_YAML"
+  if [ -n "$RACK_NODES" ]; then
+    WORKER_NODE_SELECTOR_YAML="${NODE_SELECTOR_YAML}"$'\n'"    icn-rack: \"${WORKER_RACKS[$i]}\""
+  fi
   if [ "$MASTER_MULTI" = true ]; then
     MASTER_VOLUME_DEFS="    - name: cluster-runtime
       emptyDir:
@@ -788,7 +839,7 @@ spec:
   restartPolicy: Never
 ${MASTER_POD_OPTIONS}
 ${POD_AFFINITY_YAML}
-${NODE_SELECTOR_YAML}
+${WORKER_NODE_SELECTOR_YAML}
 ${POD_LEVEL_OPTIONS_YAML}
   dnsConfig:
     options:
@@ -927,7 +978,7 @@ while true; do
   fi
   SCHEDULED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length')
   if [ "$SCHEDULED" -eq "$NNODES" ]; then
-    printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName)"'
+    printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName)\(if .spec.nodeSelector["icn-rack"] then " (icn-rack=\(.spec.nodeSelector["icn-rack"]))" else "" end)"'
     FINAL_STATUS="scheduled"
     set_output "job_status" "$FINAL_STATUS"
     log_info "All ${NNODES} worker pods are scheduled"
