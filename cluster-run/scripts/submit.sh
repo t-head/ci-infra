@@ -28,6 +28,7 @@ set_output "queue_reason" ""
 set_output "occupied_ppu_card_hours" "0.0000"
 set_output "execution_ppu_card_hours" "0.0000"
 set_output "task_pods" ""
+set_output "task_racks" ""
 
 FINAL_STATUS="failed"
 WORKERS_SUBMITTED=false
@@ -1062,6 +1063,10 @@ while true; do
         printf '%s' "$POD_SNAPSHOT" | jq -r --slurpfile racks "$RACK_MAP_FILE" '
           ($racks[0] // {}) as $map |
           .items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName) (icn-rack=\($map[.spec.nodeName] // "unknown"))"'
+        TASK_RACKS=$(printf '%s' "$POD_SNAPSHOT" | jq -c --slurpfile racks "$RACK_MAP_FILE" '
+          ($racks[0] // {}) as $map |
+          [.items | sort_by(.metadata.labels["worker-index"] | tonumber)[] | $map[.spec.nodeName] // ""]')
+        set_output "task_racks" "$TASK_RACKS"
       else
         log_warn "Could not read node rack labels; printing node placement only"
         printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName)"'

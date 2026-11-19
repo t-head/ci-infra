@@ -253,29 +253,24 @@ jobs:
           timeout_minutes: 10
           command: ${{ matrix.rack_command == 'rack' && env.RACK_SMOKE_COMMAND || env.SMOKE_COMMAND }}
 
-      - name: Capture worker rack placement before cleanup
+      - name: Assert worker rack placement
         if: matrix.rack_command == 'rack'
         shell: bash
         env:
-          REPORTED_NAME: ${{ steps.smoke.outputs.job_name }}
+          TASK_RACKS: ${{ steps.smoke.outputs.task_racks }}
           RACK_POLICY: ${{ matrix.rack_policy }}
           RACK_COUNT: ${{ matrix.rack_count }}
           EXPECTED_WORKERS: ${{ matrix.nodes }}
         run: |
           set -euo pipefail
-          pods_json="$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$REPORTED_NAME" -o json)"
-          nodes_json="$(kubectl get nodes -o json)"
-          placement="$(jq -n --argjson pods "$pods_json" --argjson nodes "$nodes_json" '
-            ($nodes.items | map({key: .metadata.name, value: .metadata.labels["icn-rack"]}) | from_entries) as $racks |
-            [$pods.items[] | {node: .spec.nodeName, rack: ($racks[.spec.nodeName] // "")}]')"
-          printf '%s\n' "$placement"
-          jq -e --argjson expected "$EXPECTED_WORKERS" 'length == $expected and all(.[]; .rack != "")' <<< "$placement"
-          racks="$(jq -r '[.[].rack] | unique | length' <<< "$placement")"
+          printf 'task_racks=%s\n' "$TASK_RACKS"
+          jq -e --argjson expected "$EXPECTED_WORKERS" 'length == $expected and all(.[]; . != "")' <<< "$TASK_RACKS"
+          racks="$(jq -r 'unique | length' <<< "$TASK_RACKS")"
           if [ "$RACK_POLICY" = same ]; then
             [ "$racks" -eq 1 ]
           else
             [ "$racks" -ge 2 ]
-            jq -e 'group_by(.rack) | map(length) | (max - min) <= 1' <<< "$placement"
+            jq -e 'group_by(.) | map(length) | (max - min) <= 1' <<< "$TASK_RACKS"
             if [ -n "$RACK_COUNT" ]; then
               [ "$racks" -eq "$RACK_COUNT" ]
             fi

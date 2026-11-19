@@ -41,6 +41,7 @@ def pod(index, phase="Pending", scheduled=None, created=EPOCH, started=None,
                                 "exitCode": int(phase == "Failed"),
                                 "reason": "Error" if phase == "Failed" else "Completed"}}
     return {"metadata": {"name": f"worker-{index}",
+                         "labels": {"worker-index": str(index)},
                          "creationTimestamp": timestamp(created)},
             "spec": {"nodeName": f"node-{index}" if scheduled is not None else ""},
             "status": {"phase": phase, "conditions": conditions,
@@ -746,6 +747,10 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(rc, 0, text)
                 self.assertEqual(outputs["job_status"], "scheduled")
                 self.assertEqual(self.manifest("podgroup.yaml")["spec"]["minMember"], 3)
+                if policy:
+                    self.assertEqual(json.loads(outputs["task_racks"]), ["rack-a", "rack-b", "rack-c"])
+                else:
+                    self.assertEqual(outputs["task_racks"], "")
                 selector = {"matchLabels": {"ppu-job": self.env["JOB_NAME"]}}
                 for index in range(3):
                     spec = self.worker_manifest(index)["spec"]

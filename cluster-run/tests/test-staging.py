@@ -441,6 +441,7 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(self.action["inputs"]["rack_count"]["default"], "")
         self.assertIs(self.action["inputs"]["rack_count"].get("required", False), False)
         self.assertEqual(steps["submit"]["env"]["INPUT_RACK_COUNT"], "${{ inputs.rack_count }}")
+        self.assertEqual(self.action["outputs"]["task_racks"]["value"], "${{ steps.submit.outputs.task_racks }}")
 
     def test_master_preflight_validates_mode_and_port_without_cluster_side_effects(self):
         self.fake("kubectl")

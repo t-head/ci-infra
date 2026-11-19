@@ -158,6 +158,9 @@ outputs:
   task_pods:
     description: 'Comma-separated worker pod names.'
     value: ${{ steps.monitor.outputs.task_pods || steps.submit.outputs.task_pods }}
+  task_racks:
+    description: 'JSON array of icn-rack values per worker in rank order; empty unless rack_policy is set.'
+    value: ${{ steps.submit.outputs.task_racks }}
 
 runs:
   using: 'composite'
