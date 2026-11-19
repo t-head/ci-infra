@@ -20,7 +20,11 @@ METRICS_END_EPOCH=$(date +%s)
 METRICS_END_TIME=$(date +%Y-%m-%dT%H:%M:%S%z)
 DURATION=$(( METRICS_END_EPOCH - START_TIME ))
 set_output "duration_seconds" "$DURATION"
-POD_SNAPSHOT=$(timeout --signal=KILL 10s kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
+if [ "${WORKERS_SUBMITTED:-true}" = false ]; then
+  POD_SNAPSHOT='{"items":[]}'
+else
+  POD_SNAPSHOT=$(timeout --signal=KILL 10s kubectl get pods -n "$NAMESPACE" -l "ppu-job=$JOB_NAME" -o json)
+fi
 
 QUEUE_START_EPOCH=0
 QUEUE_END_EPOCH=0

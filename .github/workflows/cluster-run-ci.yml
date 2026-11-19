@@ -31,6 +31,16 @@ env:
     ppu-smi
     sleep 30
 
+  RACK_SMOKE_COMMAND: |
+    set -euo pipefail
+    test -f /workspace/source/cluster-run/action.yml
+    test -f /workspace/source/README.md
+    test -d /nas_aisw
+    test -d /mnt/wl_nas
+    printf 'rank=%s node_rank=%s world_size=%s nodes=%s cards=%s\n' "$RANK" "$NODE_RANK" "$WORLD_SIZE" "$NNODES" "$NPROC_PER_NODE"
+    ppu-smi
+    sleep 300
+
   MASTER_SMOKE_COMMAND: |
     set -euo pipefail
     test "$RANK" = 0
@@ -193,17 +203,20 @@ jobs:
             devices: 1
             board_type: ZW-M890P
             rack_policy: same
+            rack_command: rack
           - label: three 890P workers across automatic ICN racks
             nodes: 3
             devices: 1
             board_type: ZW-M890P
             rack_policy: spread
+            rack_command: rack
           - label: two 890P workers across exactly two automatic ICN racks
             nodes: 2
             devices: 1
             board_type: ZW-M890P
             rack_policy: spread
             rack_count: 2
+            rack_command: rack
           - label: one 810E card
             nodes: 0
             devices: 1
@@ -238,7 +251,35 @@ jobs:
           rack_count: ${{ matrix.rack_count }}
           dmesg_policy: always
           timeout_minutes: 10
-          command: ${{ env.SMOKE_COMMAND }}
+          command: ${{ matrix.rack_command == 'rack' && env.RACK_SMOKE_COMMAND || env.SMOKE_COMMAND }}
+
+      - name: Capture worker rack placement before cleanup
+        if: matrix.rack_command == 'rack'
+        shell: bash
+        env:
+          REPORTED_NAME: ${{ steps.smoke.outputs.job_name }}
+          RACK_POLICY: ${{ matrix.rack_policy }}
+          RACK_COUNT: ${{ matrix.rack_count }}
+          EXPECTED_WORKERS: ${{ matrix.nodes }}
+        run: |
+          set -euo pipefail
+          pods_json="$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$REPORTED_NAME" -o json)"
+          nodes_json="$(kubectl get nodes -o json)"
+          placement="$(jq -n --argjson pods "$pods_json" --argjson nodes "$nodes_json" '
+            ($nodes.items | map({key: .metadata.name, value: .metadata.labels["icn-rack"]}) | from_entries) as $racks |
+            [$pods.items[] | {node: .spec.nodeName, rack: ($racks[.spec.nodeName] // "")}]')"
+          printf '%s\n' "$placement"
+          jq -e --argjson expected "$EXPECTED_WORKERS" 'length == $expected and all(.[]; .rack != "")' <<< "$placement"
+          racks="$(jq -r '[.[].rack] | unique | length' <<< "$placement")"
+          if [ "$RACK_POLICY" = same ]; then
+            [ "$racks" -eq 1 ]
+          else
+            [ "$racks" -ge 2 ]
+            jq -e 'group_by(.rack) | map(length) | (max - min) <= 1' <<< "$placement"
+            if [ -n "$RACK_COUNT" ]; then
+              [ "$racks" -eq "$RACK_COUNT" ]
+            fi
+          fi
 
       - name: Assert reported results
         shell: bash
@@ -705,18 +746,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Request more racks than exist
+      - name: Request deliberately unavailable rack candidates
         id: blocked_racks
         continue-on-error: true
         uses: $/cluster-run
         with:
           image: ${{ env.WORKER_IMAGE }}
           namespace: ${{ env.TEST_NAMESPACE }}
-          nnodes: 3
+          nnodes: 2
           nproc_per_node: 1
-          node_selector: board-type=ZW-M890P,nic-type=cx8
+          node_selector: board-type=ZW-M890P,nic-type=cx8,ppu-ci-unavailable-rack=${{ github.run_id }}-${{ github.run_attempt }}
           rack_policy: spread
-          rack_count: 3
+          rack_count: 2
           timeout_minutes: 2
           command: echo 'Unavailable rack candidates unexpectedly started' && exit 1
 
@@ -726,11 +767,13 @@ jobs:
           ALLOCATION_NAME: ${{ steps.blocked_racks.outputs.job_name }}
           ALLOCATION_OUTCOME: ${{ steps.blocked_racks.outcome }}
           ALLOCATION_STATUS: ${{ steps.blocked_racks.outputs.job_status }}
+          ALLOCATION_PODS: ${{ steps.blocked_racks.outputs.task_pods }}
         run: |
-          printf 'outcome=%s status=%s\n' "$ALLOCATION_OUTCOME" "$ALLOCATION_STATUS"
+          printf 'outcome=%s status=%s pods=%s\n' "$ALLOCATION_OUTCOME" "$ALLOCATION_STATUS" "$ALLOCATION_PODS"
           [ "$ALLOCATION_OUTCOME" = failure ]
           [ "$ALLOCATION_STATUS" = timeout ]
           [ -n "$ALLOCATION_NAME" ]
+          [ -z "$ALLOCATION_PODS" ]
           pods="$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$ALLOCATION_NAME" -o name)"
           test -z "$pods"
           groups="$(kubectl get podgroups.scheduling.x-k8s.io "$ALLOCATION_NAME" -n "$TEST_NAMESPACE" --ignore-not-found=true -o name)"

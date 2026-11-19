@@ -27,8 +27,10 @@ set_output "pod_queue" ""
 set_output "queue_reason" ""
 set_output "occupied_ppu_card_hours" "0.0000"
 set_output "execution_ppu_card_hours" "0.0000"
+set_output "task_pods" ""
 
 FINAL_STATUS="failed"
+WORKERS_SUBMITTED=false
 MASTER_KEYS_DIR=""
 _on_exit() {
   local rc=$?
@@ -45,7 +47,7 @@ _on_exit() {
     wait "$WAIT_PID" 2>/dev/null || true
   fi
   if [ "$FINAL_STATUS" != "scheduled" ] && [ -n "${START_TIME:-}" ]; then
-    JOB_STATUS="$FINAL_STATUS" JOB_START_TIME="$START_TIME" \
+    JOB_STATUS="$FINAL_STATUS" JOB_START_TIME="$START_TIME" WORKERS_SUBMITTED="$WORKERS_SUBMITTED" \
       bash "$(dirname "${BASH_SOURCE[0]}")/report-job.sh" || true
   fi
   exit "$rc"
@@ -659,8 +661,34 @@ fi
 
 SCRIPT_INDENTED=$(printf '%s\n' "$COMMAND" | sed 's/^/          /')
 
+write_task_record() {
+  {
+    TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"
+    mkdir -p "$TASK_DIR" 2>/dev/null || true
+    TASK_FILE="${TASK_DIR}/${JOB_NAME}.json"
+    cat > "$TASK_FILE" <<TASK_EOF
+{
+  "run_id": "${RUN_ID}",
+  "run_attempt": "${RUN_ATTEMPT}",
+  "repo": "${GITHUB_REPOSITORY}",
+  "job_name": "${JOB_NAME}",
+  "github_job": "${GITHUB_JOB_NAME}",
+  "pod_name": "${JOB_NAME}-worker-0",
+  "namespace": "${NAMESPACE}",
+  "ppu_per_node": ${NPROC},
+  "nnodes": ${NNODES},
+  "ppu_total": $(( NNODES * NPROC )),
+  "start_time": "$(date +%Y-%m-%dT%H:%M:%S%z)",
+  "status": "pending"
+}
+TASK_EOF
+    log_info "Task record written: ${TASK_FILE}"
+  } 2>/dev/null || true
+}
+
 SELECTED_RACKS="[]"
 if [ -n "$RACK_COUNT" ]; then
+  write_task_record
   while true; do
     if [ "$(date +%s)" -ge "$DEADLINE" ]; then
       log_error "Timed out waiting for ${RACK_COUNT} racks with enough matching nodes"
@@ -672,7 +700,12 @@ if [ -n "$RACK_COUNT" ]; then
       [.items[] |
         select(.spec.unschedulable != true) |
         select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) |
-        select(all(.spec.taints[]?; .effect != "NoSchedule" and .effect != "NoExecute")) |
+        select(all(.spec.taints[]?;
+          (.effect != "NoSchedule" and .effect != "NoExecute") or
+          (.key == "node.kubernetes.io/not-ready" or .key == "node.kubernetes.io/unreachable" or
+           .key == "node.kubernetes.io/memory-pressure" or .key == "node.kubernetes.io/disk-pressure" or
+           .key == "node.kubernetes.io/pid-pressure" or .key == "node.kubernetes.io/unschedulable" or
+           .key == "node.kubernetes.io/network-unavailable"))) |
         select((.metadata.labels["icn-rack"] // "") != "") |
         select((.status.allocatable["alibabacloud.com/ppu"] // "0" | tonumber) >= $nproc)] |
       group_by(.metadata.labels["icn-rack"]) |
@@ -992,31 +1025,13 @@ POD_EOF
   kube_request create -f "$POD_MANIFEST"
 done
 
+WORKERS_SUBMITTED=true
 log_info "All ${NNODES} worker Pods submitted"
 
 # --- Write the task record to NAS ---
-{
-  TASK_DIR="/wl_nas/devops/ppu-dashboard/tasks"
-  mkdir -p "$TASK_DIR" 2>/dev/null || true
-  TASK_FILE="${TASK_DIR}/${JOB_NAME}.json"
-  cat > "$TASK_FILE" <<TASK_EOF
-{
-  "run_id": "${RUN_ID}",
-  "run_attempt": "${RUN_ATTEMPT}",
-  "repo": "${GITHUB_REPOSITORY}",
-  "job_name": "${JOB_NAME}",
-  "github_job": "${GITHUB_JOB_NAME}",
-  "pod_name": "${JOB_NAME}-worker-0",
-  "namespace": "${NAMESPACE}",
-  "ppu_per_node": ${NPROC},
-  "nnodes": ${NNODES},
-  "ppu_total": $(( NNODES * NPROC )),
-  "start_time": "$(date +%Y-%m-%dT%H:%M:%S%z)",
-  "status": "pending"
-}
-TASK_EOF
-  log_info "Task record written: ${TASK_FILE}"
-} 2>/dev/null || true
+if [ -z "${TASK_FILE:-}" ]; then
+  write_task_record
+fi
 
 log_info "Waiting for PPU scheduling (shared job timeout: ${TIMEOUT}s)..."
 
@@ -1041,10 +1056,16 @@ while true; do
   SCHEDULED=$(printf '%s' "$POD_SNAPSHOT" | jq '[.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length')
   if [ "$SCHEDULED" -eq "$NNODES" ]; then
     if [ -n "$RACK_POLICY" ]; then
-      NODE_RACKS=$(kube_request get nodes -o json | jq -c '
-        .items | map({key: .metadata.name, value: .metadata.labels["icn-rack"]}) | from_entries')
-      printf '%s' "$POD_SNAPSHOT" | jq -r --argjson racks "$NODE_RACKS" '
-        .items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName) (icn-rack=\($racks[.spec.nodeName]))"'
+      RACK_MAP_FILE="$MANIFEST_DIR/node-racks.json"
+      if kube_request get nodes -o json | jq -c '
+        .items | map({key: .metadata.name, value: .metadata.labels["icn-rack"]}) | from_entries' > "$RACK_MAP_FILE"; then
+        printf '%s' "$POD_SNAPSHOT" | jq -r --slurpfile racks "$RACK_MAP_FILE" '
+          ($racks[0] // {}) as $map |
+          .items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName) (icn-rack=\($map[.spec.nodeName] // "unknown"))"'
+      else
+        log_warn "Could not read node rack labels; printing node placement only"
+        printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName)"'
+      fi
     else
       printf '%s' "$POD_SNAPSHOT" | jq -r '.items[] | "Pod \(.metadata.name) -> Node: \(.spec.nodeName)"'
     fi

@@ -797,6 +797,44 @@ class LifecycleTests(unittest.TestCase):
                     self.assertEqual(spec["topologySpreadConstraints"][0]["maxSkew"], 1)
                     self.assertEqual(spec["topologySpreadConstraints"][0]["whenUnsatisfiable"], "DoNotSchedule")
 
+    def test_rack_count_tolerates_default_pressure_taints_but_not_custom_taints(self):
+        nodes = [rack_node(f"{rack}-{i}", rack) for rack in ("rack-a", "rack-b") for i in range(2)]
+        for node in nodes:
+            node["spec"]["taints"] = [{"key": "node.kubernetes.io/memory-pressure", "effect": "NoSchedule"}]
+        blocked = rack_node("blocked-0", "rack-c")
+        blocked["spec"]["taints"] = [{"key": "maintenance", "effect": "NoSchedule"}]
+        nodes.append(blocked)
+        self.configure([pod(i, scheduled=EPOCH) for i in range(4)], nodes=nodes)
+        rc, outputs, text = self.run_script(
+            "submit.sh", INPUT_NNODES="4", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT="2",
+            INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        expression = self.worker_manifest()["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]
+        self.assertEqual(expression["values"], ["rack-a", "rack-b"])
+
+    def test_rack_count_timeout_writes_dashboard_record_without_workers(self):
+        self.configure([pod(i) for i in range(2)])
+        rc, outputs, text = self.run_script(
+            "submit.sh", INPUT_NNODES="2", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT="2",
+            INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "timeout")
+        self.assertEqual(outputs["task_pods"], "")
+        record = json.loads((self.root / "tasks" / (self.env["JOB_NAME"] + ".json")).read_text())
+        self.assertEqual(record["status"], "timeout")
+        self.assertEqual(record["nnodes"], 2)
+        self.assertFalse(any(call["args"][0] in ("create", "delete") for call in self.calls("kubectl")))
+
+    def test_rack_logging_falls_back_when_node_query_fails(self):
+        self.configure([pod(0, scheduled=EPOCH)], node_query_error=42)
+        rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="1", INPUT_RACK_POLICY="same",
+                                           INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        self.assertIn("Could not read node rack labels", text)
+        self.assertIn("Node: node-0", text)
+
     def test_rack_count_honors_node_filters_and_registered_capacity(self):
         nodes = [rack_node(f"good-{rack}-{i}", rack) for rack in ("rack-a", "rack-b") for i in range(2)]
         for i in range(8):

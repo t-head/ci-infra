@@ -69,6 +69,9 @@ def fake_command(tool, args):
         if args[:2] == ["get", "pods"]:
             print(fixture.get("pods", ""), end="")
             return fixture.get("query_status", 0)
+        if args[:2] == ["get", "nodes"]:
+            print(json.dumps({"items": fixture.get("nodes", [])}))
+            return fixture.get("query_status", 0)
     if tool == "curl":
         if "-o" in args:
             Path(args[args.index("-o") + 1]).write_text(wrapper("kubectl"))
@@ -371,7 +374,7 @@ class StagingTests(unittest.TestCase):
         self.fake("kubectl")
         self.fake("timeout")
         scripts = [step["run"] for job in self.workflow["jobs"].values() for step in job["steps"]
-                   if "kubectl get pods" in step.get("run", "")]
+                   if "kubectl get pods" in step.get("run", "") and "-o json" not in step.get("run", "")]
         self.assertTrue(scripts)
         env = dict(self.env)
         for script in scripts:
@@ -382,6 +385,8 @@ class StagingTests(unittest.TestCase):
                     env[key] = "failure" if '[ "$ALLOCATION_OUTCOME" = failure ]' in script else "success"
                 elif key == "ALLOCATION_STATUS":
                     env[key] = "timeout" if '[ "$ALLOCATION_STATUS" = timeout ]' in script else "succeeded"
+                elif key == "ALLOCATION_PODS":
+                    env[key] = ""
                 else:
                     env[key] = "succeeded"
             env.update(NAMESPACE="fixture", TEST_NAMESPACE="fixture", ALLOCATION_NAME="fixture-job")
