@@ -188,11 +188,22 @@ jobs:
             nodes: 2
             devices: 8
             board_type: ZW-M890P
-          - label: two 890P workers pinned to one ICN rack
+          - label: two 890P workers in one automatic ICN rack
             nodes: 2
             devices: 1
             board_type: ZW-M890P
-            rack_nodes: rack-01=2
+            rack_policy: same
+          - label: three 890P workers across automatic ICN racks
+            nodes: 3
+            devices: 1
+            board_type: ZW-M890P
+            rack_policy: spread
+          - label: two 890P workers across exactly two automatic ICN racks
+            nodes: 2
+            devices: 1
+            board_type: ZW-M890P
+            rack_policy: spread
+            rack_count: 2
           - label: one 810E card
             nodes: 0
             devices: 1
@@ -223,7 +234,8 @@ jobs:
           nnodes: ${{ matrix.nodes }}
           nproc_per_node: ${{ matrix.devices }}
           node_selector: board-type=${{ matrix.board_type }}
-          rack_nodes: ${{ matrix.rack_nodes }}
+          rack_policy: ${{ matrix.rack_policy }}
+          rack_count: ${{ matrix.rack_count }}
           dmesg_policy: always
           timeout_minutes: 10
           command: ${{ env.SMOKE_COMMAND }}
@@ -679,6 +691,50 @@ jobs:
           printf 'outcome=%s status=%s\n' "$ALLOCATION_OUTCOME" "$ALLOCATION_STATUS"
           [ "$ALLOCATION_OUTCOME" = failure ]
           [ "$ALLOCATION_STATUS" = timeout ]
+
+  rack-count-block-check:
+    name: Reject unavailable rack-count candidates
+    needs: checks
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Fetch this revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Request more racks than exist
+        id: blocked_racks
+        continue-on-error: true
+        uses: $/cluster-run
+        with:
+          image: ${{ env.WORKER_IMAGE }}
+          namespace: ${{ env.TEST_NAMESPACE }}
+          nnodes: 3
+          nproc_per_node: 1
+          node_selector: board-type=ZW-M890P,nic-type=cx8
+          rack_policy: spread
+          rack_count: 3
+          timeout_minutes: 2
+          command: echo 'Unavailable rack candidates unexpectedly started' && exit 1
+
+      - name: Require timeout without worker resources
+        shell: bash
+        env:
+          ALLOCATION_NAME: ${{ steps.blocked_racks.outputs.job_name }}
+          ALLOCATION_OUTCOME: ${{ steps.blocked_racks.outcome }}
+          ALLOCATION_STATUS: ${{ steps.blocked_racks.outputs.job_status }}
+        run: |
+          printf 'outcome=%s status=%s\n' "$ALLOCATION_OUTCOME" "$ALLOCATION_STATUS"
+          [ "$ALLOCATION_OUTCOME" = failure ]
+          [ "$ALLOCATION_STATUS" = timeout ]
+          [ -n "$ALLOCATION_NAME" ]
+          pods="$(kubectl get pods -n "$TEST_NAMESPACE" -l "ppu-job=$ALLOCATION_NAME" -o name)"
+          test -z "$pods"
+          groups="$(kubectl get podgroups.scheduling.x-k8s.io "$ALLOCATION_NAME" -n "$TEST_NAMESPACE" --ignore-not-found=true -o name)"
+          test -z "$groups"
 
   build-fixture:
     name: Create transfer fixture

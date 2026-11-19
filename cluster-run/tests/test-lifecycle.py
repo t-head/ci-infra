@@ -48,6 +48,13 @@ def pod(index, phase="Pending", scheduled=None, created=EPOCH, started=None,
                                               "state": state}]}}
 
 
+def rack_node(name, rack):
+    return {"metadata": {"name": name, "labels": {
+                "board-type": "ZW-M890P", "nic-type": "cx8", "icn-rack": rack}},
+            "spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                                    "allocatable": {"alibabacloud.com/ppu": "8"}}}
+
+
 def fake_command(tool, args):
     root = Path(os.environ["LIFECYCLE_FIXTURE"])
     fixture = json.loads((root / "fixture.json").read_text())
@@ -151,6 +158,23 @@ def fake_command(tool, args):
                 return fixture.get("create_error", 42)
             return 0
         if args[:2] == ["get", "crd"]:
+            return 0
+        if args[:2] == ["get", "nodes"]:
+            if fixture.get("node_query_error"):
+                return fixture["node_query_error"]
+            nodes = fixture.get("nodes", [])
+            for frame in fixture.get("node_frames", []):
+                if frame["at"] <= clock():
+                    nodes = frame["nodes"]
+            selector = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--selector=")), "")
+            for item in selector.split(","):
+                if not item:
+                    continue
+                key, separator, value = item.partition("=")
+                nodes = [node for node in nodes if
+                         node["metadata"].get("labels", {}).get(key) == value] if separator else [
+                         node for node in nodes if key in node["metadata"].get("labels", {})]
+            print(json.dumps({"items": nodes}))
             return 0
         if args[0] == "get" and args[1] in ("svc", "podgroups.scheduling.x-k8s.io", "secret", "secrets"):
             if fixture.get("gang_query_error") == args[1]:
@@ -710,62 +734,250 @@ class LifecycleTests(unittest.TestCase):
                 self.assertFalse(any(call["args"][0] == "create"
                                      for call in self.calls("kubectl")[before:]))
 
-    def test_rack_nodes_pin_workers_to_racks_in_listed_order(self):
-        for racks, expected in ((None, [None, None, None]),
-                                (" rack-01=2, rack-02=1 ", ["rack-01", "rack-01", "rack-02"])):
-            with self.subTest(racks=racks):
-                self.configure([pod(i, scheduled=EPOCH) for i in range(3)])
+    def test_rack_policies_generate_unpinned_job_scoped_constraints(self):
+        for policy in ("", "same", "spread"):
+            with self.subTest(policy=policy):
+                nodes = [{"metadata": {"name": f"node-{i}", "labels": {"icn-rack": rack}}}
+                         for i, rack in enumerate(("rack-a", "rack-b", "rack-c"))]
+                self.configure([pod(i, scheduled=EPOCH) for i in range(3)], nodes=nodes)
                 rc, outputs, text = self.run_script(
-                    "submit.sh", INPUT_NNODES="3", INPUT_NODE_SELECTOR="board-type=ZW-M890P",
-                    **({"INPUT_RACK_NODES": racks} if racks else {}))
+                    "submit.sh", INPUT_NNODES="3", INPUT_NODE_SELECTOR="board-type=ZW-M890P,nic-type=cx8",
+                    INPUT_RACK_POLICY=policy)
                 self.assertEqual(rc, 0, text)
                 self.assertEqual(outputs["job_status"], "scheduled")
                 self.assertEqual(self.manifest("podgroup.yaml")["spec"]["minMember"], 3)
-                for index, rack in enumerate(expected):
+                selector = {"matchLabels": {"ppu-job": self.env["JOB_NAME"]}}
+                for index in range(3):
                     spec = self.worker_manifest(index)["spec"]
-                    selector = {"board-type": "ZW-M890P", **({"icn-rack": rack} if rack else {})}
-                    self.assertEqual(spec["nodeSelector"], selector)
-                    anti = spec["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
-                    self.assertEqual(anti[0]["topologyKey"], "kubernetes.io/hostname")
+                    self.assertEqual(spec["nodeSelector"], {"board-type": "ZW-M890P", "nic-type": "cx8"})
+                    self.assertEqual(spec["schedulerName"], "ppu-scheduler")
+                    affinity = spec["affinity"]
+                    anti = affinity["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                    self.assertEqual(anti, [{"labelSelector": selector, "topologyKey": "kubernetes.io/hostname"}])
+                    if policy:
+                        terms = affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+                        self.assertEqual(terms, [{"matchExpressions": [{"key": "icn-rack", "operator": "Exists"}]}])
+                        self.assertIn(f"Node: node-{index} (icn-rack=rack-{chr(97 + index)})", text)
+                    else:
+                        self.assertNotIn("nodeAffinity", affinity)
+                        self.assertNotIn("icn-rack=", text)
+                    if policy == "same":
+                        self.assertEqual(affinity["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"],
+                                         [{"labelSelector": selector, "topologyKey": "icn-rack"}])
+                    else:
+                        self.assertNotIn("podAffinity", affinity)
+                    if policy == "spread":
+                        self.assertEqual(spec["topologySpreadConstraints"], [{
+                            "maxSkew": 1, "minDomains": 2, "topologyKey": "icn-rack",
+                            "whenUnsatisfiable": "DoNotSchedule", "nodeAffinityPolicy": "Honor",
+                            "nodeTaintsPolicy": "Honor", "labelSelector": selector}])
+                    else:
+                        self.assertNotIn("topologySpreadConstraints", spec)
 
-    def test_submit_rejects_invalid_rack_nodes_before_creation(self):
+    def test_rack_count_limits_eight_workers_to_two_or_four_automatic_racks(self):
+        nodes = [rack_node(f"node-{rack}-{i}", rack) for rack, size in
+                 (("rack-a", 8), ("rack-b", 7), ("rack-c", 6), ("rack-d", 5), ("rack-e", 4))
+                 for i in range(size)]
+        for count in (2, 4):
+            with self.subTest(rack_count=count):
+                self.configure([pod(i, scheduled=EPOCH) for i in range(8)], nodes=nodes)
+                rc, outputs, text = self.run_script(
+                    "submit.sh", INPUT_NNODES="8", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT=str(count),
+                    INPUT_NODE_SELECTOR="board-type=ZW-M890P,nic-type=cx8")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "scheduled")
+                self.assertIn(f"Selected {count} racks:", text)
+                self.assertEqual(self.manifest("podgroup.yaml")["spec"]["minMember"], 8)
+                for index in range(8):
+                    spec = self.worker_manifest(index)["spec"]
+                    expression = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]
+                    self.assertEqual(expression, {"key": "icn-rack", "operator": "In",
+                                                 "values": [f"rack-{chr(97 + i)}" for i in range(count)]})
+                    self.assertEqual(spec["topologySpreadConstraints"][0]["minDomains"], count)
+                    self.assertEqual(spec["topologySpreadConstraints"][0]["maxSkew"], 1)
+                    self.assertEqual(spec["topologySpreadConstraints"][0]["whenUnsatisfiable"], "DoNotSchedule")
+
+    def test_rack_count_honors_node_filters_and_registered_capacity(self):
+        nodes = [rack_node(f"good-{rack}-{i}", rack) for rack in ("rack-a", "rack-b") for i in range(2)]
+        for i in range(8):
+            bad = rack_node(f"bad-{i}", "rack-c")
+            if i == 0:
+                bad["metadata"]["labels"]["nic-type"] = "eic"
+            elif i == 1:
+                bad["metadata"]["labels"]["board-type"] = "OAM-810E"
+            elif i == 2:
+                bad["status"]["conditions"][0]["status"] = "False"
+            elif i == 3:
+                bad["spec"]["unschedulable"] = True
+            elif i in (4, 5):
+                bad["spec"]["taints"] = [{"key": "maintenance", "effect": "NoSchedule" if i == 4 else "NoExecute"}]
+            elif i == 6:
+                bad["status"]["allocatable"]["alibabacloud.com/ppu"] = "1"
+            else:
+                del bad["metadata"]["labels"]["icn-rack"]
+            nodes.append(bad)
+        self.configure([pod(i, scheduled=EPOCH) for i in range(4)], nodes=nodes)
+        rc, outputs, text = self.run_script(
+            "submit.sh", INPUT_NNODES="4", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT="2",
+            INPUT_NODE_SELECTOR=" board-type=ZW-M890P,nic-type=cx8", INPUT_NPROC_PER_NODE="2")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        expression = self.worker_manifest()["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]
+        self.assertEqual(expression["values"], ["rack-a", "rack-b"])
+
+    def test_rack_count_remainder_needs_only_one_larger_rack(self):
+        nodes = [rack_node(f"{rack}-{i}", rack) for rack, size in
+                 (("rack-a", 3), ("rack-b", 2), ("rack-c", 2)) for i in range(size)]
+        self.configure([pod(i, scheduled=EPOCH) for i in range(5)], nodes=nodes)
+        rc, outputs, text = self.run_script(
+            "submit.sh", INPUT_NNODES="5", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT="2",
+            INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        expression = self.worker_manifest()["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]
+        self.assertEqual(expression["values"], ["rack-a", "rack-b"])
+
+    def test_rack_count_waits_without_creating_resources_for_insufficient_candidates(self):
+        cases = ((3, [("rack-a", 4), ("rack-b", 4)]),
+                 (2, [("rack-a", 3), ("rack-b", 1)]), (2, []))
+        for count, sizes in cases:
+            with self.subTest(rack_count=count, sizes=sizes):
+                nodes = [rack_node(f"{rack}-{i}", rack) for rack, size in sizes for i in range(size)]
+                self.configure([pod(i) for i in range(4)], nodes=nodes)
+                before = len(self.calls("kubectl"))
+                rc, outputs, text = self.run_script(
+                    "submit.sh", INPUT_NNODES="4", INPUT_RACK_POLICY="spread", INPUT_RACK_COUNT=str(count),
+                    INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "timeout")
+                self.assertIn("Timed out waiting", text)
+                self.assertFalse(any(c["args"][0] in ("create", "delete") for c in self.calls("kubectl")[before:]))
+
+    def test_rack_count_rechecks_candidates_before_submission(self):
+        ready = [rack_node(f"{rack}-{i}", rack) for rack in ("rack-a", "rack-b") for i in range(2)]
+        self.configure([pod(i, scheduled=EPOCH) for i in range(4)], nodes=ready[:2],
+                       node_frames=[{"at": EPOCH + 30, "nodes": ready}])
+        rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="4", INPUT_RACK_POLICY="spread",
+                                           INPUT_RACK_COUNT="2", INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        self.assertIn("Waiting for 2 racks", text)
+        calls = self.calls("kubectl")
+        first_create = next(i for i, call in enumerate(calls) if call["args"][0] == "create")
+        self.assertEqual(sum(call["args"][:2] == ["get", "nodes"] for call in calls[:first_create]), 2)
+
+    def test_rack_count_node_query_error_fails_before_resource_creation(self):
+        self.configure([pod(i) for i in range(2)], node_query_error=42)
+        rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="2", INPUT_RACK_POLICY="spread",
+                                           INPUT_RACK_COUNT="2", INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertNotEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "failed")
+        self.assertFalse(any(call["args"][0] in ("create", "delete") for call in self.calls("kubectl")))
+
+    def test_rack_count_rejects_invalid_counts_and_policies_before_creation(self):
+        cases = [("spread", count) for count in
+                 ("0", "1", "9", "-2", "2.5", "2e0", "02", "two", "2\n", "2;exit 0", "9" * 100)]
+        cases.extend((policy, "2") for policy in ("", "same"))
+        for policy, count in cases:
+            with self.subTest(policy=policy, count=count):
+                before = len(self.calls("kubectl"))
+                self.configure([pod(i) for i in range(8)])
+                rc, _, text = self.run_script("submit.sh", INPUT_NNODES="8", INPUT_RACK_POLICY=policy,
+                                              INPUT_RACK_COUNT=count, INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+                self.assertNotEqual(rc, 0, text)
+                self.assertIn("rack_count", text)
+                self.assertFalse(any(c["args"][0] in ("create", "delete") for c in self.calls("kubectl")[before:]))
+
+    def test_rack_logging_does_not_pass_full_node_objects_as_arguments(self):
+        self.configure([pod(0, scheduled=EPOCH)], nodes=[{
+            "metadata": {"name": "node-0", "labels": {"icn-rack": "rack-x"},
+                         "annotations": {"large-state": "x" * 300000}}}])
+        rc, outputs, text = self.run_script("submit.sh", INPUT_NNODES="1", INPUT_RACK_POLICY="same",
+                                           INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(outputs["job_status"], "scheduled")
+        self.assertIn("Node: node-0 (icn-rack=rack-x)", text)
+
+    def test_same_rack_policy_supports_a_single_worker(self):
+        for count in ("0", "1"):
+            with self.subTest(nnodes=count):
+                self.configure([pod(0, scheduled=EPOCH)],
+                               nodes=[{"metadata": {"name": "node-0", "labels": {"icn-rack": "rack-x"}}}])
+                rc, outputs, text = self.run_script(
+                    "submit.sh", INPUT_NNODES=count, INPUT_RACK_POLICY="same",
+                    INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "scheduled")
+                affinity = self.worker_manifest()["spec"]["affinity"]
+                self.assertEqual(set(affinity), {"nodeAffinity"})
+                self.assertIn("icn-rack=rack-x", text)
+
+    def test_rack_policy_constraints_are_preserved_in_master_mode(self):
+        for policy in ("same", "spread"):
+            with self.subTest(policy=policy):
+                self.configure([pod(i, scheduled=EPOCH) for i in range(2)], nodes=[
+                    {"metadata": {"name": f"node-{i}", "labels": {"icn-rack": "rack-x"}}}
+                    for i in range(2)])
+                rc, outputs, text = self.run_script(
+                    "submit.sh", INPUT_NNODES="2", INPUT_RACK_POLICY=policy, INPUT_LAUNCH_MODE="master",
+                    INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "scheduled")
+                _, secret = self.secret()
+                self.assertEqual(len(json.loads(secret["nodes.json"])), 2)
+                for index in range(2):
+                    spec = self.worker_manifest(index)["spec"]
+                    self.assertIn("nodeAffinity", spec["affinity"])
+                    self.assertIn("podAntiAffinity", spec["affinity"])
+                    self.assertEqual("podAffinity" in spec["affinity"], policy == "same")
+                    self.assertEqual("topologySpreadConstraints" in spec, policy == "spread")
+                    env = {item["name"]: item.get("value") for item in spec["containers"][0]["env"]}
+                    self.assertEqual(env["RANK"], str(index))
+                    self.assertEqual(env["LAUNCH_MODE"], "master")
+
+    def test_fixed_rack_selector_without_policy_is_preserved(self):
+        self.configure([pod(0, scheduled=EPOCH)])
+        rc, _, text = self.run_script("submit.sh", INPUT_NODE_SELECTOR="board-type=ZW-M890P,icn-rack=rack-x")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.worker_manifest()["spec"]["nodeSelector"],
+                         {"board-type": "ZW-M890P", "icn-rack": "rack-x"})
+        self.assertNotIn("affinity", self.worker_manifest()["spec"])
+
+    def test_submit_rejects_invalid_rack_policy_before_creation(self):
         board = "board-type=ZW-M890P"
-        cases = (
-            ("0", board, "rack-01=1", "gang mode"),
-            ("2", "board-type=OAM-810E", "rack-01=2", "board-type=ZW-M890P"),
-            ("2", "", "rack-01=2", "board-type=ZW-M890P"),
-            ("2", board + ",icn-rack=rack-01", "rack-01=2", "icn-rack"),
-            ("2", board, "rack-01=1", "add up to 1"),
-            ("2", board, "rack-01=1,rack-01=1", "more than once"),
-            ("2", board, "rack-01=0,rack-02=2", "RACK=COUNT"),
-            ("2", board, "rack-01", "RACK=COUNT"),
-            ("2", board, "=2", "RACK=COUNT"),
-            ("2", board, "rack 01=2", "RACK=COUNT"),
-            ("2", board, "rack-01=2;touch unsafe", "RACK=COUNT"),
-            ("2", board, "rack-01=2,\nrack-02=1", "line breaks"),
-            ("2", board, "rack-01=2,\r\nrack-02=1", "line breaks"),
-            ("2", board, "rack-01=2\r", "line breaks"),
-            ("2", board, "\nrack-01=2", "line breaks"),
-            ("2", board, "rack-01=2\n", "line breaks"),
-            ("2", board, "rack-01=1, ,rack-02=1", "empty entries"),
-            ("2", board, "rack-01=1,,rack-02=1", "empty entries"),
-            ("2", board, ",rack-01=2", "empty entries"),
-            ("2", board, " ,rack-01=2", "empty entries"),
-            ("2", board, "rack-01=2,", "empty entries"),
-            ("2", board, "rack-01=2, \t", "empty entries"),
-            ("2", board, " \t ", "empty entries"),
-            ("2", board, ",", "empty entries"),
-        )
-        for nodes, selector, racks, message in cases:
-            with self.subTest(selector=selector, racks=racks):
+        cases = [
+            ("0", board, "spread", "nnodes of 2"),
+            ("1", board, "spread", "nnodes of 2"),
+        ]
+        for policy in ("same", "spread"):
+            cases.extend(("2", selector, policy, "board-type=ZW-M890P") for selector in
+                         ("board-type=OAM-810E", "board-type=ZW-810E", "nic-type=cx8", ""))
+            cases.append(("2", board + ",icn-rack=rack-01", policy, "cannot set icn-rack"))
+        cases.extend(("2", board, policy, "rack_policy must be") for policy in
+                     ("auto", "different", "SAME", " spread", "same\nspread", "same\r", "same;exit 0"))
+        for count, selector, policy, message in cases:
+            with self.subTest(nnodes=count, selector=selector, policy=policy):
                 before = len(self.calls("kubectl"))
                 self.configure([pod(i, scheduled=EPOCH) for i in range(2)])
                 rc, _, text = self.run_script(
-                    "submit.sh", INPUT_NNODES=nodes, INPUT_NODE_SELECTOR=selector, INPUT_RACK_NODES=racks)
+                    "submit.sh", INPUT_NNODES=count, INPUT_NODE_SELECTOR=selector, INPUT_RACK_POLICY=policy)
                 self.assertNotEqual(rc, 0, text)
                 self.assertIn(message, text)
                 self.assertFalse(any(call["args"][0] in ("create", "delete")
                                      for call in self.calls("kubectl")[before:]))
+
+    def test_rack_policy_preserves_timeout_for_unschedulable_gang(self):
+        for policy in ("same", "spread"):
+            with self.subTest(policy=policy):
+                self.configure([pod(0), pod(1)])
+                rc, outputs, text = self.run_script(
+                    "submit.sh", INPUT_NNODES="2", INPUT_RACK_POLICY=policy,
+                    INPUT_NODE_SELECTOR="board-type=ZW-M890P")
+                self.assertEqual(rc, 0, text)
+                self.assertEqual(outputs["job_status"], "timeout")
+                self.assertEqual(self.manifest("podgroup.yaml")["spec"]["minMember"], 2)
+                self.assertIn("timed out", text)
+                self.assertFalse(any(call["args"][0] in ("patch", "replace") for call in self.calls("kubectl")))
 
     def test_each_node_default_and_explicit_modes_preserve_resource_counts(self):
         for mode in (None, "each-node"):

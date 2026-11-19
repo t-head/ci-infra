@@ -119,7 +119,8 @@ that name. Existing destinations are kept as-is, while missing paths are warning
 | `cleanup_policy` | no | `always` | Accepted but not applied; resource removal is unconditional |
 | `source_dir` | no | `/workspace/source` | Path where staged source is extracted in the pod |
 | `node_selector` | no | | `KEY1=VAL1,...`, merged into `spec.nodeSelector` |
-| `rack_nodes` | no | | Workers per ICN rack, `RACK1=COUNT1,...`; see below |
+| `rack_policy` | no | | `same` for one automatically selected ICN rack, `spread` for balanced multi-rack placement; empty imposes no rack constraint |
+| `rack_count` | no | | Exact rack count with `spread`, between 2 and `nnodes`; empty uses all eligible racks |
 | `container_options` | no | | YAML snippet, see below |
 | `artifact_paths` | no | | Extra paths (one per line) staged with the source |
 | `job_suffix` | no | | Readable segment of resource names; a unique hash is always appended |
@@ -130,20 +131,77 @@ for all terminal states. The current implementation treats `on_failure` exactly 
 `always`: kernel logs also remain on NAS after successful execution, not just after
 an error, deadline or cancellation.
 
-### `rack_nodes`
+### `rack_policy`
 
-`rack_nodes: rack-01=4,rack-02=4` with `nnodes: 8` places four workers in each ICN
-rack. Each worker receives an extra `icn-rack` node selector, while the shared
-`PodGroup` and per-host anti-affinity are unchanged. Racks are filled in the listed
-order: here ranks 0-3, including worker-0 and `MASTER_ADDR`, are in `rack-01` and
-ranks 4-7 are in `rack-02`.
+Choose a placement policy without naming racks:
 
-Validation happens before any resource is created. Counts must be positive and add
-up to `nnodes`, a rack may be listed only once, gang mode is required, and
-`node_selector` must contain `board-type=ZW-M890P` without its own `icn-rack` entry;
-810E boards have no rack labels. There is no rack fallback: when one rack cannot hold
-its share, the whole gang waits until `timeout_minutes` expires instead of being
-placed unevenly.
+```yaml
+nnodes: 4
+nproc_per_node: 1
+node_selector: "board-type=ZW-M890P,nic-type=cx8"
+rack_policy: same
+```
+
+| Policy | Placement |
+| --- | --- |
+| Empty (default) | No additional rack constraint; existing node selectors still apply |
+| `same` | All workers share one automatically selected rack; a single worker is also supported |
+| `spread` | Workers span at least two matching racks with a count difference of at most one across eligible racks |
+
+Set `rack_policy: spread` for cross-rack placement. For example, six workers across
+three eligible racks distribute 2+2+2; eight workers across three distribute 3+3+2.
+Without `rack_count`, this is not one worker per rack, nor an exactly-two-rack policy.
+The rack of worker-0 and worker rank placement are scheduler decisions.
+The existing PodGroup and per-host anti-affinity remain unchanged.
+
+An active policy requires `board-type=ZW-M890P` in `node_selector` and nodes with an
+`icn-rack` label; other conditions such as `nic-type` are combined with it.
+`spread` requires `nnodes >= 2`. A simultaneous explicit `icn-rack` node selector
+is rejected; use that selector only when the policy is empty. 810E has no rack
+labels and rejects either active policy.
+
+`same` uses required task-scoped rack affinity; the first assumed worker anchors
+placement. Kubernetes does not backtrack the whole gang to another rack if the
+selected rack lacks capacity, so the job may wait even if another rack has room.
+`spread` uses `maxSkew=1`, `minDomains=2`, and `DoNotSchedule`, honoring node affinity
+and taints. Eligible domains are not a snapshot of free capacity: a rack with no
+room can still constrain spreading. With fewer than two domains, the group cannot
+finish placement. Constraints are never silently relaxed; unavailable placement
+waits within `timeout_minutes`, which also covers execution. Gang scheduling is not
+transactional resource reservation. Scheduled-pod logs include the actual node rack.
+
+### `rack_count`
+
+With `spread`, request an exact rack count without naming the racks:
+
+```yaml
+nnodes: 8
+nproc_per_node: 1
+node_selector: "board-type=ZW-M890P,nic-type=cx8"
+rack_policy: spread
+rack_count: 4
+```
+
+This selects four racks with two workers per rack. Set `rack_count: 2` for four
+workers in each of two racks. Counts that do not divide `nnodes` evenly differ by
+at most one: five workers with two racks use 3+2. `rack_count` must be a positive
+integer between 2 and `nnodes`; supplying it with `same` or an empty policy is an
+error. Leave it empty to spread across all eligible racks.
+
+The Action selects the largest matching candidate rack groups, with rack names
+breaking ties. Candidates must match the node selectors, be Ready and uncordoned,
+have no blocking NoSchedule/NoExecute taints, and register at least
+`nproc_per_node` PPU devices each. Each selected rack needs enough distinct nodes
+for its balanced share. Too few candidates are rechecked within the shared job
+timeout before worker resources are created.
+
+Selected racks are enforced through `icn-rack` node affinity and
+`minDomains=rack_count`; other racks cannot be used. Candidate counts describe
+registered capacity, not current free PPU/CPU/memory or reservations. Kubernetes
+still arbitrates resource competition, and a selected rack becoming unavailable
+can keep the group queued; the Action does not switch racks after submission or
+relax the count. Explicit per-rack names and counts are not an input; a fixed
+single-rack selector remains available when `rack_policy` is empty.
 
 ### `container_options`
 
