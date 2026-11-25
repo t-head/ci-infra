@@ -454,7 +454,7 @@ jobs:
           if len(parts) not in (5, 6) or not all(parts):
               raise SystemExit("::error::wheel filename must contain a distribution, version, and wheel tags")
           whl_version = parts[1]
-          parts[1] = whl_version + ("." if "+" in whl_version else "+") + key_str
+          parts[1] = whl_version.split("+", 1)[0] + "+" + key_str
           target = wheel.with_name("-".join(parts))
           if target.exists() or target.is_symlink():
               raise SystemExit("::error::renamed wheel already exists; refusing to overwrite")

@@ -1374,23 +1374,24 @@ def run_nightly_rename(nightly_workflow, workspace):
     return run
 
 
-@pytest.mark.parametrize("whl_version,separator", [
-    ("1.2.3", "+"), ("1.2.3+custom", "."), ("1.2.3+custom.7", "."),
-    ("V1.2.3RC1", "+"), ("1..2", "+"),
+@pytest.mark.parametrize("whl_version,base_version", [
+    ("1.2.3", "1.2.3"), ("1.2.3+custom", "1.2.3"), ("1.2.3+custom.7", "1.2.3"),
+    ("1.2.3+1234567.hggcrt2.ubuntu2004.sdk2.1.1", "1.2.3"),
+    ("V1.2.3RC1", "V1.2.3RC1"), ("1..2", "1..2"),
 ])
 @pytest.mark.parametrize("tags", ["py3-none-any", "cp310-cp310-linux_x86_64", "1-cp312-cp312-manylinux_2_17_x86_64"])
 @pytest.mark.parametrize("runtime,os_version,sdk", [
     ("3", "ubuntu2204", "2.2.0"), ("2", "alios7u2", "2.1.1"),
 ])
 def test_nightly_rename_uses_wheel_version_and_preserves_contents(
-    whl_version, separator, tags, runtime, os_version, sdk, make_file, nightly_wheel_bytes, run_nightly_rename,
+    whl_version, base_version, tags, runtime, os_version, sdk, make_file, nightly_wheel_bytes, run_nightly_rename,
 ):
     original = make_file(filename=f"demo_package-{whl_version}-{tags}.whl", directory="dist",
                          content=nightly_wheel_bytes)
     result = run_nightly_rename(RUNTIME_VERSION=runtime, OS_VERSION=os_version, SDK_VERSION=sdk)
     assert result.returncode == 0, result.stderr
     expected = original.with_name(
-        f"demo_package-{whl_version}{separator}abcdef1.hggcrt{runtime}.{os_version}.sdk{sdk}-{tags}.whl"
+        f"demo_package-{base_version}+abcdef1.hggcrt{runtime}.{os_version}.sdk{sdk}-{tags}.whl"
     )
     assert not original.exists()
     assert list(expected.parent.iterdir()) == [expected]
@@ -1789,7 +1790,7 @@ def test_nightly_selected_source_reaches_upload_version_and_properties(
     assert result.returncode == 0, result.stderr
     assert (original.parent.parent / "rename-output").read_text() == f"short_commit={short_commit}\n"
     wheel = original.with_name(
-        f"demo_package-1.2.3+custom.{short_commit}.hggcrt3.ubuntu2204.sdk2.2.0-py3-none-any.whl"
+        f"demo_package-1.2.3+{short_commit}.hggcrt3.ubuntu2204.sdk2.2.0-py3-none-any.whl"
     )
     upload = next(step for step in nightly_workflow["jobs"]["matrix-job"]["steps"] if step.get("id") == "upload")
     mapping, _ = upload["run"].rstrip().rsplit("\n", 1)
