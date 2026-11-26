@@ -209,9 +209,11 @@ cluster_probe() {
     (( CLUSTER_BUDGET <= 5 )) || CLUSTER_BUDGET=5
     cluster_ssh_options
     # A hard deadline bounds authentication, commands and stalled transports.
+    cluster_init_probe_status ssh_probe in_progress
     CLUSTER_REPLY=$(/usr/bin/timeout -k 1s "${CLUSTER_BUDGET}s" /usr/bin/ssh "${CLUSTER_SSH_ARGS[@]}" \
         -o "HostKeyAlias=cluster-rank-$CLUSTER_PROBE_RANK" -p "$CLUSTER_PROBE_PORT" -- "root@$CLUSTER_PROBE_HOST" \
-        __ppu_master_probe_v1__ 2>/dev/null) || return 1
+        __ppu_master_probe_v1__ 2>/dev/null) || { cluster_init_probe_status ssh_probe "$?"; return 1; }
+    cluster_init_probe_status invalid_probe_reply 0
     (( ${#CLUSTER_REPLY} <= 4096 )) || return 1
     /usr/bin/jq -e --arg job "$CLUSTER_JOB_ID" --arg host "$CLUSTER_PROBE_HOST" --arg uid "$CLUSTER_PROBE_UID" \
         --argjson rank "$CLUSTER_PROBE_RANK" --argjson port "$CLUSTER_PROBE_PORT" '
@@ -222,16 +224,20 @@ cluster_probe() {
         .exit_code == (.exit_code | floor) and
         (.pod_ip | type) == "string" and (.host_ip | type) == "string" and
         (.pod_ip | test("^[0-9A-Fa-f:.]+$")) and (.host_ip | test("^[0-9A-Fa-f:.]+$"))
-        ' <<< "$CLUSTER_REPLY" >/dev/null || return 1
+        ' <<< "$CLUSTER_REPLY" >/dev/null 2>&1 || return 1
     CLUSTER_PROBE=$CLUSTER_REPLY
+    cluster_init_probe_status peer_status_received 0
 }
 cluster_peer() {
     local CLUSTER_PEER_RANK=$1 CLUSTER_PEER_HOST CLUSTER_PEER_PORT CLUSTER_PEER_UID
+    CLUSTER_DIAG_PEER=$CLUSTER_PEER_RANK
+    cluster_init_probe_status peer_registry not_attempted
     CLUSTER_PEER_HOST=$(/usr/bin/jq -r --argjson rank "$CLUSTER_PEER_RANK" '.[$rank].host' /run/cluster/trusted-nodes.json) || return 1
     cluster_safe_dir "$CLUSTER_REGISTRY" || return 1
     cluster_registry_read "$CLUSTER_PEER_RANK" "$CLUSTER_REGISTRY/$CLUSTER_PEER_RANK.json" "$CLUSTER_PEER_HOST" || return 1
     CLUSTER_PEER_PORT=$(/usr/bin/jq -r .port <<< "$CLUSTER_RECORD")
     CLUSTER_PEER_UID=$(/usr/bin/jq -r .pod_uid <<< "$CLUSTER_RECORD")
+    cluster_init_probe_status probe_deadline not_attempted
     cluster_probe "$CLUSTER_PEER_RANK" "$CLUSTER_PEER_HOST" "$CLUSTER_PEER_PORT" "$CLUSTER_PEER_UID"
 }
 cluster_mark_deadline() {
@@ -266,6 +272,7 @@ cluster_termination() {
 }
 cluster_initialize() {
     /bin/bash /run/cluster-config/install-ssh.sh
+    cluster_init_stage configure_ssh
     command -v timeout >/dev/null || { cluster_error 'GNU timeout is required'; return 69; }
     umask 077
     # Debian/Ubuntu sshd requires its compiled-in empty privilege-separation dir.
@@ -321,7 +328,10 @@ cluster_initialize() {
     CLUSTER_SEED=$(( (RANDOM * 32768 + RANDOM) % 5000 ))
     local CLUSTER_BIND=$POD_IP
     [[ $POD_IP == "$HOST_IP" ]] && CLUSTER_BIND=$HOST_IP
+    cluster_init_stage start_ssh_listener
+    CLUSTER_DIAG_PEER=$NODE_RANK
     while IFS= read -r CLUSTER_INIT_PORT; do
+        cluster_init_probe_status listener_start not_attempted
         cluster_check_deadline
         CLUSTER_PORT=$CLUSTER_INIT_PORT
         cluster_status online
@@ -349,17 +359,22 @@ cluster_initialize() {
             # Local dialing uses the IP, while metadata always identifies the trusted FQDN.
             cluster_check_deadline
             cluster_ssh_options
+            cluster_init_probe_status ssh_self_probe in_progress
             if CLUSTER_REPLY=$(/usr/bin/timeout -k 1s "${CLUSTER_REMAINING}s" /usr/bin/ssh "${CLUSTER_SSH_ARGS[@]}" \
                 -o "HostKeyAlias=cluster-rank-$NODE_RANK" -p "$CLUSTER_INIT_PORT" -- "root@$CLUSTER_BIND" __ppu_master_probe_v1__ 2>/dev/null); then
+                cluster_init_probe_status invalid_self_probe_reply 0
                 if /usr/bin/jq -e --arg job "$CLUSTER_JOB_ID" --arg host "$CLUSTER_HOST" --arg uid "$POD_UID" \
                     --argjson rank "$NODE_RANK" --argjson port "$CLUSTER_INIT_PORT" \
                     '.jobid == $job and .host == $host and .pod_uid == $uid and .rank == $rank and .port == $port' \
-                    <<< "$CLUSTER_REPLY" >/dev/null && kill -0 "$CLUSTER_LISTENER" 2>/dev/null; then
+                    <<< "$CLUSTER_REPLY" >/dev/null 2>&1 && kill -0 "$CLUSTER_LISTENER" 2>/dev/null; then
                     printf '%s\n' "$CLUSTER_LISTENER" > /run/cluster/listener.pid
                     CLUSTER_REGISTERED=1
+                    cluster_init_probe_status publish_online 0
                     cluster_status online
                     return 0
                 fi
+            else
+                cluster_init_probe_status ssh_self_probe "$?"
             fi
             /bin/sleep 0.2
         done
@@ -381,7 +396,10 @@ cluster_mesh() {
     for ((CLUSTER_MESH_RANK=0; CLUSTER_MESH_RANK<NNODES; CLUSTER_MESH_RANK++)); do
         until cluster_peer "$CLUSTER_MESH_RANK"; do cluster_check_deadline; /bin/sleep 0.2; done
         CLUSTER_PHASE=$(/usr/bin/jq -r .phase <<< "$CLUSTER_PROBE")
-        if [[ $CLUSTER_PHASE == failed || $CLUSTER_PHASE == done ]]; then return 70; fi
+        if [[ $CLUSTER_PHASE == failed || $CLUSTER_PHASE == done ]]; then
+            cluster_init_probe_status "peer_$CLUSTER_PHASE" 0
+            return 70
+        fi
         CLUSTER_NEXT=$CLUSTER_TEMP.next
         /usr/bin/jq --argjson peer "$CLUSTER_PROBE" --argjson rank "$CLUSTER_MESH_RANK" \
             --slurpfile trusted /run/cluster/trusted-nodes.json \
@@ -406,6 +424,7 @@ cluster_mesh_barrier() {
                 case $CLUSTER_PHASE in
                     connected|setup|ready|running) break ;;
                     failed|done|finished)
+                        cluster_init_probe_status "peer_$CLUSTER_PHASE" 0
                         CLUSTER_RC=$(/usr/bin/jq -r .exit_code <<< "$CLUSTER_PROBE")
                         (( CLUSTER_RC != 0 )) || CLUSTER_RC=70
                         return "$CLUSTER_RC" ;;
@@ -425,22 +444,62 @@ cluster_ready_barrier() {
                 return 70
             else
                 CLUSTER_PHASE=$(/usr/bin/jq -r .phase <<< "$CLUSTER_PROBE")
-                if [[ $CLUSTER_PHASE == failed ]]; then
-                    CLUSTER_RC=$(/usr/bin/jq -r .exit_code <<< "$CLUSTER_PROBE")
-                    (( CLUSTER_RC != 0 )) || CLUSTER_RC=70
-                    return "$CLUSTER_RC"
-                fi
-                [[ $CLUSTER_PHASE == ready ]] && break
-                [[ $CLUSTER_PHASE != done && $CLUSTER_PHASE != finished ]] || return 70
+                case $CLUSTER_PHASE in
+                    failed)
+                        cluster_init_probe_status peer_failed 0
+                        CLUSTER_RC=$(/usr/bin/jq -r .exit_code <<< "$CLUSTER_PROBE")
+                        (( CLUSTER_RC != 0 )) || CLUSTER_RC=70
+                        return "$CLUSTER_RC" ;;
+                    ready) break ;;
+                    done|finished) cluster_init_probe_status "peer_$CLUSTER_PHASE" 0; return 70 ;;
+                esac
             fi
             /bin/sleep 0.2
         done
     done
 }
+cluster_publish_init_diagnostics() {
+    local CLUSTER_DIAG_TEMP=/run/cluster/init-diagnostic.tmp
+    # The supervisor may terminate the task before its EXIT trap can run.
+    { (umask 077; printf '%s|%s|%s|%s\n' "$CLUSTER_DIAG_STAGE" "$CLUSTER_DIAG_PEER" \
+        "$CLUSTER_DIAG_SSH_RC" "$CLUSTER_DIAG_DETAIL" > "$CLUSTER_DIAG_TEMP") &&
+        /bin/mv -f "$CLUSTER_DIAG_TEMP" /run/cluster/init-diagnostic; } 2>/dev/null || :
+}
+cluster_init_stage() {
+    CLUSTER_DIAG_STAGE=$1
+    CLUSTER_DIAG_PEER=none
+    CLUSTER_DIAG_SSH_RC=not_attempted
+    CLUSTER_DIAG_DETAIL=none
+    cluster_publish_init_diagnostics
+}
+cluster_init_probe_status() {
+    CLUSTER_DIAG_DETAIL=$1
+    CLUSTER_DIAG_SSH_RC=$2
+    [[ -z ${CLUSTER_DIAG_STAGE:-} ]] || cluster_publish_init_diagnostics
+}
+cluster_report_supervised_init_failure() {
+    local CLUSTER_STAGE CLUSTER_PEER CLUSTER_SSH_RC CLUSTER_DETAIL
+    cluster_regular /run/cluster/init-diagnostic 256 || return 0
+    IFS='|' read -r CLUSTER_STAGE CLUSTER_PEER CLUSTER_SSH_RC CLUSTER_DETAIL < /run/cluster/init-diagnostic || return 0
+    case $CLUSTER_STAGE in
+        install_ssh|configure_ssh|start_ssh_listener|ssh_mesh|ssh_mesh_barrier|setup_command|ready_barrier|publish_running) ;;
+        *) return 0 ;;
+    esac
+    [[ $CLUSTER_PEER == none ]] || cluster_number "$CLUSTER_PEER" || return 0
+    [[ $CLUSTER_SSH_RC == not_attempted || $CLUSTER_SSH_RC == in_progress ]] || cluster_number "$CLUSTER_SSH_RC" || return 0
+    case $CLUSTER_DETAIL in
+        none|listener_start|ssh_probe|invalid_probe_reply|ssh_self_probe|invalid_self_probe_reply|publish_online|peer_registry|probe_deadline|peer_status_received|peer_failed|peer_done|peer_finished) ;;
+        *) return 0 ;;
+    esac
+    cluster_error "initialization failed: rank=$NODE_RANK stage=$CLUSTER_STAGE peer_rank=$CLUSTER_PEER ssh_rc=$CLUSTER_SSH_RC detail=$CLUSTER_DETAIL exit_code=$1 source=supervisor cause=$2"
+}
 cluster_finish() {
     local CLUSTER_FINISH_RC=$1
     trap - EXIT
     set +e
+    if (( CLUSTER_FINISH_RC != 0 )) && [[ -n ${CLUSTER_DIAG_STAGE:-} ]]; then
+        cluster_error "initialization failed: rank=$CLUSTER_DIAG_RANK stage=$CLUSTER_DIAG_STAGE peer_rank=$CLUSTER_DIAG_PEER ssh_rc=$CLUSTER_DIAG_SSH_RC detail=$CLUSTER_DIAG_DETAIL exit_code=$CLUSTER_FINISH_RC"
+    fi
     [[ ${CLUSTER_REGISTERED:-0} == 1 ]] || return "$CLUSTER_FINISH_RC"
     cluster_env_load_file /run/cluster/metadata.env || return "$CLUSTER_FINISH_RC"
     if (( NODE_RANK == 0 )); then
@@ -453,10 +512,15 @@ cluster_finish() {
 cluster_task() {
     set +m
     set -e -E -o pipefail
+    readonly CLUSTER_DIAG_RANK=$NODE_RANK
     trap 'cluster_finish "$?"' EXIT
+    cluster_init_stage install_ssh
     cluster_initialize
+    cluster_init_stage ssh_mesh
     cluster_mesh
+    cluster_init_stage ssh_mesh_barrier
     cluster_mesh_barrier
+    cluster_init_stage setup_command
     cluster_status setup
     cluster_env_clean
     cluster_env_load_file /run/cluster/environment.env
@@ -469,8 +533,11 @@ cluster_task() {
     cd -- "$SOURCE_DIR"
     cluster_status ready
     if (( NODE_RANK == 0 )); then
+        cluster_init_stage ready_barrier
         cluster_ready_barrier
+        cluster_init_stage publish_running
         cluster_status running
+        cluster_init_stage ''
         # Inherit setup's shell state, but keep supervision alive across user exec/exit.
         ( trap - EXIT; set +e; source /run/cluster/command.sh ) <&0 &
         local CLUSTER_COMMAND_PID=$! CLUSTER_COMMAND_RC
@@ -479,6 +546,7 @@ cluster_task() {
         printf '%s\n' "$CLUSTER_COMMAND_RC" > /run/cluster/command.exit
         return "$CLUSTER_COMMAND_RC"
     else
+        cluster_init_stage ''
         while :; do
             cluster_check_deadline
             /bin/sleep 0.2
@@ -540,6 +608,7 @@ cluster_main() {
        -n ${MASTER_ADDR:-} && -d ${SOURCE_DIR:-} ]] || return 65
     # Markers are local to this runtime attempt, never stored on NAS.
     /bin/rm -f /run/cluster/deadline-exceeded /run/cluster/command.exit /run/cluster/command.finished || return 73
+    /bin/rm -f /run/cluster/init-diagnostic /run/cluster/init-diagnostic.tmp 2>/dev/null || :
     cluster_check_deadline || {
         CLUSTER_MAIN_RC=$?
         [[ ! -f /run/cluster/deadline-exceeded ]] || CLUSTER_OUTCOME=timeout
@@ -561,6 +630,7 @@ cluster_main() {
             CLUSTER_MAIN_PHASE=$(/usr/bin/jq -r .phase /run/cluster/status.json 2>/dev/null)
             if [[ -f /run/cluster/command.exit || $CLUSTER_MAIN_PHASE == done ]] || ! kill -0 "$CLUSTER_MAIN_TASK" 2>/dev/null; then break; fi
             if cluster_mark_deadline; then CLUSTER_MAIN_RC=124; else CLUSTER_MAIN_RC=$?; fi
+            cluster_report_supervised_init_failure "$CLUSTER_MAIN_RC" deadline || :
             break
         fi
         if [[ -f /run/cluster/listener.pid ]]; then
@@ -570,6 +640,7 @@ cluster_main() {
                 kill -0 "$CLUSTER_MAIN_TASK" 2>/dev/null || break
                 cluster_error 'SSH listener died'
                 CLUSTER_MAIN_RC=70
+                cluster_report_supervised_init_failure "$CLUSTER_MAIN_RC" listener_lost || :
                 break
             fi
         fi

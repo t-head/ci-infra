@@ -32,21 +32,45 @@ set_output() {
 set_output "job_status" "$FINAL_STATUS"
 
 print_failed_worker_logs() {
-  local pod
-  while IFS= read -r pod; do
+  local pod collect_log details log_deadline remaining mode=${1:-}
+  local -a log_pods=()
+  while IFS=$'\t' read -r pod collect_log details; do
     [ -n "$pod" ] || continue
+    printf 'Worker pod status: %s\n' "$details"
+    if [ "$collect_log" = true ]; then
+      log_pods+=("$pod")
+    fi
+  done < <(printf '%s' "$POD_SNAPSHOT" | jq -r --arg master "$POD_W0" --arg mode "$mode" '
+    def container_states:
+      map({name, waiting_reason: .state.waiting.reason,
+        termination: (.state.terminated | if . == null then null else
+          {reason, exit_code: .exitCode, signal, finished_at: .finishedAt} end)});
+    .items | sort_by(.metadata.name)[] |
+    (.status.phase == "Failed" or
+      any(.status.initContainerStatuses[]?, .status.containerStatuses[]?;
+        (.state.terminated.exitCode // 0) != 0) or
+      ($mode == "early_exit" and .metadata.name != $master and .status.phase == "Succeeded")) as $collect_log |
+    select($collect_log or .status.phase == "Unknown" or .metadata.deletionTimestamp != null) |
+    {pod: .metadata.name, node: .spec.nodeName, phase: .status.phase, pod_reason: .status.reason,
+     deleting: (.metadata.deletionTimestamp != null),
+     init_containers: ((.status.initContainerStatuses // []) | container_states),
+     containers: ((.status.containerStatuses // []) | container_states)} as $details |
+    "\(.metadata.name)\t\($collect_log)\t\($details | tojson)"')
+  [ "$mode" != snapshot_only ] && [ -n "${log_pods[0]:-}" ] || return 0
+  log_deadline=$(( $(date +%s) + 10 ))
+  for pod in "${log_pods[@]}"; do
+    remaining=$(( log_deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+      echo "Skipping remaining failed worker logs: shared collection budget exhausted"
+      break
+    fi
     echo "::group::Failed worker log: $pod"
-    if ! timeout --signal=TERM --kill-after=2s 10s \
+    if ! timeout --signal=KILL "${remaining}s" \
       kubectl logs "$pod" -c worker -n "$NAMESPACE" --timestamps=true; then
       echo "Unable to read the failed worker log before cleanup: $pod"
     fi
     echo "::endgroup::"
-  done < <(printf '%s' "$POD_SNAPSHOT" | jq -r '
-    .items[] |
-    select(.status.phase == "Failed" or
-      any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0) or
-      any(.status.containerStatuses[]?; (.state.terminated.exitCode // 0) != 0)) |
-    .metadata.name' | sort -u)
+  done
 }
 
 _on_exit() {
@@ -235,6 +259,7 @@ while true; do
 
   if [ "$MASTER_MULTI" = true ] && [ "$WORKER_COMPLETED" -gt 0 ]; then
     echo "::error::A worker SSH service exited before allocation cleanup"
+    print_failed_worker_logs early_exit
     FINAL_STATUS="failed"
     exit 0
   fi
@@ -282,6 +307,7 @@ while true; do
 
   if [ "$NOW" -ge "$DEADLINE" ]; then
     echo "::error::Workload exceeded the $(( DEADLINE - START_TIME ))s scheduling and execution budget"
+    print_failed_worker_logs snapshot_only
     exit 0
   fi
 
