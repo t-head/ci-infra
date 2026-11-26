@@ -638,6 +638,43 @@ class RuntimeUnitTests(Fixture):
             result = self.bash(command, env)
             self.assertEqual(result.returncode, 1 if changed else 0, changed)
 
+    def test_mesh_barrier_logs_local_and_peer_rank_without_raw_ssh_output(self):
+        _, runtime, config, _, tools, env = self.stage(rank=1)
+        shutil.copyfile(config / "nodes.json", runtime / "trusted-nodes.json")
+        command = '''
+cluster_initialize() { :; }
+cluster_mesh() { :; }
+cluster_status() { :; }
+cluster_safe_dir() { :; }
+'''
+        registry_record = '''cluster_registry_read() { CLUSTER_RECORD='{"port":2222,"pod_uid":"uid-0"}'; }
+cluster_task
+'''
+        peer_failed = json.dumps(dict(jobid="job-independent-123", rank=0, host="127.0.0.2",
+                                      port=2222, pod_uid="uid-0", phase="failed", exit_code=69,
+                                      pod_ip="127.0.0.2", host_ip="127.0.0.2"))
+        for ssh_code, reply, detail, exit_code in (
+            (255, "", "ssh_probe", 70),
+            (124, "", "ssh_probe", 70),
+            (0, "unexpected-probe-output", "invalid_probe_reply", 70),
+            (0, peer_failed, "peer_failed", 69),
+        ):
+            with self.subTest(ssh_code=ssh_code, detail=detail):
+                executable(tools / "ssh", "#!/bin/sh\n"
+                           "printf '%s\\n' raw-ssh-stderr >&2\n"
+                           "printf '%s\\n' " + shlex.quote(reply) + f"\nexit {ssh_code}\n")
+                result = self.registry(runtime, command + registry_record, env)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertIn(f"rank=1 stage=ssh_mesh_barrier peer_rank=0 ssh_rc={ssh_code} "
+                              f"detail={detail} exit_code={exit_code}", result.stderr)
+                self.assertNotIn("raw-ssh-stderr", result.stderr)
+                self.assertNotIn("unexpected-probe-output", result.stderr)
+
+        result = self.registry(runtime, command + "cluster_registry_read() { return 1; }\ncluster_task\n", env)
+        self.assertEqual(result.returncode, 70, result.stderr)
+        self.assertIn("rank=1 stage=ssh_mesh_barrier peer_rank=0 ssh_rc=not_attempted "
+                      "detail=peer_registry exit_code=70", result.stderr)
+
     def test_deadline_and_term_bound_blocked_startup(self):
         for terminate in (False, True):
             node, runtime, config, _, _, env = self.stage(rank=int(terminate))
@@ -678,6 +715,8 @@ class RuntimeUnitTests(Fixture):
         self.assert_termination(node, env, "runtime")
         self.assertFalse((runtime / "deadline-exceeded").exists())
         self.assertFalse((runtime / "command.exit").exists())
+        self.assertIn("rank=0 stage=install_ssh peer_rank=none ssh_rc=not_attempted "
+                      "detail=none exit_code=124", (node / "output").read_text())
 
     def test_marker_and_termination_write_failures_are_reported(self):
         node, runtime, _, _, _, env = self.stage()
@@ -875,6 +914,7 @@ class SimulatedClusterTests(Fixture):
         self.assertFalse((nodes[0][1] / "deadline-exceeded").exists())
         self.assertLess(int(time.time()), int(nodes[0][5]["PPU_DEADLINE"]))
         self.assertEqual(json.loads((nodes[0][1] / "status.json").read_text())["exit_code"], 124)
+        self.assertNotIn("initialization failed:", (nodes[0][0] / "output").read_text())
 
     def test_setup_exit124_remains_runtime_failure(self):
         nodes, procs = self.launch_pair(setup=["exit 124\n", ":\n"],
@@ -883,6 +923,8 @@ class SimulatedClusterTests(Fixture):
         self.assert_termination(nodes[0][0], nodes[0][5], "runtime")
         self.assertFalse((nodes[0][1] / "deadline-exceeded").exists())
         self.assertFalse((nodes[0][3] / "command-result").exists())
+        self.assertIn("rank=0 stage=setup_command peer_rank=none ssh_rc=not_attempted "
+                      "detail=none exit_code=124", (nodes[0][0] / "output").read_text())
 
     def test_command_exec_preserves_setup_shell_state_and_exit_code(self):
         nodes, procs = self.launch_pair(setup=["LOCAL_VALUE=from-setup\n"] * 2,

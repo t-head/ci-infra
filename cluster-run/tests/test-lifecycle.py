@@ -1259,8 +1259,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_master_monitor_prints_failed_worker_logs_before_reporting(self):
         failed_name = self.env["JOB_NAME"] + "-worker-1"
-        self.configure([pod(0, "Running", EPOCH, started=EPOCH),
-                        pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 4)],
+        worker = pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 4)
+        worker["status"]["reason"] = "UnexpectedAdmissionError"
+        worker["status"]["containerStatuses"][0]["state"]["terminated"].update(
+            reason="OOMKilled", exitCode=137, signal=9, message="raw termination message")
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH), worker],
                        pod_logs={failed_name: ["worker-1 setup", "worker-1 failure"]})
         rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
         self.assertEqual(rc, 0, text)
@@ -1268,6 +1271,14 @@ class LifecycleTests(unittest.TestCase):
         heading = f"::group::Failed worker log: {failed_name}"
         self.assertIn(heading, text)
         self.assertIn("worker-1 setup\nworker-1 failure\n::endgroup::", text)
+        status = next(line for line in text.splitlines() if line.startswith("Worker pod status: "))
+        details = json.loads(status.removeprefix("Worker pod status: "))
+        self.assertEqual(details["pod"], failed_name)
+        self.assertEqual(details["pod_reason"], "UnexpectedAdmissionError")
+        self.assertEqual(details["containers"][0]["termination"],
+                         dict(reason="OOMKilled", exit_code=137, signal=9, finished_at=timestamp(EPOCH + 4)))
+        self.assertNotIn("raw termination message", text)
+        self.assertLess(text.index(status), text.index(heading))
         self.assertLess(text.index(heading), text.index("Job: "))
         self.assertNotIn(f"::group::Failed worker log: {self.env['JOB_NAME']}-worker-0", text)
         calls = [call["args"] for call in self.calls("kubectl")
@@ -1321,6 +1332,11 @@ class LifecycleTests(unittest.TestCase):
                                  "Broken SSH workers must fail without an unbounded wait")
                 if state == "init-failed":
                     self.assertIn("init failure", text)
+                    self.assertIn('"init_containers":[{"name":"setup"', text)
+                    self.assertIn('"reason":"Error","exit_code":7', text)
+                if state == "Succeeded":
+                    self.assertIn('"phase":"Succeeded"', text)
+                    self.assertIn('"exit_code":0', text)
 
     def test_master_monitor_missing_master_fails(self):
         self.configure([pod(1, "Running", EPOCH, started=EPOCH)])
