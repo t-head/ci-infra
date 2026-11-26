@@ -189,6 +189,8 @@ def fake_command(tool, args):
             if any(arg.startswith(("--tail", "--since")) for arg in args):
                 raise ValueError("Worker logs must not be filtered")
             if pod_name != worker_zero:
+                clock(min(fixture.get("worker_log_latency", 0),
+                          int(os.environ["LIFECYCLE_API_TIMEOUT"].removesuffix("s"))))
                 lines = fixture.get("pod_logs", {}).get(pod_name)
                 if lines is None or fixture.get("failed_log_error"):
                     return 42
@@ -1286,6 +1288,23 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("--timestamps=true", calls[0])
 
+    def test_monitor_shared_log_budget_preserves_all_worker_snapshots(self):
+        workers = [pod(i, "Succeeded", EPOCH, started=EPOCH, finished=EPOCH + 1) for i in range(1, 4)]
+        names = [f"{self.env['JOB_NAME']}-worker-{i}" for i in range(1, 4)]
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH), *workers],
+                       worker_log_latency=6, pod_logs={name: [name] for name in names})
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="4")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "failed", 4)
+        status_lines = [line for line in text.splitlines() if line.startswith("Worker pod status: ")]
+        self.assertEqual([json.loads(line.split(": ", 1)[1])["pod"] for line in status_lines], names)
+        self.assertLess(text.index(status_lines[-1]), text.index("::group::Failed worker log:"))
+        log_calls = [call["args"] for call in self.calls("timeout") if "--timestamps=true" in call["args"]]
+        self.assertEqual([(args[args.index("kubectl") - 1], args[args.index("logs") + 1])
+                          for args in log_calls], [("10s", names[0]), ("4s", names[1])])
+        self.assertIn("shared collection budget exhausted", text)
+        self.assertEqual(int((self.root / "clock").read_text()), EPOCH + 10)
+
     def test_failed_worker_log_error_does_not_replace_job_result(self):
         failed_name = self.env["JOB_NAME"] + "-worker-1"
         self.configure([pod(0, "Running", EPOCH, started=EPOCH),
@@ -1308,6 +1327,17 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assert_reported(outputs, "timeout", 2)
         self.assertIn("worker-1 deadline exceeded", text)
+
+    def test_master_monitor_late_failure_reports_snapshot_without_changing_timeout(self):
+        self.configure([pod(0, "Running", EPOCH, started=EPOCH),
+                        pod(1, "Failed", EPOCH, started=EPOCH, finished=EPOCH + 61)],
+                       now=EPOCH + 65)
+        rc, outputs, text = self.run_script("monitor.sh", INPUT_LAUNCH_MODE="master", INPUT_NNODES="2")
+        self.assertEqual(rc, 0, text)
+        self.assert_reported(outputs, "timeout", 2)
+        self.assertIn('"reason":"Error","exit_code":1', text)
+        self.assertIn(f"{self.env['JOB_NAME']}-worker-1", text)
+        self.assertNotIn("::group::Failed worker log:", text)
 
     def test_master_monitor_missing_or_abnormal_worker_never_reports_success(self):
         for state in ("missing", "Unknown", "Succeeded", "deleting", "init-failed"):

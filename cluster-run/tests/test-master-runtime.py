@@ -690,6 +690,26 @@ cluster_task
             self.assertLess(time.monotonic() - start, 5)
             self.assert_termination(node, env, "runtime" if terminate else "timeout")
             self.assertEqual((runtime / "deadline-exceeded").exists(), not terminate)
+            if not terminate:
+                self.assertIn("rank=0 stage=install_ssh peer_rank=none ssh_rc=not_attempted "
+                              "detail=none exit_code=124 source=supervisor cause=deadline",
+                              (node / "output").read_text())
+
+    def test_running_status_publication_failure_does_not_report_the_last_peer(self):
+        _, runtime, _, _, _, env = self.stage()
+        (runtime / "environment.env").write_bytes(b"NODE_RANK=0\0")
+        result = self.registry(runtime, '''
+cluster_initialize() { :; }
+cluster_mesh() { :; }
+cluster_mesh_barrier() { :; }
+cluster_env_save() { :; }
+cluster_ready_barrier() { CLUSTER_DIAG_PEER=1; cluster_init_probe_status peer_status_received 0; }
+cluster_status() { if [[ $1 == running ]]; then return 66; fi; }
+cluster_task
+''', env)
+        self.assertEqual(result.returncode, 66, result.stderr)
+        self.assertIn("rank=0 stage=publish_running peer_rank=none ssh_rc=not_attempted "
+                      "detail=none exit_code=66", result.stderr)
 
     def test_expired_startup_and_child_deadline_marker(self):
         node, runtime, _, _, _, env = self.stage()
@@ -917,7 +937,7 @@ class SimulatedClusterTests(Fixture):
         self.assertNotIn("initialization failed:", (nodes[0][0] / "output").read_text())
 
     def test_setup_exit124_remains_runtime_failure(self):
-        nodes, procs = self.launch_pair(setup=["exit 124\n", ":\n"],
+        nodes, procs = self.launch_pair(setup=["export NODE_RANK=99\nexit 124\n", ":\n"],
                                        command="printf BAD > command-result\n")
         self.assertEqual(procs[0].wait(timeout=15), 124)
         self.assert_termination(nodes[0][0], nodes[0][5], "runtime")
@@ -925,6 +945,14 @@ class SimulatedClusterTests(Fixture):
         self.assertFalse((nodes[0][3] / "command-result").exists())
         self.assertIn("rank=0 stage=setup_command peer_rank=none ssh_rc=not_attempted "
                       "detail=none exit_code=124", (nodes[0][0] / "output").read_text())
+
+    def test_setup_unset_rank_still_reports_failure_with_nounset(self):
+        nodes, procs = self.launch_pair(setup=[":\n", "set -u\nunset NODE_RANK\nexit 23\n"])
+        self.assertEqual(procs[1].wait(timeout=15), 23)
+        self.assertIn("rank=1 stage=setup_command peer_rank=none ssh_rc=not_attempted "
+                      "detail=none exit_code=23", (nodes[1][0] / "output").read_text())
+        status = json.loads((nodes[1][1] / "status.json").read_text())
+        self.assertEqual((status["rank"], status["phase"], status["exit_code"]), (1, "failed", 23))
 
     def test_command_exec_preserves_setup_shell_state_and_exit_code(self):
         nodes, procs = self.launch_pair(setup=["LOCAL_VALUE=from-setup\n"] * 2,
@@ -975,6 +1003,17 @@ class SimulatedClusterTests(Fixture):
         self.wait_cluster(procs, (70, 1))
         self.assertFalse((nodes[1][3] / "should-not-run").exists())
         self.assertFalse((nodes[0][3] / "command-result").exists())
+
+    def test_supervisor_logs_listener_loss_during_setup_before_cleanup(self):
+        nodes, procs = self.launch_pair(setup=[":\n", "touch in-setup\n/bin/sleep 60\n"])
+        node, runtime, _, source, _, env = nodes[1]
+        self.await_condition(lambda: (source / "in-setup").exists())
+        os.kill(int((runtime / "listener.pid").read_text()), signal.SIGKILL)
+        self.assertEqual(procs[1].wait(timeout=12), 70)
+        self.assert_termination(node, env, "runtime")
+        self.assertIn("rank=1 stage=setup_command peer_rank=none ssh_rc=not_attempted "
+                      "detail=none exit_code=70 source=supervisor cause=listener_lost",
+                      (node / "output").read_text())
 
     def test_worker_listener_failure_interrupts_master_command(self):
         nodes, procs = self.launch_pair(command="printf started > started\n/bin/sleep 60\n")
